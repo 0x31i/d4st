@@ -347,20 +347,58 @@ def probe_targets(targets: list[Target], cookie: str) -> list[Finding]:
     return out
 
 
-def run_engagement(target: str, cookie: str, host: str,
-                   depth: int = 3) -> dict:
-    """Full blind flow. Returns {urls, targets, findings} with findings verified."""
-    urls = blind_crawl(target, cookie, depth=depth)
-    targets = discover_targets(urls, cookie, host)
+def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
+                   dom: bool = True, tools: bool = True) -> dict:
+    """Full blind flow covering BOTH profiles: blatant injection (DVWA-style) AND the
+    hardened-app profile (config/passive + vulnerable JS + API + DOM-based). Returns
+    {urls, targets, findings} with findings verified."""
+    from .dom import dom_probe
+    from .jsanalysis import analyze_js
+    from .passive import passive_scan
 
+    urls = blind_crawl(target, cookie, depth=depth)
+
+    # JS/API discovery: pull API routes out of JS so unlinked endpoints get tested too.
+    js_urls = [u for u in urls if u.split("?")[0].endswith(".js")]
+    api_eps, vuln_libs = analyze_js(js_urls, cookie, host)
+    urls = sorted(set(urls) | set(api_eps))
+
+    targets = discover_targets(urls, cookie, host)
     findings: list[Finding] = []
-    findings += run_nuclei_dast([t.url for t in targets if t.method == "GET" and t.params], cookie)
-    for t in targets:
-        if t.params:
-            findings += run_sqlmap(t, cookie)
-    # verify tool findings + run the independent completeness probes
+
+    # 1) injection tools (breadth) + independent completeness probes (6 blatant classes)
+    if tools:
+        findings += run_nuclei_dast([t.url for t in targets if t.method == "GET" and t.params], cookie)
+        for t in targets:
+            if t.params:
+                findings += run_sqlmap(t, cookie)
     findings = [verify_finding(f, cookie) for f in findings]
     findings += probe_targets(targets, cookie)
+
+    # 2) passive/config (hardened-app bulk: headers, cookies, CORS, TLS hygiene)
+    for pf in passive_scan(urls, cookie):
+        findings.append(Finding(tool="passive", category=pf.category, url=pf.url,
+                                param=pf.check, evidence=pf.detail, verified=True))
+
+    # 3) vulnerable JS dependencies
+    for vl in vuln_libs:
+        findings.append(Finding(tool="jsanalysis", category="vulnerable-component", url=vl.url,
+                                param=vl.library, evidence=f"{vl.library} {vl.version}: {vl.detail}",
+                                verified=True))
+
+    # 4) DOM-based (headless): DOM-XSS + DOM open-redirect on HTML pages
+    if dom:
+        html_pages = sorted({u.split("#")[0] for u in urls
+                             if not u.split("?")[0].endswith((".js", ".css", ".png", ".jpg",
+                                                              ".svg", ".ico", ".woff", ".map"))})
+        # map discovered params per page for DOM source testing
+        page_params: dict = {}
+        for t in targets:
+            page_params.setdefault(t.url.split("?")[0], set()).update(t.params)
+        for pg in html_pages[:25]:
+            for d in dom_probe(pg, cookie, params=sorted(page_params.get(pg, []))):
+                findings.append(Finding(tool="dom", category=d.category, url=d.url,
+                                        param=d.source, evidence=d.evidence, verified=True))
 
     # dedup by (category, path, param)
     seen: set = set(); uniq: list[Finding] = []
