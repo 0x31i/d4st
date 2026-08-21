@@ -271,6 +271,18 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
     if not ok:
         raise click.ClickException(f"session invalid ({note}); re-capture before an engagement.")
 
+    # Pre-flight: prove the parse paths still work against canaries, so a stale parser can't
+    # silently under-report on this run.
+    from .selftest import run_selftest
+    st = run_selftest()
+    failed = [r for r in st if not r.passed]
+    if failed:
+        for r in failed:
+            console.print(f"[red]parse self-test FAIL[/red] {r.check}: {r.detail}")
+        raise click.ClickException("aborting: a tool/parser self-test failed (see above). "
+                                   "Findings could be silently missed. Fix parsers, then re-run.")
+    console.print(f"[green]parse self-test: {len(st)} checks healthy[/green]")
+
     from .updater import stale_components
     stale = stale_components()
     if stale:
@@ -296,6 +308,21 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
         with open(out_path, "w", encoding="utf-8") as fh:
             _json.dump(result, fh, indent=2)
         console.print(f"report -> {out_path}")
+
+
+@main.command()
+def selftest() -> None:
+    """Verify every tool->parser path against known-vulnerable canaries. Fails loudly if a
+    parser has gone stale (e.g. a tool changed its output format), so silent under-reporting
+    can't happen. Run before an engagement (the engagement runs it automatically)."""
+    from .selftest import run_selftest, selftest_ok
+    results = run_selftest()
+    for r in results:
+        tag = "[green]PASS[/green]" if r.passed else "[red]FAIL[/red]"
+        console.print(f"  {tag}  {r.check:<22} {r.detail}")
+    if not selftest_ok(results):
+        raise click.ClickException("parse self-test FAILED — a parser is stale; fix before scanning.")
+    console.print("[green]all parse paths healthy[/green]")
 
 
 @main.command()
