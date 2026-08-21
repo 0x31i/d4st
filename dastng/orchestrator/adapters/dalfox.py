@@ -15,7 +15,8 @@ from .session_util import _cookie_header
 
 
 def parse_dalfox(text: str) -> list[dict]:
-    """dalfox --format json emits either a JSON array of PoC objects or JSONL. Handle both."""
+    """dalfox JSON output. v1 emits a bare array of PoCs; v2 wraps them as
+    {"findings": [...]}; some modes emit JSONL. Handle all three."""
     text = (text or "").strip()
     if not text:
         return []
@@ -24,6 +25,8 @@ def parse_dalfox(text: str) -> list[dict]:
         if isinstance(obj, list):
             return [o for o in obj if isinstance(o, dict)]
         if isinstance(obj, dict):
+            if isinstance(obj.get("findings"), list):   # dalfox v2
+                return [o for o in obj["findings"] if isinstance(o, dict)]
             return [obj]
     except json.JSONDecodeError:
         pass
@@ -56,7 +59,7 @@ class DalfoxAdapter(ToolAdapter):
         if not targets:
             return AdapterResult(tool=self.name, ok=True,
                                  note="no parameterized URLs to test")
-        cmd = f"dalfox file <{len(targets)} urls> --format json"
+        cmd = f"dalfox file <{len(targets)} urls> -f json"
         if ctx.dry_run:
             return AdapterResult(tool=self.name, ok=True, command=cmd,
                                  note=f"dry-run over {len(targets)} url(s)")
@@ -68,10 +71,11 @@ class DalfoxAdapter(ToolAdapter):
             with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
                 fh.write("\n".join(targets))
                 list_path = fh.name
-            args = ["dalfox", "file", list_path, "--format", "json", "--no-color", "--silence"]
+            # dalfox v2 CLI: -f json, --cookies (plural), -S silence.
+            args = ["dalfox", "file", list_path, "-f", "json", "-S"]
             cookie = _cookie_header(ctx.session, ctx.target)
             if cookie:
-                args += ["--cookie", cookie]
+                args += ["--cookies", cookie]
             proc = self._exec(args, timeout=ctx.options.get("timeout", 1800))
         except Exception as exc:  # noqa: BLE001
             return AdapterResult(tool=self.name, ok=False, command=cmd, note=f"exec error: {exc}")

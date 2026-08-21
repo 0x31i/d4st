@@ -13,24 +13,40 @@ from ._targets import candidate_urls
 from .base import AdapterResult, RunContext, ToolAdapter, register
 from .session_util import _cookie_header
 
-# commix reports e.g.:
-#   The (GET) 'ip' parameter is vulnerable to results-based command injection technique.
+# commix reports e.g. (wording varies by version/technique):
+#   POST parameter 'ip' appears to be injectable via (results-based) classic command injection
+#   POST parameter 'ip' is likely vulnerable ...
+#   The (GET) 'ip' parameter is vulnerable to ... (older phrasing)
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _VULN_RE = re.compile(
+    r"\(?(?P<place>GET|POST)\)?\s+parameter\s+'(?P<param>[^']+)'\s+"
+    r"(?:appears to be injectable|is (?:likely )?vulnerable)",
+    re.IGNORECASE,
+)
+# older phrasing: "(GET) 'ip' parameter is vulnerable"
+_VULN_RE_OLD = re.compile(
     r"\((?P<place>GET|POST)\)\s*'(?P<param>[^']+)'\s*parameter is vulnerable",
     re.IGNORECASE,
 )
 
 
 def parse_commix(text: str, url: str = "") -> list[dict]:
+    text = _ANSI.sub("", text or "")
+    seen: set = set()
     out: list[dict] = []
-    for m in _VULN_RE.finditer(text or ""):
-        out.append({
-            "tool": "commix",
-            "url": url,
-            "param": m.group("param"),
-            "place": m.group("place"),
-            "category": "command-injection",
-        })
+    for rx in (_VULN_RE, _VULN_RE_OLD):
+        for m in rx.finditer(text):
+            key = (m.group("param"), m.group("place").upper())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "tool": "commix",
+                "url": url,
+                "param": m.group("param"),
+                "place": m.group("place").upper(),
+                "category": "command-injection",
+            })
     return out
 
 
