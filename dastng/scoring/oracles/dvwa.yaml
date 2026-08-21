@@ -1,0 +1,54 @@
+# DVWA ground truth: known-vulnerable (category, endpoint, param) points at security=low.
+# Endpoints are paths (base URL stripped). Params are the injectable field where applicable.
+# This is the recall oracle for the DVWA pilot; edit if your DVWA build differs.
+name: dvwa
+items:
+  - id: dvwa-sqli
+    category: sql-injection
+    endpoint: /vulnerabilities/sqli/
+    param: id
+  - id: dvwa-sqli-blind
+    category: sql-injection
+    endpoint: /vulnerabilities/sqli_blind/
+    param: id
+    note: blind (boolean/time-based)
+  - id: dvwa-xss-reflected
+    category: xss
+    endpoint: /vulnerabilities/xss_r/
+    param: name
+  - id: dvwa-xss-stored
+    category: xss
+    endpoint: /vulnerabilities/xss_s/
+    param: mtxMessage
+    note: stored (also txtName)
+  - id: dvwa-xss-dom
+    category: xss
+    endpoint: /vulnerabilities/xss_d/
+    param: default
+    note: DOM-based
+  - id: dvwa-command-injection
+    category: command-injection
+    endpoint: /vulnerabilities/exec/
+    param: ip
+  - id: dvwa-file-inclusion
+    category: file-inclusion
+    endpoint: /vulnerabilities/fi/
+    param: page
+    note: LFI/RFI via page=
+  - id: dvwa-file-upload
+    category: file-upload
+    endpoint: /vulnerabilities/upload/
+    param: null
+  - id: dvwa-csrf
+    category: csrf
+    endpoint: /vulnerabilities/csrf/
+    param: null
+  - id: dvwa-open-redirect
+    category: open-redirect
+    endpoint: /vulnerabilities/open_redirect/
+    param: redirect
+    note: present in newer DVWA builds
+  - id: dvwa-weak-session
+    category: weak-session
+    endpoint: /vulnerabilities/weak_id/
+    param: null

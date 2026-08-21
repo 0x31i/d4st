@@ -144,6 +144,84 @@ def auth_show(session_path: str) -> None:
                       f"domain={c.get('domain')} path={c.get('path')}")
 
 
+# Map result filenames (in a --results dir) to tools.
+_RESULT_FILES = {
+    "nuclei": ["nuclei.jsonl", "nuclei.json"],
+    "dalfox": ["dalfox.json", "dalfox.jsonl"],
+    "zap": ["zap.json", "report.json"],
+    "sqlmap": ["sqlmap.txt", "sqlmap.log"],
+    "commix": ["commix.txt", "commix.log"],
+}
+
+
+@main.command()
+@click.option("--oracle", "-O", default="dvwa", help="Ground-truth oracle name (bundled) or path.")
+@click.option("--results", "-r", "results_dir", required=True,
+              help="Directory of native tool outputs (nuclei.jsonl, dalfox.json, zap.json, ...).")
+@click.option("--burp", "burp_path", default=None, help="Burp XML export -> the reference column.")
+@click.option("--out", "-o", "out_path", default=None, help="Write the full report JSON here.")
+def score(oracle: str, results_dir: str, burp_path: str | None, out_path: str | None) -> None:
+    """Score tool outputs against a known-vuln oracle and print a category x tool matrix."""
+    import json as _json
+    import os
+
+    from .scoring.burp import parse_burp
+    from .scoring.normalize import normalize
+    from .scoring.oracle import load_oracle
+    from .scoring.score import build_matrix, matrix_to_dict, score_columns
+
+    orc = load_oracle(oracle)
+    columns: dict[str, list] = {}
+    for tool, names in _RESULT_FILES.items():
+        for fn in names:
+            p = os.path.join(results_dir, fn)
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as fh:
+                    columns[tool] = normalize(tool, fh.read())
+                break
+
+    if burp_path and os.path.exists(burp_path):
+        with open(burp_path, "r", encoding="utf-8") as fh:
+            columns["burp"] = parse_burp(fh.read())
+
+    if not columns:
+        raise click.ClickException(f"no recognized result files found in {results_dir}")
+
+    scored = score_columns(orc, columns)
+    tool_cols = [t for t in ("nuclei", "zap", "sqlmap", "dalfox", "commix") if t in scored]
+    order = tool_cols + ["pipeline"] + (["burp"] if "burp" in scored else [])
+
+    rows = build_matrix(orc, scored, order)
+    table = Table(title=f"coverage vs {orc.name} (recall by category)")
+    table.add_column("category")
+    table.add_column("n", justify="right")
+    for c in order:
+        table.add_column(c, justify="center")
+    if "burp" in scored:
+        table.add_column("Δ pipe-burp", justify="right")
+    for r in rows:
+        cells = [r.category, str(r.total)]
+        for c in order:
+            tp, n = r.recalls.get(c, (0, 0))
+            cells.append(f"{tp}/{n}" if n else "-")
+        if "burp" in scored:
+            d = r.delta
+            tag = "" if d is None else (f"[green]+{d}[/green]" if d > 0
+                                        else (f"[red]{d}[/red]" if d < 0 else "0"))
+            cells.append(tag)
+        table.add_row(*cells)
+    console.print(table)
+
+    prec = " ".join(f"{c}={scored[c].precision:.2f}" for c in order
+                    if scored[c].precision is not None)
+    console.print(f"precision (matched/total findings, DVWA caveat): {prec}")
+
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            _json.dump(matrix_to_dict(orc, scored, order), fh, indent=2)
+        console.print(f"report -> {out_path}")
+
+
 @main.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8810, type=int)
