@@ -1,0 +1,55 @@
+# OCWA (OVERCLOCK Web Application) ground truth, enumerated live from the authenticated
+# index.php vulnerability menu at 192.168.1.229. DVWA-derived with extra modules.
+# Scored set = the classes a DAST scanner can reasonably detect. Non-DAST modules
+# (brute, captcha, cryptography, javascript, api, authbypass) are listed as context, not
+# scored, so they do not unfairly depress recall.
+name: ocwa
+items:
+  - id: ocwa-sqli
+    category: sql-injection
+    endpoint: /vulnerabilities/sqli/
+    param: id
+  - id: ocwa-sqli-blind
+    category: sql-injection
+    endpoint: /vulnerabilities/sqli_blind/
+    param: id
+    note: blind (boolean/time-based)
+  - id: ocwa-xss-reflected
+    category: xss
+    endpoint: /vulnerabilities/xss_r/
+    param: name
+  - id: ocwa-xss-stored
+    category: xss
+    endpoint: /vulnerabilities/xss_s/
+    param: mtxMessage
+    note: stored (POST txtName/mtxMessage)
+  - id: ocwa-xss-dom
+    category: xss
+    endpoint: /vulnerabilities/xss_d/
+    param: default
+    note: DOM-based
+  - id: ocwa-command-injection
+    category: command-injection
+    endpoint: /vulnerabilities/exec/
+    param: ip
+    note: POST ip
+  - id: ocwa-file-inclusion
+    category: file-inclusion
+    endpoint: /vulnerabilities/fi/
+    param: page
+  - id: ocwa-file-upload
+    category: file-upload
+    endpoint: /vulnerabilities/upload/
+    param: null
+  - id: ocwa-csrf
+    category: csrf
+    endpoint: /vulnerabilities/csrf/
+    param: null
+  - id: ocwa-open-redirect
+    category: open-redirect
+    endpoint: /vulnerabilities/open_redirect/
+    param: redirect
+  - id: ocwa-weak-session
+    category: weak-session
+    endpoint: /vulnerabilities/weak_id/
+    param: null
