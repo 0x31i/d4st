@@ -11,7 +11,6 @@ deterministic true positive, not a heuristic.
 
 from __future__ import annotations
 
-import json
 import os
 from urllib.parse import parse_qs, urlsplit
 
@@ -85,10 +84,11 @@ class LfiFuzzAdapter(ToolAdapter):
                 path = _WORDLISTS.get(wl)
                 if not path or not os.path.exists(path):
                     continue
+                # -s makes ffuf print ONLY matched payloads (the FUZZ values) to stdout, one
+                # per line. (-o - -of json does NOT stream JSON to stdout, it drops it.)
                 args = ["ffuf", "-u", fuzz_url, "-w", f"{path}:FUZZ", "-mr", matcher,
                         "-s", "-t", str(ctx.options.get("ffuf_threads", 40)),
-                        "-timeout", str(ctx.options.get("http_timeout", 6)),
-                        "-o", "-", "-of", "json"]
+                        "-timeout", str(ctx.options.get("http_timeout", 6))]
                 if cookie:
                     args += ["-H", f"Cookie: {cookie}"]
                 try:
@@ -110,19 +110,7 @@ class LfiFuzzAdapter(ToolAdapter):
 
 
 def _parse_ffuf(raw: str) -> list[str]:
-    """ffuf -of json -o - emits a single JSON doc with a 'results' array (matcher-filtered)."""
-    raw = (raw or "").strip()
-    if not raw:
-        return []
-    try:
-        doc = json.loads(raw)
-    except json.JSONDecodeError:
-        # ffuf sometimes prefixes banner lines; grab the JSON object
-        i = raw.find("{")
-        if i < 0:
-            return []
-        try:
-            doc = json.loads(raw[i:])
-        except json.JSONDecodeError:
-            return []
-    return [r.get("input", {}).get("FUZZ", "") for r in doc.get("results", [])]
+    """ffuf -s prints one matched payload (the FUZZ value) per line; each line is a traversal
+    payload whose response matched a filesystem signature -> a confirmed hit."""
+    return [ln.strip() for ln in (raw or "").splitlines()
+            if ln.strip() and not ln.startswith("[")]
