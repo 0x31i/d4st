@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 
 from .base import AdapterResult, RunContext, ToolAdapter, register
+from .session_util import _session_header_args
 
 
 @register
@@ -22,7 +23,7 @@ class KatanaAdapter(ToolAdapter):
 
     def run(self, ctx: RunContext) -> AdapterResult:
         args = ["katana", "-u", ctx.target, "-jc", "-silent", "-json"]
-        # Phase 1 will inject: -H "Cookie: ..." / -H "Authorization: ..." from ctx.session.
+        args += _session_header_args(ctx.session, ctx.target)
         cmd = " ".join(args)
 
         if ctx.dry_run:
