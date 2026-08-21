@@ -246,8 +246,12 @@ def score(oracle: str, results_dir: str, burp_path: str | None, out_path: str | 
 @click.option("--target", "-t", required=True, help="Base URL (blind: no endpoints supplied).")
 @click.option("--session", "-s", "session_path", required=True, help="Captured session JSON.")
 @click.option("--depth", default=3, type=int, help="Crawl depth.")
+@click.option("--profile", default="normal",
+              type=click.Choice(["polite", "normal", "aggressive"]),
+              help="Politeness: 'polite' throttles hard for lockout-prone production targets.")
 @click.option("--out", "-o", "out_path", default=None, help="Write findings JSON here.")
-def engagement(target: str, session_path: str, depth: int, out_path: str | None) -> None:
+def engagement(target: str, session_path: str, depth: int, profile: str,
+               out_path: str | None) -> None:
     """Blind engagement: crawl -> discover forms/CSRF -> scan (CSRF-aware) -> verify -> report.
 
     Does NOT know where the vulns are. Active scanning; authorized targets only.
@@ -268,7 +272,7 @@ def engagement(target: str, session_path: str, depth: int, out_path: str | None)
         raise click.ClickException(f"session invalid ({note}); re-capture before an engagement.")
     console.print(f"[green]session valid[/green] · crawling {target} blind...")
 
-    result = run_engagement(target, cookie, host, depth=depth)
+    result = run_engagement(target, cookie, host, depth=depth, profile=profile)
     console.print(f"crawled {len(result['urls'])} urls · {result['targets']} injection targets")
 
     table = Table(title=f"blind engagement · {target}")
