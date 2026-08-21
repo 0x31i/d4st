@@ -243,6 +243,52 @@ def score(oracle: str, results_dir: str, burp_path: str | None, out_path: str | 
 
 
 @main.command()
+@click.option("--target", "-t", required=True, help="Base URL (blind: no endpoints supplied).")
+@click.option("--session", "-s", "session_path", required=True, help="Captured session JSON.")
+@click.option("--depth", default=3, type=int, help="Crawl depth.")
+@click.option("--out", "-o", "out_path", default=None, help="Write findings JSON here.")
+def engagement(target: str, session_path: str, depth: int, out_path: str | None) -> None:
+    """Blind engagement: crawl -> discover forms/CSRF -> scan (CSRF-aware) -> verify -> report.
+
+    Does NOT know where the vulns are. Active scanning; authorized targets only.
+    """
+    import json as _json
+    from urllib.parse import urlsplit
+
+    from .auth.session import Session
+    from .auth.validity import is_valid
+    from .engagement import run_engagement
+
+    sess = Session.load(session_path)
+    host = urlsplit(target).hostname or ""
+    cookie = sess.cookie_header(host)
+    ok, note = is_valid(sess, sess.meta.get("validity_url") or target,
+                        sess.meta.get("validity_marker") or "Logout")
+    if not ok:
+        raise click.ClickException(f"session invalid ({note}); re-capture before an engagement.")
+    console.print(f"[green]session valid[/green] · crawling {target} blind...")
+
+    result = run_engagement(target, cookie, host, depth=depth)
+    console.print(f"crawled {len(result['urls'])} urls · {result['targets']} injection targets")
+
+    table = Table(title=f"blind engagement · {target}")
+    table.add_column("category"); table.add_column("tool"); table.add_column("param")
+    table.add_column("verified"); table.add_column("evidence")
+    for f in result["findings"]:
+        v = f["verified"]
+        vtag = "[green]CONFIRMED[/green]" if v is True else ("[red]refuted[/red]" if v is False
+                                                             else "[dim]tool[/dim]")
+        table.add_row(f["category"], f["tool"], str(f["param"]), vtag, (f["evidence"] or "")[:50])
+    console.print(table)
+    confirmed = sum(1 for f in result["findings"] if f["verified"] is True)
+    console.print(f"findings: {len(result['findings'])} ({confirmed} independently verified)")
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            _json.dump(result, fh, indent=2)
+        console.print(f"report -> {out_path}")
+
+
+@main.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8810, type=int)
 def serve(host: str, port: int) -> None:
