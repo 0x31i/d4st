@@ -16,3 +16,4 @@ sessions/
 results/
 .tools/
 .output/
+results_*
