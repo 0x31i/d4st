@@ -9,6 +9,9 @@ password_selector: "input[name=password]"
 submit_selector: "input[name=Login], input[type=submit]"
 username: admin
 password: password
+# Override creds without committing them: export DASTNG_OCWA_USER / DASTNG_OCWA_PASS
+username_env: DASTNG_OCWA_USER
+password_env: DASTNG_OCWA_PASS
 
 success:
   url_contains: "homepage.php"
