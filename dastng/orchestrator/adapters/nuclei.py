@@ -8,6 +8,7 @@ template checks are passive-ish; the fuzzing/DAST payloads are ACTIVE (authoriza
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 
 from .base import AdapterResult, RunContext, ToolAdapter, register
@@ -27,12 +28,25 @@ class NucleiAdapter(ToolAdapter):
         targets = ctx.seed_urls or [ctx.target]
         args = ["nuclei", "-jsonl", "-silent"]
         args += _session_header_args(ctx.session, ctx.target)
-        # Phase 2: -dast -ft/-fm, -secret-file <auth>, -iserver <interactsh>.
-        cmd = "nuclei -jsonl -silent -l <frontier>"
+
+        # -dast turns on the fuzzing engine (the OSS answer to Burp active scan). Enabled by
+        # the workflow (options.nuclei_dast) and only when active scanning is authorized.
+        dast = bool(ctx.options.get("nuclei_dast"))
+        if dast:
+            args += ["-dast"]
+        # interactsh (OAST) for blind/out-of-band detection. Self-hosted server via env, else
+        # nuclei uses its default hosted server.
+        iserver = os.environ.get("DASTNG_INTERACTSH_SERVER")
+        if iserver:
+            args += ["-iserver", iserver]
+
+        cmd = "nuclei -jsonl -silent" + (" -dast" if dast else "") + \
+              (f" -iserver {iserver}" if iserver else "") + " -l <frontier>"
 
         if ctx.dry_run:
             return AdapterResult(tool=self.name, ok=True, command=cmd,
-                                 note=f"dry-run over {len(targets)} target(s)")
+                                 note=f"dry-run over {len(targets)} target(s)"
+                                      + (" [dast]" if dast else ""))
         if not self.available():
             return AdapterResult(tool=self.name, ok=False, command=cmd,
                                  note="nuclei binary not found on PATH")
