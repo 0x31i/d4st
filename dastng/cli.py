@@ -246,9 +246,13 @@ def score(oracle: str, results_dir: str, burp_path: str | None, out_path: str | 
 @click.option("--target", "-t", required=True, help="Base URL (blind: no endpoints supplied).")
 @click.option("--session", "-s", "session_path", required=True, help="Captured session JSON.")
 @click.option("--depth", default=3, type=int, help="Crawl depth.")
-@click.option("--profile", default="normal",
-              type=click.Choice(["polite", "normal", "aggressive"]),
-              help="Politeness: 'polite' throttles hard for lockout-prone production targets.")
+@click.option("--profile", default="staging",
+              type=click.Choice(["production-safe", "passive-only", "staging", "aggressive",
+                                 "polite", "normal"]),
+              help="Scan safety policy. 'production-safe': live/client infra (throttled, no "
+                   "data mutation, no destructive endpoints, safe sqlmap). 'passive-only': "
+                   "read-only recon. 'staging'/'aggressive': disposable targets. "
+                   "(polite=production-safe, normal=staging aliases.)")
 @click.option("--out", "-o", "out_path", default=None, help="Write findings JSON here.")
 def engagement(target: str, session_path: str, depth: int, profile: str,
                out_path: str | None) -> None:
@@ -288,10 +292,18 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
     if stale:
         console.print(f"[yellow]stale detection content[/yellow]: {', '.join(stale)} "
                       f"— run `dast-ng update` for freshest templates/rules (or proceed offline).")
+    if profile in ("production-safe", "passive-only"):
+        console.print(f"[cyan]safety policy[/cyan]: [bold]{profile}[/bold] — throttled, "
+                      f"{'no attack traffic' if profile == 'passive-only' else 'no data mutation / no destructive endpoints / safe sqlmap'}")
     console.print(f"[green]session valid[/green] · crawling {target} blind...")
 
     result = run_engagement(target, cookie, host, depth=depth, profile=profile)
     console.print(f"crawled {len(result['urls'])} urls · {result['targets']} injection targets")
+    pol = result.get("policy", {})
+    if pol:
+        console.print(f"[dim]policy {pol['name']}: active={pol['active_scan']} "
+                      f"fuzz_forms={pol['fuzz_forms']} sqlmap[{pol['sqlmap']}] · "
+                      f"{pol['state_changing_endpoints_skipped']} destructive endpoint(s) skipped[/dim]")
 
     table = Table(title=f"blind engagement · {target}")
     table.add_column("category"); table.add_column("tool"); table.add_column("param")
