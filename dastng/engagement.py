@@ -408,6 +408,14 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                                 param=vl.library, evidence=f"{vl.library} {vl.version}: {vl.detail}",
                                 verified=True))
 
+    # 3b) Semgrep JS static analysis: source->sink flows in code the runtime DOM pass never
+    # triggers (belt-and-suspenders for DOM data-manipulation / XSS). No-op if semgrep absent.
+    from .jsanalysis import run_semgrep_js
+    for sg in run_semgrep_js(js_urls, cookie):
+        findings.append(Finding(tool="semgrep", category=sg["category"], url=sg.get("path", ""),
+                                param=sg.get("check"), method="static",
+                                evidence=(sg.get("message") or "")[:120]))
+
     # 4) DOM-based (headless): DOM-XSS + DOM open-redirect on HTML pages
     if dom:
         html_pages = sorted({u.split("#")[0] for u in urls
