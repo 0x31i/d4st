@@ -14,20 +14,30 @@ from .base import AdapterResult, RunContext, ToolAdapter, register
 from .session_util import _cookie_header
 
 
+def _is_finding(o) -> bool:
+    """A real dalfox finding, not the v3 'meta' summary line."""
+    if not isinstance(o, dict) or "meta" in o:
+        return False
+    # finding objects carry at least one of these
+    return any(k in o for k in ("type", "cwe", "param", "payload", "data", "message_str",
+                                "inject_type", "evidence"))
+
+
 def parse_dalfox(text: str) -> list[dict]:
-    """dalfox JSON output. v1 emits a bare array of PoCs; v2 wraps them as
-    {"findings": [...]}; some modes emit JSONL. Handle all three."""
+    """dalfox JSON output across versions: v1 bare array of PoCs; v2 {"findings": [...]};
+    v3 emits a JSONL stream where the first line is a {"meta": ...} summary followed by one
+    JSON object per finding. Skip the meta line so it is not miscounted as a finding."""
     text = (text or "").strip()
     if not text:
         return []
     try:
         obj = json.loads(text)
         if isinstance(obj, list):
-            return [o for o in obj if isinstance(o, dict)]
+            return [o for o in obj if _is_finding(o)]
         if isinstance(obj, dict):
             if isinstance(obj.get("findings"), list):   # dalfox v2
                 return [o for o in obj["findings"] if isinstance(o, dict)]
-            return [obj]
+            return [obj] if _is_finding(obj) else []
     except json.JSONDecodeError:
         pass
     out: list[dict] = []
@@ -37,10 +47,10 @@ def parse_dalfox(text: str) -> list[dict]:
             continue
         try:
             o = json.loads(line)
-            if isinstance(o, dict):
-                out.append(o)
         except json.JSONDecodeError:
             continue
+        if _is_finding(o):
+            out.append(o)
     return out
 
 
