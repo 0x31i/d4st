@@ -322,10 +322,15 @@ def run_nuclei_dast(urls: list[str], cookie: str, politeness=None) -> list[Findi
             for n in normalize_nuclei(out)]
 
 
-def run_sqlmap(t: Target, cookie: str, politeness=None) -> list[Finding]:
-    """CSRF-aware sqlmap: passes --csrf-token/--csrf-url when the form carries a token."""
-    args = ["sqlmap", "--batch", "--level", "2", "--risk", "2", "--disable-coloring",
-            "--flush-session", "--technique=BEUST"]
+def run_sqlmap(t: Target, cookie: str, politeness=None, policy=None) -> list[Finding]:
+    """CSRF-aware sqlmap: passes --csrf-token/--csrf-url when the form carries a token.
+    Injection depth (level/risk/technique) comes from the ScanPolicy: production-safe uses
+    level 2 / risk 1 / BEU (no time-hang, no stacked queries -> cannot mutate/hang the DB)."""
+    args = ["sqlmap", "--batch", "--disable-coloring", "--flush-session"]
+    if policy is not None:
+        args += policy.sqlmap_args()
+    else:
+        args += ["--level", "2", "--risk", "2", "--technique=BEUST"]
     if politeness:
         args += politeness.sqlmap_flags()
     if t.method == "POST":
@@ -343,11 +348,13 @@ def run_sqlmap(t: Target, cookie: str, politeness=None) -> list[Finding]:
             for n in normalize_sqlmap(out)]
 
 
-def probe_targets(targets: list[Target], cookie: str, politeness=None) -> list[Finding]:
+def probe_targets(targets: list[Target], cookie: str, politeness=None,
+                  fuzz_forms: bool = True) -> list[Finding]:
     """Completeness safety-net: independently replay EVERY blatant-vuln class on every
     discovered param, so a payload-set gap in any scanner does not become a missed finding.
     Deterministic, strong-signature checks only (low false-positive). Throttled when a
-    politeness profile is given (avoids tripping rate limits/WAF on production targets)."""
+    politeness profile is given (avoids tripping rate limits/WAF on production targets).
+    When fuzz_forms is False (production-safe), stored-XSS (which WRITES data) is skipped."""
     from .safety import is_auth_endpoint
     out: list[Finding] = []
 
@@ -376,8 +383,9 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None) -> list[F
             ok, note = verify_open_redirect(t.url, param, t.method, cookie)
             if ok:
                 add("open-redirect", t.url, param, t.method, note)
-            # stored XSS only makes sense on POST forms (inject then re-view the page)
-            if t.method == "POST":
+            # stored XSS only makes sense on POST forms (inject then re-view the page).
+            # It WRITES data, so it is skipped under production-safe (fuzz_forms=False).
+            if t.method == "POST" and fuzz_forms:
                 ok, note = verify_stored_xss(t, param, cookie)
                 if ok:
                     add("xss", t.url, param, t.method, f"stored: {note}")
@@ -390,15 +398,18 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     hardened-app profile (config/passive + vulnerable JS + API + DOM-based). Returns
     {urls, targets, findings} with findings verified.
 
-    profile: politeness ('polite'|'normal'|'aggressive'). 'polite' throttles hard for
-    lockout-prone production targets. Auth endpoints (login/logout/reset) are NEVER actively
-    tested regardless of profile, so the scan cannot lock accounts."""
+    profile: ScanPolicy name. 'production-safe' (live/client infra) throttles hard, sends NO
+    data-mutating traffic, skips destructive/notifying endpoints, and limits sqlmap to safe
+    techniques. 'passive-only' sends no attack traffic at all. 'staging'/'aggressive' are for
+    disposable targets. Auth endpoints (login/logout/reset) are NEVER actively tested under any
+    profile, so the scan cannot lock accounts."""
     from .dom import dom_probe
     from .jsanalysis import analyze_js
     from .passive import passive_scan
-    from .safety import PROFILES, is_auth_endpoint
+    from .safety import get_policy, is_auth_endpoint, is_state_changing
 
-    pol = PROFILES.get(profile, PROFILES["normal"])
+    policy = get_policy(profile)
+    pol = policy.politeness
     urls = blind_crawl(target, cookie, depth=depth, politeness=pol)
 
     # JS/API discovery: pull API routes out of JS so unlinked endpoints get tested too.
@@ -410,17 +421,29 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # SAFETY: never actively test auth endpoints (submitting payloads/failed logins there
     # locks accounts and logs the scanner out). Passive checks still cover them read-only.
     targets = [t for t in targets if not is_auth_endpoint(t.url)]
+    # SAFETY: under production-safe, never fuzz destructive/notifying endpoints
+    # (delete/send/pay/...). They are still crawled + passively analyzed, just not attacked.
+    active_targets = targets
+    skipped_state_changing = 0
+    if policy.skip_state_changing:
+        active_targets = [t for t in targets if not is_state_changing(t.url)]
+        skipped_state_changing = len(targets) - len(active_targets)
+    # production-safe also skips POST-form fuzzing entirely (no data mutation)
+    if not policy.fuzz_forms:
+        active_targets = [t for t in active_targets if t.method != "POST"]
     findings: list[Finding] = []
 
-    # 1) injection tools (breadth) + independent completeness probes (6 blatant classes)
-    if tools:
-        findings += run_nuclei_dast([t.url for t in targets if t.method == "GET" and t.params],
-                                    cookie, politeness=pol)
-        for t in targets:
+    # 1) injection tools (breadth) + independent completeness probes (6 blatant classes).
+    #    Skipped entirely under passive-only (active_scan=False): read-only recon.
+    if tools and policy.active_scan:
+        findings += run_nuclei_dast([t.url for t in active_targets
+                                     if t.method == "GET" and t.params], cookie, politeness=pol)
+        for t in active_targets:
             if t.params:
-                findings += run_sqlmap(t, cookie, politeness=pol)
-    findings = [verify_finding(f, cookie) for f in findings]
-    findings += probe_targets(targets, cookie, politeness=pol)
+                findings += run_sqlmap(t, cookie, politeness=pol, policy=policy)
+        findings = [verify_finding(f, cookie) for f in findings]
+        findings += probe_targets(active_targets, cookie, politeness=pol,
+                                  fuzz_forms=policy.fuzz_forms)
 
     # 2) passive/config (hardened-app bulk: headers, cookies, CORS, TLS hygiene)
     for pf in passive_scan(urls, cookie):
@@ -441,8 +464,9 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                                 param=sg.get("check"), method="static",
                                 evidence=(sg.get("message") or "")[:120]))
 
-    # 4) DOM-based (headless): DOM-XSS + DOM open-redirect on HTML pages
-    if dom:
+    # 4) DOM-based (headless): DOM-XSS + DOM open-redirect on HTML pages. This injects via a
+    #    headless browser (client-side), so it is skipped under passive-only (no attack traffic).
+    if dom and policy.active_scan:
         html_pages = sorted({u.split("#")[0] for u in urls
                              if not u.split("?")[0].endswith((".js", ".css", ".png", ".jpg",
                                                               ".svg", ".ico", ".woff", ".map"))})
@@ -465,6 +489,16 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     return {
         "urls": urls, "targets": len(targets),
         "findings": [f.__dict__ for f in uniq],
+        # surface what the safety policy constrained, so coverage caps are never silent
+        "policy": {
+            "name": policy.name,
+            "active_scan": policy.active_scan,
+            "fuzz_forms": policy.fuzz_forms,
+            "skip_state_changing": policy.skip_state_changing,
+            "state_changing_endpoints_skipped": skipped_state_changing,
+            "sqlmap": f"level {policy.sqlmap_level} risk {policy.sqlmap_risk} "
+                      f"technique {policy.sqlmap_technique}",
+        },
     }
 
 
