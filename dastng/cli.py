@@ -34,9 +34,11 @@ def version() -> None:
 @click.option("--allow-active", is_flag=True, default=False,
               help="Authorize active attack traffic for this target (required by active tools).")
 @click.option("--dry-run", is_flag=True, default=False, help="Plan only; run no tools.")
+@click.option("--force", is_flag=True, default=False,
+              help="Scan even if the session fails its validity probe (not recommended).")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON.")
 def launch(workflow: str, target: str, session_path: str | None,
-           allow_active: bool, dry_run: bool, as_json: bool) -> None:
+           allow_active: bool, dry_run: bool, force: bool, as_json: bool) -> None:
     """Run a scanning workflow against a target."""
     Config.from_env()  # loaded for side effects / future DB + egress wiring
     spec = load_workflow(workflow)
@@ -45,6 +47,24 @@ def launch(workflow: str, target: str, session_path: str | None,
     if session_path:
         with open(session_path, "r", encoding="utf-8") as fh:
             session = json.load(fh)
+        # Gate: never scan logged-out. If the session fails its validity probe, abort loudly
+        # instead of silently producing unauthenticated (garbage) results.
+        if not dry_run:
+            from .auth.session import Session
+            from .auth.validity import is_valid
+            sess = Session.from_dict(session)
+            marker = sess.meta.get("validity_marker") or "Logout"
+            probe_url = sess.meta.get("validity_url") or sess.origin or target
+            ok, note = is_valid(sess, probe_url, marker)
+            if ok:
+                console.print(f"[green]session valid[/green]: {note}")
+            elif force:
+                console.print(f"[yellow]session INVALID but --force set[/yellow]: {note}")
+            else:
+                raise click.ClickException(
+                    f"session invalid ({note}); refusing to scan logged-out. Re-capture with "
+                    f"`dast-ng auth capture` (check credentials), or pass --force to override."
+                )
 
     runner = WorkflowRunner(
         spec, allow_active=allow_active, dry_run=dry_run,

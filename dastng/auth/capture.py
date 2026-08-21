@@ -77,8 +77,9 @@ def capture_scripted(profile: AuthProfile, base: str | None = None, *,
         browser.close()
 
     session = Session(name=profile.name, origin=base, storage_state=state,
-                      meta={"profile": profile.name, "mode": "scripted",
-                            "security": security or ""})
+                      meta={"profile": profile.name, "mode": "scripted", "security": security or "",
+                            "validity_url": profile.validity_url(base),
+                            "validity_marker": profile.validity_marker() or ""})
     _apply_post_login_cookies(session, profile, base, security)
     return session
 
@@ -110,7 +111,8 @@ def capture_interactive(profile: AuthProfile, base: str | None = None, *,
         browser.close()
 
     session = Session(name=profile.name, origin=base, storage_state=state,
-                      meta={"profile": profile.name, "mode": "interactive",
-                            "security": security or ""})
+                      meta={"profile": profile.name, "mode": "interactive", "security": security or "",
+                            "validity_url": profile.validity_url(base),
+                            "validity_marker": profile.validity_marker() or ""})
     _apply_post_login_cookies(session, profile, base, security)
     return session
