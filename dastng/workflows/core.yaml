@@ -2,29 +2,33 @@
 # Discovery stages feed the shared frontier; detection stages consume the converged
 # frontier. Tools referenced here must be registered adapters (dastng/orchestrator/adapters).
 #
-# Phase 0: only katana + nuclei adapters exist. The remaining tools are declared here as
-# the target shape and get their adapters in Phase 2 (they are skipped with a clear note
-# until then).
+# The active tools (nuclei -dast, zap, sqlmap, dalfox, commix) emit attack traffic and are
+# skipped unless the run authorizes them (--allow-active). ZAP is both discovery + detection
+# (spider + active scan), so it also feeds the frontier.
 name: core
 description: Core subset pipeline for the DVWA and WAVSEP coverage pilot
 max_rounds: 3
 
 options:
   timeout: 1800
+  nuclei_dast: true      # turn on the nuclei fuzzing engine
+  inject_cap: 0          # 0 = no cap on injection targets (log if you set one)
+  sqlmap_level: 1
+  sqlmap_risk: 1
 
 stages:
   - name: crawl
     kind: discovery
     tools:
       - katana
-      # - zap_spider   # Phase 2
-      # - domdig       # Phase 2
+      # zap also discovers; it runs in the scan stage but feeds the frontier too
+      # - domdig       # Phase 5
 
   - name: scan
     kind: detection
     tools:
       - nuclei
-      # - zap_active   # Phase 2
-      # - sqlmap       # Phase 2
-      # - dalfox       # Phase 2
-      # - commix       # Phase 2
+      - zap
+      - sqlmap
+      - dalfox
+      - commix
