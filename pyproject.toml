@@ -40,7 +40,7 @@ dast-ng = "dastng.cli:main"
 include = ["dastng*"]
 
 [tool.setuptools.package-data]
-dastng = ["workflows/*.yaml", "auth/profiles/*.yaml", "scoring/oracles/*.yaml"]
+dastng = ["rules/*.yaml", "workflows/*.yaml", "auth/profiles/*.yaml", "scoring/oracles/*.yaml"]
 
 [tool.ruff]
 line-length = 120

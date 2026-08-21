@@ -32,3 +32,22 @@ def test_recent_jquery_not_flagged():
 def test_detect_lodash_prototype_pollution():
     v = detect_vuln_libs("", "https://h/js/lodash-4.17.10.min.js")
     assert v and v[0].library == "lodash"
+
+
+def test_semgrep_category_mapping():
+    from dastng.jsanalysis import _semgrep_category
+    assert _semgrep_category("dom-source-to-redirect", ["CWE-601"]) == "open-redirect"
+    assert _semgrep_category("dom-source-to-data-sink", []) == "dom-data-manipulation"
+    assert _semgrep_category("dom-source-to-html-sink", ["CWE-79"]) == "xss"
+    assert _semgrep_category("hardcoded-secret", ["CWE-798"]) == "info-disclosure"
+
+
+def test_parse_semgrep_json():
+    import json
+
+    from dastng.jsanalysis import parse_semgrep_json
+    doc = json.dumps({"results": [{"check_id": "rules.dom-source-to-html-sink",
+                      "path": "a.js", "start": {"line": 3},
+                      "extra": {"message": "DOM XSS", "metadata": {"cwe": ["CWE-79"]}}}]})
+    out = parse_semgrep_json(doc)
+    assert out[0]["category"] == "xss" and out[0]["line"] == 3

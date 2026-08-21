@@ -1,0 +1,45 @@
+rules:
+  - id: dom-source-to-html-sink
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >
+      DOM-based XSS: a tainted DOM source (location/document.URL/referrer/window.name) flows
+      into an HTML sink (innerHTML/outerHTML/insertAdjacentHTML/document.write).
+    metadata: {cwe: "CWE-79", category: security, subcategory: dom-xss}
+    patterns:
+      - pattern-either:
+          - pattern: $EL.innerHTML = <... location ...>
+          - pattern: $EL.outerHTML = <... location ...>
+          - pattern: $EL.insertAdjacentHTML($P, <... location ...>)
+          - pattern: document.write(<... location ...>)
+          - pattern: document.writeln(<... location ...>)
+          - pattern: $EL.innerHTML = <... document.URL ...>
+          - pattern: $EL.innerHTML = <... document.referrer ...>
+          - pattern: $EL.innerHTML = <... window.name ...>
+          - pattern: $F.html(<... location ...>)
+  - id: dom-source-to-data-sink
+    languages: [javascript, typescript]
+    severity: INFO
+    message: >
+      DOM data manipulation: a tainted DOM source flows into a non-executing sink
+      (setAttribute/cookie/localStorage/element value).
+    metadata: {cwe: "CWE-79", category: security, subcategory: dom-data-manipulation}
+    patterns:
+      - pattern-either:
+          - pattern: $EL.setAttribute($A, <... location ...>)
+          - pattern: document.cookie = <... location ...>
+          - pattern: localStorage.setItem($K, <... location ...>)
+          - pattern: sessionStorage.setItem($K, <... location ...>)
+          - pattern: $EL.value = <... location ...>
+  - id: dom-source-to-redirect
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: "DOM open redirect: a tainted DOM source drives a navigation sink."
+    metadata: {cwe: "CWE-601", category: security, subcategory: open-redirect}
+    patterns:
+      - pattern-either:
+          - pattern: location.href = <... location.hash ...>
+          - pattern: location = <... location.hash ...>
+          - pattern: location.replace(<... location.hash ...>)
+          - pattern: location.assign(<... location.hash ...>)
+          - pattern: window.open(<... location.hash ...>)
