@@ -10,3 +10,10 @@ def test_cookies_parsed_for_playwright():
 
 def test_empty_cookie():
     assert _cookies_for("", "h.test") == []
+
+
+def test_taint_harness_has_marker_and_sinks():
+    from dastng.dom import _TAINT, _TAINT_HARNESS
+    assert _TAINT in _TAINT_HARNESS
+    for sink in ("document.cookie", "storage.setItem", "setAttribute", "innerHTML", "input.value"):
+        assert sink in _TAINT_HARNESS
