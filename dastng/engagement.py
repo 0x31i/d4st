@@ -15,6 +15,7 @@ and false positives never reach the report.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -372,3 +373,42 @@ def run_engagement(target: str, cookie: str, host: str,
         "urls": urls, "targets": len(targets),
         "findings": [f.__dict__ for f in uniq],
     }
+
+
+# ----- ZAP (passive categories + generative active scan, dockerized) ----------
+
+def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400) -> list[Finding]:
+    """OWASP ZAP full-scan via docker (authenticated, logout-excluded). Adds the passive
+    categories (CSRF, cookie/session hygiene, CSP, headers) and a generative active scan that
+    corroborates injection classes. Requires a running docker (colima) + the zaproxy image."""
+    import os
+
+    from .scoring.normalize import normalize_zap
+    ck = cookie.replace("; ", ";")
+    zopts = (
+        "-config replacer.full_list(0).description=auth "
+        "-config replacer.full_list(0).enabled=true "
+        "-config replacer.full_list(0).matchtype=REQ_HEADER "
+        "-config replacer.full_list(0).matchstr=Cookie "
+        "-config replacer.full_list(0).regex=false "
+        f"-config replacer.full_list(0).replacement={ck} "
+        "-config globalexcludeurl.url_list.url(0).regex=.*logout.* "
+        "-config globalexcludeurl.url_list.url(0).enabled=true "
+        "-config anticsrf.tokens.token(0).name=user_token "
+        "-config anticsrf.tokens.token(0).enabled=true"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    args = ["docker", "run", "--rm", "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
+            "zaproxy/zap-stable", "zap-full-scan.py", "-t", target,
+            "-J", "zap.json", "-j", "-I", "-z", zopts]
+    _run(args, timeout=timeout)
+    report_path = os.path.join(out_dir, "zap.json")
+    if not os.path.exists(report_path):
+        return []
+    with open(report_path, encoding="utf-8") as fh:
+        report = json.load(fh)
+    out: list[Finding] = []
+    for n in normalize_zap(report):
+        out.append(Finding(tool="zap", category=n.category, url=n.url, param=n.param,
+                           evidence=n.raw.get("name", "")))
+    return out
