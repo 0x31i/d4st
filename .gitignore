@@ -17,3 +17,6 @@ results/
 .tools/
 .output/
 results_*
+
+# fetched tool payloads/templates (see scripts/fetch_vendor.sh)
+vendor/
