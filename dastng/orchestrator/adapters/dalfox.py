@@ -77,19 +77,31 @@ class DalfoxAdapter(ToolAdapter):
             return AdapterResult(tool=self.name, ok=False, command=cmd,
                                  note="dalfox binary not found on PATH")
 
-        try:
-            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
-                fh.write("\n".join(targets))
-                list_path = fh.name
-            # dalfox v2 CLI: -f json, --cookies (plural), -S silence.
-            args = ["dalfox", "file", list_path, "-f", "json", "-S"]
-            cookie = _cookie_header(ctx.session, ctx.target)
-            if cookie:
-                args += ["--cookies", cookie]
-            proc = self._exec(args, timeout=ctx.options.get("timeout", 1800))
-        except Exception as exc:  # noqa: BLE001
-            return AdapterResult(tool=self.name, ok=False, command=cmd, note=f"exec error: {exc}")
+        # Batch by endpoint (path without query). dalfox dedup_mode=exact collapses findings
+        # across a big heterogeneous list, silently dropping real hits (WAVSEP: 28 found per-
+        # endpoint vs 6 on one list). Group by endpoint so its dedup only acts within a page.
+        groups: dict[str, list[str]] = {}
+        for u in targets:
+            groups.setdefault(u.split("?")[0], []).append(u)
+        cookie = _cookie_header(ctx.session, ctx.target)
+        findings: list[dict] = []
+        raw_all: list[str] = []
+        for urls in groups.values():
+            try:
+                with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+                    fh.write("\n".join(urls))
+                    list_path = fh.name
+                # dalfox v2 CLI: -f json, --cookies (plural), -S silence. NB: no --no-spinner
+                # (invalid flag in v3 -> silent zero output).
+                args = ["dalfox", "file", list_path, "-f", "json", "-S"]
+                if cookie:
+                    args += ["--cookies", cookie]
+                proc = self._exec(args, timeout=ctx.options.get("timeout", 1800))
+            except Exception:  # noqa: BLE001,S112 - one endpoint's error must not sink the scan
+                continue
+            findings.extend(parse_dalfox(proc.stdout))
+            raw_all.append(proc.stdout or "")
 
-        findings = parse_dalfox(proc.stdout)
         return AdapterResult(tool=self.name, ok=True, findings=findings, command=cmd,
-                             note=f"{len(findings)} xss finding(s)", raw=proc.stdout)
+                             note=f"{len(findings)} xss finding(s) over {len(groups)} endpoint(s)",
+                             raw="\n".join(raw_all))
