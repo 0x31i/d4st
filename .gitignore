@@ -14,3 +14,5 @@ runs/
 sessions/
 *.storagestate.json
 results/
+.tools/
+.output/
