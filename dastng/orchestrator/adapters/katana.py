@@ -1,15 +1,17 @@
-"""katana crawl adapter (discovery). Reference implementation of a DISCOVER adapter.
+"""katana crawl adapter (blind authenticated discovery).
 
-Full authenticated-crawl flag wiring (headers from the captured session, depth, JS parsing)
-lands in Phase 2. Here it establishes the shape: shell out, parse JSONL, feed the frontier.
+Crawls from the target with the captured session, JS-aware, and CRUCIALLY excludes logout
+(and setup/reset) URLs via crawl-out-scope so it does not destroy its own session mid-crawl
+(the DVWA/OCWA logout-link trap). Emits discovered URLs to the frontier.
 """
 
 from __future__ import annotations
 
-import json
-
 from .base import AdapterResult, RunContext, ToolAdapter, register
 from .session_util import _session_header_args
+
+# Never crawl these: logging out kills the session; setup/reset wipes app state.
+_LOGOUT_OUT_OF_SCOPE = r"logout|signout|sign-out|/setup|reset"
 
 
 @register
@@ -22,7 +24,16 @@ class KatanaAdapter(ToolAdapter):
     binary = "katana"
 
     def run(self, ctx: RunContext) -> AdapterResult:
-        args = ["katana", "-u", ctx.target, "-jc", "-silent", "-json"]
+        depth = str(ctx.options.get("crawl_depth", 3))
+        duration = str(ctx.options.get("crawl_duration", "3m"))
+        # NOTE: plain-text output (one URL per line). katana's -json emits a single JSON
+        # array, not JSON-Lines, which trips line-based parsing; we extract forms separately.
+        args = ["katana", "-u", ctx.target, "-jc", "-silent",
+                "-d", depth, "-ct", duration,
+                "-cos", _LOGOUT_OUT_OF_SCOPE,   # crawl-out-scope: skip logout/setup
+                "-fs", "fqdn",                   # stay on the target host
+                "-kf", "all",                    # known-files (robots, sitemap)
+                "-c", str(ctx.options.get("crawl_concurrency", 10))]
         args += _session_header_args(ctx.session, ctx.target)
         cmd = " ".join(args)
 
@@ -40,15 +51,8 @@ class KatanaAdapter(ToolAdapter):
         urls: list[str] = []
         for line in proc.stdout.splitlines():
             line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            u = obj.get("endpoint") or obj.get("url") or (obj.get("request") or {}).get("endpoint")
-            if u:
-                urls.append(u)
+            if line.startswith("http"):
+                urls.append(line)
 
         return AdapterResult(
             tool=self.name,
