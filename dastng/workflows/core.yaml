@@ -1,0 +1,30 @@
+# Core-subset workflow: the DVWA-vs-Burp pilot pipeline.
+# Discovery stages feed the shared frontier; detection stages consume the converged
+# frontier. Tools referenced here must be registered adapters (dastng/orchestrator/adapters).
+#
+# Phase 0: only katana + nuclei adapters exist. The remaining tools are declared here as
+# the target shape and get their adapters in Phase 2 (they are skipped with a clear note
+# until then).
+name: core
+description: Core subset pipeline for the DVWA and WAVSEP coverage pilot
+max_rounds: 3
+
+options:
+  timeout: 1800
+
+stages:
+  - name: crawl
+    kind: discovery
+    tools:
+      - katana
+      # - zap_spider   # Phase 2
+      # - domdig       # Phase 2
+
+  - name: scan
+    kind: detection
+    tools:
+      - nuclei
+      # - zap_active   # Phase 2
+      # - sqlmap       # Phase 2
+      # - dalfox       # Phase 2
+      # - commix       # Phase 2
