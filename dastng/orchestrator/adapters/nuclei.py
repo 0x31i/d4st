@@ -11,6 +11,7 @@ import json
 import tempfile
 
 from .base import AdapterResult, RunContext, ToolAdapter, register
+from .session_util import _session_header_args
 
 
 @register
@@ -25,6 +26,7 @@ class NucleiAdapter(ToolAdapter):
     def run(self, ctx: RunContext) -> AdapterResult:
         targets = ctx.seed_urls or [ctx.target]
         args = ["nuclei", "-jsonl", "-silent"]
+        args += _session_header_args(ctx.session, ctx.target)
         # Phase 2: -dast -ft/-fm, -secret-file <auth>, -iserver <interactsh>.
         cmd = "nuclei -jsonl -silent -l <frontier>"
 
