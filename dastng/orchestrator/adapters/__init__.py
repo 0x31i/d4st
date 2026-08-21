@@ -6,10 +6,14 @@ from __future__ import annotations
 
 # Import adapter modules for their registration side effects. Add new tools here.
 from . import (
+    api,  # noqa: F401
     commix,  # noqa: F401
     dalfox,  # noqa: F401
+    discovery,  # noqa: F401
+    injection2,  # noqa: F401
     katana,  # noqa: F401
     nuclei,  # noqa: F401
+    secrets,  # noqa: F401
     sqlmap,  # noqa: F401
     zap,  # noqa: F401
 )

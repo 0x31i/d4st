@@ -1,0 +1,44 @@
+# Full roster workflow: every implemented adapter, staged.
+# Discovery feeds the shared frontier; detection consumes it. Active tools require
+# --allow-active. Tools whose surface is absent (GraphQL, OpenAPI, JWT, JS secrets)
+# cleanly report "not applicable" rather than failing.
+name: full
+description: Full tool roster (discovery + injection + api + secrets + zap)
+max_rounds: 3
+
+options:
+  timeout: 1800
+  nuclei_dast: true
+  inject_cap: 0
+  sqlmap_level: 1
+  sqlmap_risk: 1
+  # js_dir: <dir of fetched .js>     # enables gitleaks/trufflehog/semgrep
+  # jwt: <token>                     # enables jwt_tool
+  # openapi_schema: <url>            # enables schemathesis
+
+stages:
+  - name: recon
+    kind: discovery
+    tools:
+      - katana
+      - feroxbuster
+      - gau
+      - x8
+      - graphw00f
+
+  - name: scan
+    kind: detection
+    tools:
+      - nuclei
+      - zap
+      - sqlmap
+      - ghauri
+      - dalfox
+      - commix
+      - sstimap
+      - crlfuzz
+      - jwt_tool
+      - schemathesis
+      - gitleaks
+      - trufflehog
+      - semgrep
