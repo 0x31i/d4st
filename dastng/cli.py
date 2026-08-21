@@ -270,6 +270,12 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
                         sess.meta.get("validity_marker") or "Logout")
     if not ok:
         raise click.ClickException(f"session invalid ({note}); re-capture before an engagement.")
+
+    from .updater import stale_components
+    stale = stale_components()
+    if stale:
+        console.print(f"[yellow]stale detection content[/yellow]: {', '.join(stale)} "
+                      f"— run `dast-ng update` for freshest templates/rules (or proceed offline).")
     console.print(f"[green]session valid[/green] · crawling {target} blind...")
 
     result = run_engagement(target, cookie, host, depth=depth, profile=profile)
@@ -290,6 +296,30 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
         with open(out_path, "w", encoding="utf-8") as fh:
             _json.dump(result, fh, indent=2)
         console.print(f"report -> {out_path}")
+
+
+@main.command()
+@click.option("--status", is_flag=True, default=False, help="Show freshness only; do not update.")
+@click.option("--component", "-c", "components", multiple=True,
+              help="Update only these (nuclei-templates/semgrep-rules/retirejs-db/tools).")
+def update(status: bool, components: tuple) -> None:
+    """Fetch the freshest detection content ONCE (templates, rules, vuln-DB), stamped so
+    scans can then run offline/air-gapped. Run this before an engagement."""
+    from .updater import freshness_report, update_all
+
+    if status:
+        console.print("[bold]detection content freshness[/bold]")
+        for line in freshness_report():
+            console.print(line)
+        return
+
+    console.print("updating detection content (reaching the internet once)...")
+    _m, log = update_all(list(components) or None)
+    for line in log:
+        console.print(f"  [green]OK[/green] {line}")
+    console.print("\n[bold]freshness[/bold]")
+    for line in freshness_report():
+        console.print(line)
 
 
 @main.command()
