@@ -34,6 +34,12 @@ class NucleiAdapter(ToolAdapter):
         dast = bool(ctx.options.get("nuclei_dast"))
         if dast:
             args += ["-dast"]
+        # fuzzing-templates repo dirs (LFI/RFI/traversal permutation fuzzers). The core
+        # ruleset ships only ~3 LFI templates; the fuzzing-templates repo is the payload-
+        # breadth lever that closed the WAVSEP LFI gap. Pass one or more -t dirs.
+        for tdir in ctx.options.get("nuclei_template_dirs", []) or []:
+            if os.path.isdir(os.path.expanduser(tdir)):
+                args += ["-t", os.path.expanduser(tdir)]
         # interactsh (OAST) for blind/out-of-band detection. Self-hosted server via env, else
         # nuclei uses its default hosted server.
         iserver = os.environ.get("DASTNG_INTERACTSH_SERVER")
