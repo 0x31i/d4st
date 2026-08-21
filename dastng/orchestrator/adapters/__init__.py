@@ -10,9 +10,13 @@ from . import (
     commix,  # noqa: F401
     dalfox,  # noqa: F401
     discovery,  # noqa: F401
+    dotdotpwn,  # noqa: F401
+    ghauri,  # noqa: F401
     injection2,  # noqa: F401
     katana,  # noqa: F401
+    lfi_fuzz,  # noqa: F401
     nuclei,  # noqa: F401
+    rfi_oast,  # noqa: F401
     secrets,  # noqa: F401
     sqlmap,  # noqa: F401
     zap,  # noqa: F401
