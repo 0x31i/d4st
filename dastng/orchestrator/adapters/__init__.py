@@ -15,6 +15,7 @@ from . import (
     injection2,  # noqa: F401
     katana,  # noqa: F401
     lfi_fuzz,  # noqa: F401
+    linkharvest,  # noqa: F401
     nuclei,  # noqa: F401
     rfi_oast,  # noqa: F401
     secrets,  # noqa: F401
