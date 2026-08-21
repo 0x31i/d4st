@@ -1,0 +1,47 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16
+    container_name: dastng-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dastng
+      POSTGRES_USER: dastng
+      POSTGRES_PASSWORD: "${DASTNG_DB_PASSWORD:-changeme}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+
+  orchestrator:
+    build: .
+    container_name: dastng-orchestrator
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      DASTNG_DATABASE_URL: "postgresql://dastng:${DASTNG_DB_PASSWORD:-changeme}@db:5432/dastng"
+      DASTNG_API_KEYS: "${DASTNG_API_KEYS:-}"
+      DASTNG_VERIFY_EGRESS_IPS: "${DASTNG_VERIFY_EGRESS_IPS:-}"
+      DASTNG_INTERACTSH_SERVER: "${DASTNG_INTERACTSH_SERVER:-}"
+    ports:
+      - "0.0.0.0:8810:8810"
+    volumes:
+      - ./runs:/app/runs
+      - ./sessions:/app/sessions
+
+  # OAST / blind-vuln callback server. Self-hosting needs a domain with NS records
+  # pointed at this host; until then, leave DASTNG_INTERACTSH_SERVER empty to use
+  # the default hosted server. Wired in Phase 2.
+  # interactsh:
+  #   image: projectdiscovery/interactsh-server:latest
+  #   container_name: dastng-interactsh
+  #   restart: unless-stopped
+  #   command: ["-domain", "oast.your-domain.example", "-http-port", "8811"]
+  #   ports:
+  #     - "0.0.0.0:8811:8811"
+
+volumes:
+  pgdata:
+    driver: local

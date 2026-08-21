@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dast-ng"
+version = "0.1.0"
+description = "Standalone open-source DAST appliance for recurring authenticated web-app scanning"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "ASM-NG Team"},
+]
+
+dependencies = [
+    "click>=8.1",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "psycopg[binary]>=3.1",
+    "psycopg_pool>=3.1",
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "python-multipart>=0.0.6",
+    "httpx>=0.25",
+    "playwright>=1.40",
+    "pyotp>=2.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+dast-ng = "dastng.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["dastng*"]
+
+[tool.setuptools.package-data]
+dastng = ["workflows/*.yaml"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
