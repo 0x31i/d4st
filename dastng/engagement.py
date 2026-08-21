@@ -60,10 +60,12 @@ def _run(args: list[str], timeout: int, stdin: str | None = None) -> str:
 
 # ----- discovery --------------------------------------------------------------
 
-def blind_crawl(target: str, cookie: str, depth: int = 3, duration: str = "3m") -> list[str]:
+def blind_crawl(target: str, cookie: str, depth: int = 3, duration: str = "3m",
+                politeness=None) -> list[str]:
     """katana blind crawl (logout-safe, host-scoped, plain-URL output)."""
     args = ["katana", "-u", target, "-jc", "-silent", "-d", str(depth), "-ct", duration,
-            "-cos", "logout|signout|/setup|reset", "-fs", "fqdn", "-kf", "all", "-c", "10"]
+            "-cos", "logout|signout|/setup|reset", "-fs", "fqdn", "-kf", "all"]
+    args += politeness.katana_flags() if politeness else ["-c", "10"]
     if cookie:
         args += ["-H", f"Cookie: {cookie}"]
     out = _run(args, timeout=600)
@@ -278,12 +280,14 @@ def verify_finding(f: Finding, cookie: str) -> Finding:
 
 # ----- detection (tool runners, form + CSRF aware) ----------------------------
 
-def run_nuclei_dast(urls: list[str], cookie: str) -> list[Finding]:
+def run_nuclei_dast(urls: list[str], cookie: str, politeness=None) -> list[Finding]:
     if not urls:
         return []
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
         fh.write("\n".join(urls)); path = fh.name
     args = ["nuclei", "-l", path, "-dast", "-jsonl", "-silent"]
+    if politeness:
+        args += politeness.nuclei_flags()
     if cookie:
         args += ["-H", f"Cookie: {cookie}"]
     out = _run(args, timeout=1800)
@@ -293,10 +297,12 @@ def run_nuclei_dast(urls: list[str], cookie: str) -> list[Finding]:
             for n in normalize_nuclei(out)]
 
 
-def run_sqlmap(t: Target, cookie: str) -> list[Finding]:
+def run_sqlmap(t: Target, cookie: str, politeness=None) -> list[Finding]:
     """CSRF-aware sqlmap: passes --csrf-token/--csrf-url when the form carries a token."""
     args = ["sqlmap", "--batch", "--level", "2", "--risk", "2", "--disable-coloring",
             "--flush-session", "--technique=BEUST"]
+    if politeness:
+        args += politeness.sqlmap_flags()
     if t.method == "POST":
         args += ["-u", t.url, "--data", t.data_string()]
     else:
@@ -312,10 +318,12 @@ def run_sqlmap(t: Target, cookie: str) -> list[Finding]:
             for n in normalize_sqlmap(out)]
 
 
-def probe_targets(targets: list[Target], cookie: str) -> list[Finding]:
+def probe_targets(targets: list[Target], cookie: str, politeness=None) -> list[Finding]:
     """Completeness safety-net: independently replay EVERY blatant-vuln class on every
     discovered param, so a payload-set gap in any scanner does not become a missed finding.
-    Deterministic, strong-signature checks only (low false-positive)."""
+    Deterministic, strong-signature checks only (low false-positive). Throttled when a
+    politeness profile is given (avoids tripping rate limits/WAF on production targets)."""
+    from .safety import is_auth_endpoint
     out: list[Finding] = []
 
     def add(cat, url, param, method, note):
@@ -323,6 +331,10 @@ def probe_targets(targets: list[Target], cookie: str) -> list[Finding]:
                            method=method, evidence=note, verified=True))
 
     for t in targets:
+        if is_auth_endpoint(t.url):   # never inject auth endpoints
+            continue
+        if politeness:
+            politeness.wait()
         for param in t.params:
             ok, note = verify_cmdi(t.url, param, t.method, cookie)
             if ok:
@@ -348,15 +360,21 @@ def probe_targets(targets: list[Target], cookie: str) -> list[Finding]:
 
 
 def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
-                   dom: bool = True, tools: bool = True) -> dict:
+                   dom: bool = True, tools: bool = True, profile: str = "normal") -> dict:
     """Full blind flow covering BOTH profiles: blatant injection (DVWA-style) AND the
     hardened-app profile (config/passive + vulnerable JS + API + DOM-based). Returns
-    {urls, targets, findings} with findings verified."""
+    {urls, targets, findings} with findings verified.
+
+    profile: politeness ('polite'|'normal'|'aggressive'). 'polite' throttles hard for
+    lockout-prone production targets. Auth endpoints (login/logout/reset) are NEVER actively
+    tested regardless of profile, so the scan cannot lock accounts."""
     from .dom import dom_probe
     from .jsanalysis import analyze_js
     from .passive import passive_scan
+    from .safety import PROFILES, is_auth_endpoint
 
-    urls = blind_crawl(target, cookie, depth=depth)
+    pol = PROFILES.get(profile, PROFILES["normal"])
+    urls = blind_crawl(target, cookie, depth=depth, politeness=pol)
 
     # JS/API discovery: pull API routes out of JS so unlinked endpoints get tested too.
     js_urls = [u for u in urls if u.split("?")[0].endswith(".js")]
@@ -364,16 +382,20 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     urls = sorted(set(urls) | set(api_eps))
 
     targets = discover_targets(urls, cookie, host)
+    # SAFETY: never actively test auth endpoints (submitting payloads/failed logins there
+    # locks accounts and logs the scanner out). Passive checks still cover them read-only.
+    targets = [t for t in targets if not is_auth_endpoint(t.url)]
     findings: list[Finding] = []
 
     # 1) injection tools (breadth) + independent completeness probes (6 blatant classes)
     if tools:
-        findings += run_nuclei_dast([t.url for t in targets if t.method == "GET" and t.params], cookie)
+        findings += run_nuclei_dast([t.url for t in targets if t.method == "GET" and t.params],
+                                    cookie, politeness=pol)
         for t in targets:
             if t.params:
-                findings += run_sqlmap(t, cookie)
+                findings += run_sqlmap(t, cookie, politeness=pol)
     findings = [verify_finding(f, cookie) for f in findings]
-    findings += probe_targets(targets, cookie)
+    findings += probe_targets(targets, cookie, politeness=pol)
 
     # 2) passive/config (hardened-app bulk: headers, cookies, CORS, TLS hygiene)
     for pf in passive_scan(urls, cookie):
