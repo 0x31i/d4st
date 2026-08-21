@@ -122,3 +122,94 @@ def analyze_js(js_urls: list[str], cookie: str, host: str,
                 endpoints.append(ep)
         vulns += detect_vuln_libs(r.text, str(r.url))
     return endpoints, vulns
+
+
+# ----- Semgrep static analysis over fetched JS (belt-and-suspenders for DOM flows) --------
+
+def _semgrep_category(check_id: str, cwe) -> str:
+    cid = (check_id or "").lower()
+    text = f"{cid} {' '.join(cwe) if isinstance(cwe, list) else (cwe or '')}".lower()
+    # specific subcategories first, then the broad xss catch-all
+    if "redirect" in text or "cwe-601" in text:
+        return "open-redirect"
+    if "data-sink" in text or "data-manipulation" in text:
+        return "dom-data-manipulation"
+    if "secret" in text or "hardcoded" in text or "credential" in text or "cwe-798" in text:
+        return "info-disclosure"
+    if "prototype" in text or "cwe-1321" in text:
+        return "prototype-pollution"
+    if "xss" in text or "cwe-79" in text or "dom" in text or "eval" in text:
+        return "xss"
+    return "misconfiguration"
+
+
+def parse_semgrep_json(text: str) -> list[dict]:
+    import json
+    text = (text or "").strip()
+    if not text:
+        return []
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    out = []
+    for r in obj.get("results", []):
+        extra = r.get("extra", {}) or {}
+        meta = extra.get("metadata", {}) or {}
+        out.append({
+            "tool": "semgrep",
+            "check": r.get("check_id"),
+            "path": r.get("path"),
+            "line": (r.get("start", {}) or {}).get("line"),
+            "message": extra.get("message", ""),
+            "category": _semgrep_category(r.get("check_id", ""), meta.get("cwe")),
+        })
+    return out
+
+
+def run_semgrep_js(js_urls: list[str], cookie: str, semgrep_bin: str = "semgrep",
+                   configs: list[str] | None = None, cap: int = 40) -> list[dict]:
+    """Fetch the app's JS bundles and run Semgrep's JS/XSS rulesets over them — catches
+    source->sink flows in code paths the runtime DOM pass never triggers. Runs Semgrep as a
+    subprocess (it needs py3.10+), so it is decoupled from this 3.9-capable package.
+    Returns [] if semgrep is absent (degrades gracefully)."""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    import httpx
+
+    if not shutil.which(semgrep_bin) and not os.path.exists(semgrep_bin):
+        return []
+    import os as _os
+    _local = _os.path.join(_os.path.dirname(__file__), "rules", "dom-xss.yaml")
+    configs = configs or ["p/javascript", "p/secrets", _local]
+    headers = {"Cookie": cookie} if cookie else {}
+    workdir = tempfile.mkdtemp(prefix="semgrep_js_")
+    n = 0
+    for i, u in enumerate(js_urls[:cap]):
+        try:
+            r = httpx.get(u, headers=headers, follow_redirects=True, timeout=12)
+        except Exception:  # noqa: BLE001, S112
+            continue
+        fn = os.path.join(workdir, f"{i:03d}_" + (u.split("/")[-1].split("?")[0] or "script") )
+        if not fn.endswith(".js"):
+            fn += ".js"
+        try:
+            with open(fn, "w", encoding="utf-8") as fh:
+                fh.write(r.text)
+            n += 1
+        except Exception:  # noqa: BLE001, S112
+            continue
+    if not n:
+        return []
+    args = [semgrep_bin, "--json", "--quiet", "--timeout", "30", "--metrics", "off"]
+    for c in configs:
+        args += ["--config", c]
+    args.append(workdir)
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=600, check=False)
+    except Exception:  # noqa: BLE001
+        return []
+    return parse_semgrep_json(proc.stdout)
