@@ -501,9 +501,16 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
     _lvl = level_override or policy.sqlmap_level
     # Shorter per-tool budget once stressed (reduced depth) so no single tool pins a fragile app.
     _to = 1800 if _lvl >= 5 else 600
+    # CRITICAL for "safe": the roster subprocess tools default to aggressive concurrency
+    # (dalfox = 100 workers, crlfuzz = 25) that DoSes a fragile single-process target — this is
+    # what killed the Juice Shop demo mid-roster. Propagate the policy's politeness so every
+    # tool honors the same throttle the Python probes do.
+    _pol = policy.politeness
     opts = {"cookie": cookie, "inject_cap": 0, "timeout": _to,
             "sqlmap_level": _lvl, "sqlmap_risk": policy.sqlmap_risk,
-            "sqli_level": _lvl, "lfi_deep": policy.lfi_deep, "js_dir": js_dir}
+            "sqli_level": _lvl, "lfi_deep": policy.lfi_deep, "js_dir": js_dir,
+            "workers": max(1, _pol.concurrency), "delay_ms": _pol.delay_ms,
+            "rps": _pol.rps}
     out: list[Finding] = []
     for name in _MEGA_ROSTER:
         ad = REGISTRY.get(name)

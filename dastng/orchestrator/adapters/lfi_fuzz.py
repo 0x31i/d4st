@@ -86,9 +86,14 @@ class LfiFuzzAdapter(ToolAdapter):
                     continue
                 # -s makes ffuf print ONLY matched payloads (the FUZZ values) to stdout, one
                 # per line. (-o - -of json does NOT stream JSON to stdout, it drops it.)
+                # Throttle: ffuf defaults to 40 threads. Honor the scan politeness (workers +
+                # request rate) so LFI fuzzing doesn't DoS a fragile target.
                 args = ["ffuf", "-u", fuzz_url, "-w", f"{path}:FUZZ", "-mr", matcher,
-                        "-s", "-t", str(ctx.options.get("ffuf_threads", 40)),
+                        "-s", "-t", str(ctx.options.get("workers", ctx.options.get("ffuf_threads", 40))),
                         "-timeout", str(ctx.options.get("http_timeout", 6))]
+                _rate = ctx.options.get("rps")
+                if _rate:
+                    args += ["-rate", str(int(_rate))]
                 if cookie:
                     args += ["-H", f"Cookie: {cookie}"]
                 try:
