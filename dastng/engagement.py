@@ -537,7 +537,8 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
 
 
 def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
-                   dom: bool = True, tools: bool = True, profile: str = "safe-deep") -> dict:
+                   dom: bool = True, tools: bool = True, profile: str = "safe-deep",
+                   zap: bool = True) -> dict:
     """Full blind flow covering BOTH profiles: blatant injection (DVWA-style) AND the
     hardened-app profile (config/passive + vulnerable JS + API + DOM-based). Returns
     {urls, targets, findings} with findings verified.
@@ -717,6 +718,27 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             lvl = health.sqlmap_level(policy.sqlmap_level)
             findings += run_sqlmap(t, cookie, politeness=pol, policy=policy, level_override=lvl)
 
+    # 6) ZAP independent crawl + scan — a SECOND engine as a cross-check / accuracy insurance
+    #    (its own spider + active rules corroborate the native stack; disagreements flag gaps on
+    #    either side). Runs LAST because it re-crawls the target (heaviest, most target-hostile),
+    #    and only while the target is healthy — a dockerized full-scan, skipped cleanly if docker
+    #    or the image is absent. Findings are tagged tool="zap" so the cross-check is auditable.
+    zap_ran = False
+    zap_note = "disabled"
+    if zap and tools and policy.active_scan:
+        if health.check() >= 2:
+            zap_note = "skipped: target unhealthy"
+        elif not zap_available():
+            zap_note = "skipped: docker/zap-stable image not available"
+        else:
+            import tempfile as _tf
+            try:
+                findings += run_zap(target, cookie, _tf.mkdtemp(prefix="dastng-zap-"))
+                zap_ran = True
+                zap_note = "ran"
+            except Exception as exc:  # noqa: BLE001 - ZAP failure must not sink the scan
+                zap_note = f"error: {exc}"
+
     # dedup by (category, path, param)
     seen: set = set(); uniq: list[Finding] = []
     for f in findings:
@@ -744,10 +766,27 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             "sqlmap_level_used": health.sqlmap_level(policy.sqlmap_level),
             "events": health.events,
         },
+        # ZAP cross-check: whether the second engine ran, so the corroboration is auditable
+        "zap": {"ran": zap_ran, "note": zap_note,
+                "findings": sum(1 for f in uniq if f.tool == "zap")},
     }
 
 
 # ----- ZAP (passive categories + generative active scan, dockerized) ----------
+
+def zap_available() -> bool:
+    """True if the dockerized ZAP can run (docker daemon up + zap-stable image pulled).
+    Lets the mega scan include ZAP when present and cleanly skip it when not."""
+    try:
+        if subprocess.run(["docker", "info"], capture_output=True, timeout=15,
+                          check=False).returncode != 0:
+            return False
+        img = subprocess.run(["docker", "images", "-q", "zaproxy/zap-stable"],
+                             capture_output=True, text=True, timeout=15, check=False)
+        return bool((img.stdout or "").strip())
+    except Exception:  # noqa: BLE001 - any failure = not available
+        return False
+
 
 def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400) -> list[Finding]:
     """OWASP ZAP full-scan via docker (authenticated, logout-excluded). Adds the passive
