@@ -565,10 +565,11 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     from .orchestrator.adapters.base import RunContext as _RC
     # Discovery throttle: gentle but not glacial. feroxbuster's default 50 threads DoSes
     # fragile single-process apps, but the policy's 2-rps floor timed out over a 4.7k wordlist.
-    # Content discovery is read-only GETs (lower risk than injection), so cap threads modestly
-    # and use a moderate rate that still finishes; injection roster stays fully throttled.
-    _ferox_threads = 10
-    _ferox_rate = max(20, int(pol.rps * pol.concurrency)) if pol else 20
+    # Content discovery is read-only GETs (lower risk than injection). Derive a conservative
+    # ceiling from the policy; feroxbuster's --auto-tune/--auto-bail (set in the adapter) then
+    # self-lower the rate and abort if the target struggles, so this is a ceiling, not a floor.
+    _ferox_threads = max(4, pol.concurrency * 2) if pol else 8
+    _ferox_rate = max(10, int(pol.rps * pol.concurrency * 2)) if pol else 15
     _dopts = {"cookie": cookie, "harvest_rounds": 3, "ferox_depth": 2, "timeout": 1500,
               "ferox_threads": _ferox_threads, "ferox_rate": _ferox_rate}
     if os.environ.get("DASTNG_FEROX_WORDLIST"):   # operator override (e.g. a fast list)
