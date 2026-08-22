@@ -376,9 +376,11 @@ def run_sqlmap(t: Target, cookie: str, politeness=None, policy=None,
         args += ["--cookie", cookie]
     if t.csrf_field:
         args += ["--csrf-token", t.csrf_field, "--csrf-url", t.csrf_url]
-    # Bound wall-time: full depth gets a generous budget, reduced depth (stressed target) is
-    # kept short so a struggling app isn't pinned under a long sqlmap run.
-    _to = 600 if (level_override or (policy.sqlmap_level if policy else 2)) >= 5 else 240
+    # Bound wall-time per parameter. sqlmap BEU confirms a detectable injection within a couple
+    # minutes; grinding 10 min/param mostly means it is NOT injectable (pure waste + sustained
+    # load that kills fragile targets). Keep it tight so the depth pass over N params can never
+    # monopolize the scan or pin the target: full=180s, reduced (stressed target)=120s.
+    _to = 180 if (level_override or (policy.sqlmap_level if policy else 2)) >= 5 else 120
     out = _run(args, timeout=_to)
     from .scoring.normalize import normalize_sqlmap
     return [Finding(tool="sqlmap", category="sql-injection", url=t.url, param=n.param,
@@ -606,18 +608,14 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     from .safety import TargetHealth
     health = TargetHealth(base_url=target, cookie=cookie)
 
-    # 1) injection tools (breadth) + independent completeness probes (6 blatant classes).
+    # 1) FAST detection breadth first — capture the full matrix while the target is certainly
+    #    alive, BEFORE the heavy sqlmap depth pass (section 5). Ordering matters: sqlmap L5 is
+    #    the slowest + most target-hostile stage and adds little the fast detectors miss, so it
+    #    runs LAST; a fragile target that dies under it has already yielded everything else.
     #    Skipped entirely under passive-only (active_scan=False): read-only recon.
     if tools and policy.active_scan:
         findings += run_nuclei_dast([t.url for t in active_targets
                                      if t.method == "GET" and t.params], cookie, politeness=pol)
-        for t in active_targets:
-            if not t.params:
-                continue
-            if health.check() >= 2:   # target unhealthy -> stop injecting, keep findings
-                break
-            lvl = health.sqlmap_level(policy.sqlmap_level)
-            findings += run_sqlmap(t, cookie, politeness=pol, policy=policy, level_override=lvl)
         # Full detection roster over the SAFE frontier (dalfox/ghauri/lfi_fuzz/commix/crlfuzz/
         # sstimap/rfi_oast/dotdotpwn/schemathesis/jwt_tool/graphw00f/gitleaks/trufflehog).
         # This is what makes it the mega scan — the roster, not just the core subset.
@@ -628,11 +626,13 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                                    js_dir=os.environ.get("DASTNG_JS_DIR", ""),
                                    level_override=health.sqlmap_level(policy.sqlmap_level),
                                    health=health)
-        findings = [verify_finding(f, cookie) for f in findings]
         # completeness probes only while the target is alive (they replay payloads = more load)
         if not health.halted:
             findings += probe_targets(active_targets, cookie, politeness=pol,
                                       fuzz_forms=policy.fuzz_forms)
+        # verify (deterministic replay) the fast-detector findings now, while the target is
+        # still healthy — sqlmap (section 5) may stress it afterward.
+        findings = [verify_finding(f, cookie) for f in findings]
 
     # 2) passive/config (hardened-app bulk: headers, cookies, CORS, TLS hygiene)
     for pf in passive_scan(urls, cookie):
@@ -695,6 +695,19 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             for d in dom_probe(pg, cookie, params=sorted(page_params.get(pg, []))):
                 findings.append(Finding(tool="dom", category=d.category, url=d.url,
                                         param=d.source, evidence=d.evidence, verified=True))
+
+    # 5) DEEP sqlmap exploitation LAST — the slowest + most target-hostile stage. By now the
+    #    full detection matrix (nuclei/roster/probes/passive/PII/DOM) is already captured, so
+    #    if sqlmap stresses or kills a fragile target the rest of the results still stand.
+    #    Health-gated per target: reduced depth under stress, halt on target death.
+    if tools and policy.active_scan:
+        for t in active_targets:
+            if not t.params:
+                continue
+            if health.check() >= 2:   # target unhealthy -> stop, keep everything already found
+                break
+            lvl = health.sqlmap_level(policy.sqlmap_level)
+            findings += run_sqlmap(t, cookie, politeness=pol, policy=policy, level_override=lvl)
 
     # dedup by (category, path, param)
     seen: set = set(); uniq: list[Finding] = []
