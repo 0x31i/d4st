@@ -617,6 +617,14 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     from .safety import TargetHealth
     health = TargetHealth(base_url=target, cookie=cookie)
 
+    # Per-parameter subprocess tools (sqlmap/ghauri/commix in the roster) cost one process per
+    # target; on a benchmark app with thousands of parameterized cases (WAVSEP) that is days of
+    # runtime. DASTNG_INJECT_CAP bounds how many params those heavy tools attack (0 = unbounded).
+    # The SCALABLE detectors that give recall — nuclei-dast (batch) + dalfox (batch) +
+    # deterministic probe_targets — still run over ALL cases, so recall is not capped, only the
+    # slow exploitation depth is. The cap is surfaced in the summary (never a silent truncation).
+    _inject_cap = int(os.environ.get("DASTNG_INJECT_CAP", "0") or "0")
+
     # 1) FAST detection breadth first — capture the full matrix while the target is certainly
     #    alive, BEFORE the heavy sqlmap depth pass (section 5). Ordering matters: sqlmap L5 is
     #    the slowest + most target-hostile stage and adds little the fast detectors miss, so it
@@ -631,6 +639,8 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         if not health.halted:
             _safe_urls = [t.url for t in active_targets if t.params] or \
                 [t.url for t in active_targets]
+            if _inject_cap:
+                _safe_urls = _safe_urls[:_inject_cap]
             findings += run_roster(target, _safe_urls, cookie, policy,
                                    js_dir=os.environ.get("DASTNG_JS_DIR", ""),
                                    level_override=health.sqlmap_level(policy.sqlmap_level),
@@ -710,9 +720,10 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     #    if sqlmap stresses or kills a fragile target the rest of the results still stand.
     #    Health-gated per target: reduced depth under stress, halt on target death.
     if tools and policy.active_scan:
-        for t in active_targets:
-            if not t.params:
-                continue
+        _sql_targets = [t for t in active_targets if t.params]
+        if _inject_cap:
+            _sql_targets = _sql_targets[:_inject_cap]
+        for t in _sql_targets:
             if health.check() >= 2:   # target unhealthy -> stop, keep everything already found
                 break
             lvl = health.sqlmap_level(policy.sqlmap_level)
@@ -758,6 +769,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             "state_changing_endpoints_skipped": skipped_state_changing,
             "sqlmap": f"level {policy.sqlmap_level} risk {policy.sqlmap_risk} "
                       f"technique {policy.sqlmap_technique}",
+            "inject_cap": _inject_cap or None,   # per-param heavy-tool cap (None = unbounded)
         },
         # adaptive health: what the target-stress monitor observed + did (never a silent cap)
         "health": {
