@@ -139,6 +139,11 @@ class PiiScanner:
                 continue   # format-only match without Luhn -> drop (kills the FPs)
             out.append(PiiHit(r.entity_type, _mask(val), round(float(r.score), 2), url,
                               _SEVERITY.get(r.entity_type, "info")))
+        # Presidio's email recognizer validates the TLD and misses non-standard ones
+        # (.op / .local / .internal / .corp) — but an exposed email is exposed regardless.
+        # Always union the format regex so internal/corporate emails are never missed.
+        for m in self._RX["EMAIL_ADDRESS"].finditer(text[:200000]):
+            out.append(PiiHit("EMAIL_ADDRESS", _mask(m.group(0)), 0.6, url, "info"))
         return out
 
     # --- minimal fallback (no Presidio): high-signal patterns only -----------------
@@ -204,7 +209,7 @@ def scan_urls(urls: list[str], cookie: str = "", min_score: float = 0.35,
     """Fetch each URL once and PII-scan the body (Burp-style passive pass over the crawled
     surface). cap>0 limits pages scanned."""
     import httpx
-    scanner = PiiScanner(min_score=min_score)
+    scanner = PiiScanner(min_score=min_score, structured_only=structured_only)
     headers = {"Cookie": cookie} if cookie else {}
     targets = urls[:cap] if cap else urls
     out: list[PiiHit] = []
