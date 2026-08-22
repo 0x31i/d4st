@@ -91,7 +91,13 @@ class FeroxbusterAdapter(ToolAdapter):
                 "-d", str(ctx.options.get("ferox_depth", 2)),
                 # Throttle: feroxbuster's default 50 threads DoSes fragile targets. The safe
                 # profile passes ferox_threads/ferox_rate so content discovery stays gentle.
-                "-t", str(ctx.options.get("ferox_threads", 10))]
+                "-t", str(ctx.options.get("ferox_threads", 10)),
+                # Native adaptive safety (feroxbuster's own circuit breakers) so content
+                # discovery self-protects even before the rate cap: --auto-tune lowers the scan
+                # rate when it detects errors/timeouts; --auto-bail aborts if the error rate
+                # spikes (target struggling). This gives feroxbuster the same detect-stress ->
+                # back-off -> bail behavior the TargetHealth monitor gives the rest of the scan.
+                "--auto-tune", "--auto-bail"]
         _rate = ctx.options.get("ferox_rate")
         if _rate:
             args += ["--rate-limit", str(_rate)]
