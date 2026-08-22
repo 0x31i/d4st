@@ -26,6 +26,22 @@ _ENTITIES = [
 _HIGH_CONF_ONLY = {"PERSON", "IP_ADDRESS"}   # NER / loose -> require higher score
 _HIGH_CONF = 0.85
 
+# Structured, format/checksum-validated entities only. This is the RESPONSE-PIPELINE profile:
+# NER (PERSON/LOCATION) over raw HTML/code/payloads is a false-positive disaster (WAVSEP: 4136
+# bogus PERSON hits), and Burp doesn't NER markup either. Phone/driver-license are also noisy
+# on markup, so they're opt-in, not in this precision set.
+STRUCTURED_ENTITIES = [
+    "EMAIL_ADDRESS", "US_SSN", "CREDIT_CARD", "IBAN_CODE",
+    "MEDICAL_LICENSE", "US_PASSPORT", "US_ITIN",
+]
+
+
+def strip_html(text: str) -> str:
+    """Reduce markup FPs: drop <script>/<style>/comments, then tags — scan visible text."""
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<!--.*?-->", " ", text)
+    return re.sub(r"<[^>]+>", " ", text)
+
 # PHI/PII severity: disclosure is Low/Info like Burp; SSN/CC/medical lean Low, rest Info.
 _SEVERITY = {"US_SSN": "low", "CREDIT_CARD": "low", "MEDICAL_LICENSE": "low",
              "US_PASSPORT": "low", "US_DRIVER_LICENSE": "low", "US_ITIN": "low"}
@@ -69,8 +85,12 @@ def _luhn(num: str) -> bool:
 class PiiScanner:
     """Detect PII in response text. Presidio if present, minimal fallback otherwise."""
 
-    def __init__(self, min_score: float = 0.35):
+    def __init__(self, min_score: float = 0.35, structured_only: bool = False):
         self.min_score = min_score
+        # structured_only = high-precision, validated entities + HTML strip (response pipeline).
+        # Default keeps the full NER set for the deliberate deep-PII surface scan.
+        self.structured_only = structured_only
+        self._entities = STRUCTURED_ENTITIES if structured_only else _ENTITIES
         self._engine = None
         try:
             from presidio_analyzer import AnalyzerEngine
@@ -89,6 +109,8 @@ class PiiScanner:
     def scan_text(self, text: str, url: str = "") -> list[PiiHit]:
         if not text:
             return []
+        if self.structured_only:
+            text = strip_html(text)
         hits = self._presidio(text, url) if self._engine else self._fallback(text, url)
         # dedup by (entity, masked) so we don't spam identical values per page
         seen: set = set()
@@ -103,7 +125,8 @@ class PiiScanner:
 
     def _presidio(self, text: str, url: str) -> list[PiiHit]:
         try:
-            results = self._engine.analyze(text=text[:200000], entities=_ENTITIES, language="en")
+            results = self._engine.analyze(text=text[:200000], entities=self._entities,
+                                           language="en")
         except Exception:  # noqa: BLE001
             return self._fallback(text, url)
         out = []
@@ -136,8 +159,48 @@ class PiiScanner:
         return out
 
 
+class ResponsePiiCollector:
+    """Burp-style response-pipeline PII sink. Every response the engagement generates (crawl +
+    AUDIT-time responses to injected payloads) is fed here, so PII that only surfaces in an
+    error/audit response is caught (that's how Burp found the WAVSEP email). Uses the
+    structured/precision profile, dedups identical bodies by hash, and is hard-capped so the
+    high request volume of an active scan can't make this unbounded or slow."""
+
+    def __init__(self, min_score: float = 0.35, max_bodies: int = 600):
+        self.scanner = PiiScanner(min_score=min_score, structured_only=True)
+        self.max_bodies = max_bodies
+        self._seen_bodies: set = set()
+        self._scanned = 0
+        self._hits: list[PiiHit] = []
+
+    def feed(self, url: str, body: str) -> None:
+        if not body or self._scanned >= self.max_bodies:
+            return
+        import hashlib
+        h = hashlib.md5(body[:8000].encode("utf-8", "ignore")).hexdigest()
+        if h in self._seen_bodies:
+            return
+        self._seen_bodies.add(h)
+        self._scanned += 1
+        try:
+            self._hits.extend(self.scanner.scan_text(body, url))
+        except Exception:  # noqa: BLE001,S110 - inspection must never break the scan
+            pass
+
+    def hits(self) -> list[PiiHit]:
+        seen: set = set()
+        out: list[PiiHit] = []
+        for hh in self._hits:
+            k = (hh.entity, hh.masked, hh.url.split("?")[0])
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(hh)
+        return out
+
+
 def scan_urls(urls: list[str], cookie: str = "", min_score: float = 0.35,
-              cap: int = 0) -> list[PiiHit]:
+              cap: int = 0, structured_only: bool = True) -> list[PiiHit]:
     """Fetch each URL once and PII-scan the body (Burp-style passive pass over the crawled
     surface). cap>0 limits pages scanned."""
     import httpx

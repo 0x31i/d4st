@@ -43,3 +43,33 @@ def test_scan_accepts_valid_card():
 
 def test_backend_reports_itself():
     assert PiiScanner().backend in ("presidio", "builtin-fallback")
+
+
+def test_structured_profile_drops_ner_names():
+    from dastng.pii import PiiScanner
+    html = '<a title="John Smith">x</a> SSN 456-78-9012 admin@x.org'
+    ents = {h.entity for h in PiiScanner(structured_only=True).scan_text(html)}
+    assert "PERSON" not in ents            # NER excluded in the response-pipeline profile
+    assert "US_SSN" in ents and "EMAIL_ADDRESS" in ents
+
+
+def test_response_collector_dedups_by_body():
+    from dastng.pii import ResponsePiiCollector
+    c = ResponsePiiCollector()
+    body = "card 4111111111111111, ssn 456-78-9012"
+    c.feed("http://x/a", body)
+    c.feed("http://x/a", body)          # identical body -> not re-scanned
+    assert c._scanned == 1
+    assert {h.entity for h in c.hits()} == {"CREDIT_CARD", "US_SSN"}
+
+
+def test_engagement_feed_hook_collects():
+    from dastng import engagement as e
+    from dastng.pii import ResponsePiiCollector
+    col = ResponsePiiCollector()
+    e.set_pii_sink(col)
+    e._feed("http://x/audit", "leaked admin@x.org and 456-78-9012")
+    e.set_pii_sink(None)
+    assert {h.entity for h in col.hits()} == {"EMAIL_ADDRESS", "US_SSN"}
+    e._feed("http://x/after", "should-not-collect@x.org")   # sink cleared -> no-op
+    assert not any("after" in h.url for h in col.hits())
