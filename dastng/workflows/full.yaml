@@ -21,6 +21,7 @@ stages:
     kind: discovery
     tools:
       - katana
+      - linkharvest    # exhaustively expand index/listing pages katana under-follows
       - feroxbuster
       - gau
       - x8
@@ -34,6 +35,9 @@ stages:
       - sqlmap
       - ghauri
       - dalfox
+      - lfi_fuzz       # ffuf traversal corpus, signature-confirmed LFI
+      - rfi_oast       # RFI via out-of-band callback (needs oast_host_ip)
+      - dotdotpwn      # targeted deep traversal on a single endpoint
       - commix
       - sstimap
       - crlfuzz

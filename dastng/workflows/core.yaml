@@ -21,8 +21,9 @@ stages:
     kind: discovery
     tools:
       - katana
+      - linkharvest    # crawl-reach lever: expand index pages katana under-follows
+      - feroxbuster    # content brute for well-known holes (/ftp, /.git, /swagger, backups)
       # zap also discovers; it runs in the scan stage but feeds the frontier too
-      # - domdig       # Phase 5
 
   - name: scan
     kind: detection
@@ -31,4 +32,5 @@ stages:
       - zap
       - sqlmap
       - dalfox
+      - lfi_fuzz       # closed the WAVSEP LFI gap (12% -> 40% detection)
       - commix

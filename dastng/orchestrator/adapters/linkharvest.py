@@ -46,7 +46,7 @@ class LinkHarvestAdapter(ToolAdapter):
         if ctx.dry_run:
             return AdapterResult(tool=self.name, ok=True, command=cmd, note="dry-run")
 
-        cookie = _cookie_header(ctx.session, ctx.target)
+        cookie = _cookie_header(ctx.session, ctx.target) or (ctx.options.get("cookie") or "")
         headers = {"Cookie": cookie} if cookie else {}
         seeds = list(dict.fromkeys([ctx.target, *(ctx.seed_urls or [])]))
         seen: set[str] = set(seeds)
