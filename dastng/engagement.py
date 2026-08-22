@@ -79,10 +79,13 @@ def discover_targets(urls: list[str], cookie: str, host: str) -> list[Target]:
     discovered form (POST/GET) with its CSRF token."""
     targets: list[Target] = []
     seen: set = set()
+    # host may carry a port (localhost:3000) while urlsplit(...).hostname strips it — compare
+    # hostname to hostname or every param URL on a non-80/443 target is silently skipped.
+    want_host = (host or "").rsplit("@", 1)[-1].split(":")[0].lower()
 
     for u in urls:
         parts = urlsplit(u)
-        if parts.query and (parts.hostname or host) == host:
+        if parts.query and (parts.hostname or want_host).lower() == want_host:
             params = sorted({kv.split("=")[0] for kv in parts.query.split("&") if kv})
             key = (parts.path, "GET", tuple(params))
             if key not in seen:
@@ -91,7 +94,7 @@ def discover_targets(urls: list[str], cookie: str, host: str) -> list[Target]:
 
     # forms (fetch each unique page once)
     for page in sorted({u.split("?")[0] for u in urls}):
-        if (urlsplit(page).hostname or host) != host:
+        if (urlsplit(page).hostname or want_host).lower() != want_host:
             continue
         for f in fetch_forms(page, cookie):
             ip = f.injectable_params()

@@ -22,13 +22,32 @@ _ENDPOINT_RE = re.compile(r"""
   (
     (?:[a-zA-Z]{1,10}://|//)[^"'`/]{1,}\.[a-zA-Z]{2,}[^"'`]{0,}   # absolute URL
     | (?:/|\.\./|\./)[\w\-/]{1,}[^"'`><,; )(]{0,}                 # rooted / relative path
-    | [\w\-/]{1,}/[\w\-/]{1,}\.(?:aspx|asmx|ashx|php|jsp|json|action|do|api)  # path w/ ext
+    | [\w\-/]{1,}/[\w\-/]{1,}\.(?:aspx|asmx|ashx|php|jsp|json)  # path w/ ext (no do/action/api: FPs on minified JS division/props)
     | api/[\w\-/]{1,}                                            # api/... route
   )
   (?:"|'|`)
 """, re.VERBOSE)
 
 _API_HINT = re.compile(r"/api/|/rest/|/v\d+/|\.asmx|\.ashx|GetInfo|GetInfo", re.IGNORECASE)
+
+# SPA API routes are built in template literals / concatenation, so the whole path is rarely a
+# single quoted string — `${this.host}/rest/products/search?q=${e}` never sits between quotes.
+# The quote-anchored _ENDPOINT_RE misses ALL of them (that's how Juice Shop's entire /rest +
+# /api surface went undiscovered). This second pass finds API route segments anywhere in the
+# JS regardless of delimiter, keyed on the distinctive /api|/rest|/graphql|/v<n> prefix.
+_API_PATH_RE = re.compile(
+    r"/(?:api|rest|graphql|internal|service|services|v\d+)"
+    r"(?:/(?:\$\{[^}]{1,40}\}|[A-Za-z0-9_][\w.\-]*))+/?"
+    r"(?:\?[\w\-.\[\]]+=(?:\$\{[^}]{1,40}\}|[\w%\-.]*))?",
+    re.IGNORECASE,
+)
+
+
+def _norm_route(raw: str) -> str:
+    """Turn a template-literal route into a concrete, testable path: replace ${...}
+    interpolation with a placeholder value so path params resolve and query params survive
+    (`/rest/products/search?q=${e}` -> `/rest/products/search?q=1`, so `q` gets fuzzed)."""
+    return re.sub(r"\$\{[^}]*\}", "1", raw)
 
 
 @dataclass
@@ -67,17 +86,35 @@ def extract_endpoints(js_text: str, base_url: str, host: str) -> list[str]:
     """Return same-host absolute URLs referenced in JS (API routes prioritized)."""
     out: list[str] = []
     seen: set = set()
-    for m in _ENDPOINT_RE.finditer(js_text or ""):
-        raw = m.group(1).strip()
+    # Compare hostname to hostname: `host` may carry a port (localhost:3000) while
+    # urlsplit(...).hostname strips it, so a raw `hostname != host` check drops every same-host
+    # endpoint on any non-443/80 target. Strip creds + port from both sides before comparing.
+    want_host = (host or "").rsplit("@", 1)[-1].split(":")[0].lower()
+
+    def _add(raw: str) -> None:
+        raw = (raw or "").strip()
         if not raw or raw.startswith(("//cdn", "http://www.w3", "https://www.w3")):
-            continue
-        url = urljoin(base_url, raw)
-        if (urlsplit(url).hostname or host) != host:
-            continue
+            return
+        url = urljoin(base_url, _norm_route(raw))
+        h = (urlsplit(url).hostname or want_host).lower()
+        if want_host and h != want_host:
+            return
+        # Drop minified-numeral junk: paths whose every segment is pure-numeric or a single
+        # char (e.g. `/10`, `/2/5`) are array indices / loop counters lifted out of minified
+        # code, never real routes. Keep `/rest/basket/1` (mixed) and `/2fa/enter` (alnum).
+        segs = [s for s in urlsplit(url).path.split("/") if s]
+        if segs and all(re.fullmatch(r"\d+|.", s) for s in segs):
+            return
         if url in seen:
-            continue
+            return
         seen.add(url)
         out.append(url)
+
+    for m in _ENDPOINT_RE.finditer(js_text or ""):
+        _add(m.group(1))
+    # Second pass: template-literal / concatenated API routes the quote-anchored regex can't see.
+    for m in _API_PATH_RE.finditer(js_text or ""):
+        _add(m.group(0))
     # API-looking endpoints first
     out.sort(key=lambda u: (not bool(_API_HINT.search(u)), u))
     return out
