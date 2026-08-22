@@ -105,6 +105,27 @@ def discover_targets(urls: list[str], cookie: str, host: str) -> list[Target]:
     return targets
 
 
+# ----- response pipeline (Burp-style passive inspection of EVERY response) ----
+# Any response the probes generate (including AUDIT-time responses to injected payloads) is
+# fed to the active PII sink, so PII that only surfaces in an error/audit response is caught
+# (that's how Burp found the WAVSEP email — not on the crawled page, but in an audit response).
+_PII_SINK = None
+
+
+def set_pii_sink(collector) -> None:
+    global _PII_SINK
+    _PII_SINK = collector
+
+
+def _feed(url: str, body: str) -> None:
+    sink = _PII_SINK
+    if sink is not None and body:
+        try:
+            sink.feed(url, body)
+        except Exception:  # noqa: BLE001,S110 - inspection must never break a probe
+            pass
+
+
 # ----- verification (deterministic replay) ------------------------------------
 
 def verify_cmdi(url: str, param: str, method: str, cookie: str) -> tuple[bool, str]:
@@ -124,6 +145,7 @@ def verify_cmdi(url: str, param: str, method: str, cookie: str) -> tuple[bool, s
                               follow_redirects=True, timeout=12)
         except Exception:  # noqa: BLE001, S112
             continue
+        _feed(url, r.text)   # passive PII inspection of the audit-time response (Burp-style)
         if "uid=" in r.text and "gid=" in r.text:
             return True, f"cmd exec confirmed via '{sep}' (uid= in response)"
     return False, "no command output on replay"
@@ -143,6 +165,7 @@ def verify_reflected_xss(url: str, param: str, method: str, cookie: str) -> tupl
                           follow_redirects=True, timeout=12)
     except Exception as exc:  # noqa: BLE001
         return False, f"replay error: {exc}"
+    _feed(url, r.text)   # passive PII inspection of the audit-time response (Burp-style)
     # confirmed only if the payload is reflected UN-encoded (real XSS, not encoded echo)
     if payload in r.text:
         return True, "payload reflected unencoded"
@@ -168,10 +191,13 @@ def _req(method, url, param, value, cookie, follow=True):
     # Include Submit=Submit: DVWA-style forms only process the input when the submit button
     # is present. Harmless extra param elsewhere.
     if method == "POST":
-        return httpx.post(url, data={param: value, "Submit": "Submit"}, headers=headers,
+        resp = httpx.post(url, data={param: value, "Submit": "Submit"}, headers=headers,
                           follow_redirects=follow, timeout=12)
-    return httpx.get(url, params={param: value, "Submit": "Submit"}, headers=headers,
-                     follow_redirects=follow, timeout=12)
+    else:
+        resp = httpx.get(url, params={param: value, "Submit": "Submit"}, headers=headers,
+                         follow_redirects=follow, timeout=12)
+    _feed(url, resp.text)   # passive PII inspection of the audit-time response (Burp-style)
+    return resp
 
 
 def verify_sqli(url: str, param: str, method: str, cookie: str) -> tuple[bool, str]:
@@ -474,6 +500,12 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         active_targets = [t for t in active_targets if t.method != "POST"]
     findings: list[Finding] = []
 
+    # Response-pipeline PII sink: every probe response (incl. audit-time responses to injected
+    # payloads) is inspected for PII, Burp-style — not just the crawled surface.
+    from .pii import ResponsePiiCollector
+    _pii_collector = ResponsePiiCollector()
+    set_pii_sink(_pii_collector)
+
     # 1) injection tools (breadth) + independent completeness probes (6 blatant classes).
     #    Skipped entirely under passive-only (active_scan=False): read-only recon.
     if tools and policy.active_scan:
@@ -497,13 +529,23 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     if tools:
         findings += run_nuclei_exposures(urls, cookie, politeness=pol)
 
-    # 2c) PII / PHI disclosure (Presidio, Burp-style) — passive scan of the crawled surface
-    # for emails, SSNs, cards (Luhn), phones, names (NER), medical IDs. Masked values only,
-    # never raw PHI. High value for healthcare clients (FHC). Read-only.
+    # 2c) PII / PHI disclosure (Presidio, Burp-style) — high-precision structured profile
+    # (email, SSN, card w/ Luhn, IBAN, medical/passport/ITIN; NO NER-names, which false-
+    # positive on markup). Two sources, merged: (a) the response-pipeline sink = PII seen in
+    # AUDIT-time responses (how Burp caught the WAVSEP email), (b) a passive scan of the
+    # crawled surface. Masked values only, never raw PHI. High value for FHC (healthcare).
     from .pii import scan_urls as _pii_scan
+    set_pii_sink(None)   # stop capturing; drain what the probes fed
+    _pii = list(_pii_collector.hits())
     _html = [u for u in urls if not u.split("?")[0].endswith(
         (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".map"))]
-    for hit in _pii_scan(_html, cookie, cap=300):
+    _pii += _pii_scan(_html, cookie, cap=300, structured_only=True)
+    _pii_seen: set = set()
+    for hit in _pii:
+        k = (hit.entity, hit.masked, hit.url.split("?")[0])
+        if k in _pii_seen:
+            continue
+        _pii_seen.add(k)
         findings.append(Finding(
             tool="pii", category="pii-disclosure", url=hit.url, param=hit.entity,
             evidence=f"{hit.entity} disclosed: {hit.masked} (confidence {hit.score})",
