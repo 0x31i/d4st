@@ -16,6 +16,7 @@ and false positives never reach the report.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -459,8 +460,53 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
     return out
 
 
+# Category per roster tool (adapter finding dicts vary; this is the fallback classification).
+_ROSTER_CAT = {
+    "dalfox": "xss", "ghauri": "sql-injection", "commix": "command-injection",
+    "crlfuzz": "crlf-injection", "sstimap": "ssti", "lfi_fuzz": "file-inclusion",
+    "rfi_oast": "rfi", "dotdotpwn": "file-inclusion", "schemathesis": "api-fuzz",
+    "jwt_tool": "jwt", "graphw00f": "graphql", "gitleaks": "secret", "trufflehog": "secret",
+}
+# The full detection roster the mega scan runs over the SAFE frontier. nuclei + sqlmap are
+# already hand-coded above; ZAP is intentionally excluded (its full-scan re-crawls and can
+# crash fragile targets — the failure we hit on WAVSEP; use `launch -w full` if you want it).
+_MEGA_ROSTER = ["dalfox", "ghauri", "lfi_fuzz", "commix", "crlfuzz", "sstimap", "rfi_oast",
+                "dotdotpwn", "schemathesis", "jwt_tool", "graphw00f", "gitleaks", "trufflehog"]
+
+
+def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
+               js_dir: str = "") -> list[Finding]:
+    """Run the full detection roster over the SAFE, converged frontier and normalize each
+    adapter's findings to Finding. Tools whose surface is absent (GraphQL/OpenAPI/JWT/JS)
+    cleanly no-op. Every tool is isolated so one failure never sinks the scan."""
+    from .orchestrator.adapters import REGISTRY
+    from .orchestrator.adapters.base import RunContext
+    opts = {"cookie": cookie, "inject_cap": 0, "timeout": 1800,
+            "sqlmap_level": policy.sqlmap_level, "sqlmap_risk": policy.sqlmap_risk,
+            "sqli_level": policy.sqlmap_level, "lfi_deep": policy.lfi_deep, "js_dir": js_dir}
+    out: list[Finding] = []
+    for name in _MEGA_ROSTER:
+        ad = REGISTRY.get(name)
+        if ad is None or not ad.available():
+            continue
+        if getattr(ad, "active", False) and not policy.active_scan:
+            continue
+        try:
+            res = ad.run(RunContext(target=target, seed_urls=safe_urls, options=opts))
+        except Exception:  # noqa: BLE001,S112 - one tool must never sink the mega scan
+            continue
+        cat = _ROSTER_CAT.get(name)
+        for f in (res.findings or []):
+            fcat = cat or f.get("category") or f.get("type") or f.get("name") or name
+            url = f.get("url") or f.get("matched-at") or f.get("data") or target
+            ev = f.get("evidence") or f.get("name") or f.get("message_str") or ""
+            out.append(Finding(tool=name, category=fcat, url=str(url).split("?")[0],
+                               param=f.get("param"), evidence=str(ev)[:160]))
+    return out
+
+
 def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
-                   dom: bool = True, tools: bool = True, profile: str = "normal") -> dict:
+                   dom: bool = True, tools: bool = True, profile: str = "safe-deep") -> dict:
     """Full blind flow covering BOTH profiles: blatant injection (DVWA-style) AND the
     hardened-app profile (config/passive + vulnerable JS + API + DOM-based). Returns
     {urls, targets, findings} with findings verified.
@@ -530,6 +576,12 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         for t in active_targets:
             if t.params:
                 findings += run_sqlmap(t, cookie, politeness=pol, policy=policy)
+        # Full detection roster over the SAFE frontier (dalfox/ghauri/lfi_fuzz/commix/crlfuzz/
+        # sstimap/rfi_oast/dotdotpwn/schemathesis/jwt_tool/graphw00f/gitleaks/trufflehog).
+        # This is what makes it the mega scan — the roster, not just the core subset.
+        _safe_urls = [t.url for t in active_targets if t.params] or [t.url for t in active_targets]
+        findings += run_roster(target, _safe_urls, cookie, policy,
+                               js_dir=os.environ.get("DASTNG_JS_DIR", ""))
         findings = [verify_finding(f, cookie) for f in findings]
         findings += probe_targets(active_targets, cookie, politeness=pol,
                                   fuzz_forms=policy.fuzz_forms)

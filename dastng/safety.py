@@ -128,8 +128,17 @@ class ScanPolicy:
                 f"--technique={self.sqlmap_technique}"]
 
 
-# Named policies. 'production-safe' is the locked-down default for live/client infra.
+# Named policies. 'safe-deep' is THE default: one posture, every scan — safe for live infra
+# AND maximum detection depth. Safety and depth are orthogonal: throttling + no data mutation
+# + skipping destructive/auth endpoints + non-corrupting sqlmap techniques keep it safe, while
+# the full tool roster + full payload corpus + full param coverage keep it deep.
 POLICIES: dict[str, ScanPolicy] = {
+    "safe-deep": ScanPolicy(
+        name="safe-deep", politeness=POLITE, active_scan=True, fuzz_forms=True,
+        skip_state_changing=True,          # never fuzz delete/send/pay/... endpoints
+        sqlmap_level=5, sqlmap_risk=1,     # max coverage, safe payloads only
+        sqlmap_technique="BEU",            # boolean/error/union: no time-hang, no stacked writes
+        lfi_deep=True, oast_selfhosted_only=True),
     # Live/client infra (esp. healthcare/EHR): throttle hard, no data mutation, no destructive
     # or notifying endpoints, error/union/boolean SQLi only (no time-hang or stacked queries),
     # OAST must stay in-network. Detection breadth (crawl reach, LFI/XSS payloads, verify layer)
@@ -158,7 +167,7 @@ POLICIES["normal"] = POLICIES["staging"]
 
 
 def get_policy(name: str) -> ScanPolicy:
-    return POLICIES.get(name, POLICIES["staging"])
+    return POLICIES.get(name, POLICIES["safe-deep"])
 
 
 @dataclass
