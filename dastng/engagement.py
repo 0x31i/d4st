@@ -540,6 +540,8 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     _ferox_rate = max(20, int(pol.rps * pol.concurrency)) if pol else 20
     _dopts = {"cookie": cookie, "harvest_rounds": 3, "ferox_depth": 2, "timeout": 1500,
               "ferox_threads": _ferox_threads, "ferox_rate": _ferox_rate}
+    if os.environ.get("DASTNG_FEROX_WORDLIST"):   # operator override (e.g. a fast list)
+        _dopts["ferox_wordlist"] = os.environ["DASTNG_FEROX_WORDLIST"]
     for _tool, _seeds in (("linkharvest", urls), ("feroxbuster", None)):
         try:
             _r = REGISTRY[_tool].run(_RC(target=target, seed_urls=_seeds or [], options=_dopts))
