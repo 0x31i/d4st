@@ -82,8 +82,33 @@ def _luhn(num: str) -> bool:
     return s % 10 == 0
 
 
+# Shared Presidio engine — loaded ONCE, module-wide. Loading per-scanner (984MB with the
+# large spaCy model) OOM-killed the mega scan. Use the small model (~150MB) and cache it, so
+# every PiiScanner across the whole engagement shares one engine.
+_ENGINE = None
+_ENGINE_TRIED = False
+
+
+def _shared_engine():
+    global _ENGINE, _ENGINE_TRIED
+    if _ENGINE_TRIED:
+        return _ENGINE
+    _ENGINE_TRIED = True
+    try:
+        from presidio_analyzer import AnalyzerEngine
+        from presidio_analyzer.nlp_engine import NlpEngineProvider
+        cfg = {"nlp_engine_name": "spacy",
+               "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}]}
+        nlp = NlpEngineProvider(nlp_configuration=cfg).create_engine()
+        _ENGINE = AnalyzerEngine(nlp_engine=nlp)
+    except Exception:  # noqa: BLE001 - optional dep / model missing; fall back to regex
+        _ENGINE = None
+    return _ENGINE
+
+
 class PiiScanner:
-    """Detect PII in response text. Presidio if present, minimal fallback otherwise."""
+    """Detect PII in response text. Presidio (shared small-model engine) if present, minimal
+    regex fallback otherwise."""
 
     def __init__(self, min_score: float = 0.35, structured_only: bool = False):
         self.min_score = min_score
@@ -91,12 +116,7 @@ class PiiScanner:
         # Default keeps the full NER set for the deliberate deep-PII surface scan.
         self.structured_only = structured_only
         self._entities = STRUCTURED_ENTITIES if structured_only else _ENTITIES
-        self._engine = None
-        try:
-            from presidio_analyzer import AnalyzerEngine
-            self._engine = AnalyzerEngine()
-        except Exception:  # noqa: BLE001 - optional dep; fall back
-            self._engine = None
+        self._engine = _shared_engine()
 
     @property
     def available(self) -> bool:
