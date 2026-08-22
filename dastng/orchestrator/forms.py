@@ -106,4 +106,7 @@ def csrf_for_url(url: str, cookie: str = "") -> tuple[str | None, str]:
 
 
 def same_host(url: str, host: str) -> bool:
-    return (urlsplit(url).hostname or "") == host
+    # host may include a port (localhost:3000); urlsplit(...).hostname strips it. Compare
+    # hostname to hostname so scope checks don't fail on any non-80/443 target.
+    want = (host or "").rsplit("@", 1)[-1].split(":")[0].lower()
+    return (urlsplit(url).hostname or want).lower() == want
