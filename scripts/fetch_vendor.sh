@@ -24,3 +24,11 @@ if [ ! -d "$FT" ]; then
   git clone --depth 1 https://github.com/projectdiscovery/fuzzing-templates.git "$FT"
 fi
 echo "vendor fetch complete: PayloadsAllTheThings, dotdotpwn, nuclei fuzzing-templates"
+
+# Optional PII/PHI engine (Presidio + spaCy model). Enables the industry-grade PII stage
+# (emails, SSN, cards w/ Luhn, phones, names via NER, medical IDs). Falls back to a built-in
+# email/SSN/card recognizer if skipped.
+pip install --only-binary=:all: "spacy==3.7.5" presidio-analyzer >/dev/null 2>&1 && \
+  python -m spacy download en_core_web_lg >/dev/null 2>&1 && \
+  echo "PII engine (Presidio + en_core_web_lg) installed" || \
+  echo "PII engine optional install skipped (built-in fallback will be used)"

@@ -348,6 +348,47 @@ def run_sqlmap(t: Target, cookie: str, politeness=None, policy=None) -> list[Fin
             for n in normalize_sqlmap(out)]
 
 
+def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[Finding]:
+    """Passive info-disclosure via nuclei's exposures + misconfiguration templates and our
+    PII/email extractor — the CLI analog to Burp's passive scanner (source-code / private-key
+    / token / config disclosure, emails/PII). Detection lives in nuclei's engine + versioned
+    YAML, not bespoke code regex. Read-only GETs, so safe under any policy."""
+    if not urls:
+        return []
+    import os
+    tdirs = [os.path.expanduser("~/nuclei-templates/http/exposures"),
+             os.path.expanduser("~/nuclei-templates/http/misconfiguration"),
+             os.path.join(os.path.dirname(__file__), "rules", "pii-disclosure.yaml")]
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+        fh.write("\n".join(urls)); path = fh.name
+    args = ["nuclei", "-l", path, "-jsonl", "-silent"]
+    for t in tdirs:
+        if os.path.exists(t):
+            args += ["-t", t]
+    if politeness:
+        args += politeness.nuclei_flags()
+    if cookie:
+        args += ["-H", f"Cookie: {cookie}"]
+    out = _run(args, timeout=1800)
+    findings: list[Finding] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        info = o.get("info", {}) or {}
+        cat = "pii-disclosure" if "pii" in (o.get("template-id") or "") else "info-disclosure"
+        findings.append(Finding(tool="nuclei", category=cat,
+                                url=o.get("matched-at") or o.get("url") or "",
+                                param=o.get("template-id"),
+                                evidence=(info.get("name") or o.get("template-id") or "")[:160],
+                                verified=True))
+    return findings
+
+
 def probe_targets(targets: list[Target], cookie: str, politeness=None,
                   fuzz_forms: bool = True) -> list[Finding]:
     """Completeness safety-net: independently replay EVERY blatant-vuln class on every
@@ -449,6 +490,24 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     for pf in passive_scan(urls, cookie):
         findings.append(Finding(tool="passive", category=pf.category, url=pf.url,
                                 param=pf.check, evidence=pf.detail, verified=True))
+
+    # 2b) passive info-disclosure via CLI detectors (nuclei exposures/misconfig + PII/email
+    # extractor) — the OSS analog to Burp's passive scanner (source/key/token/config
+    # disclosure, emails/PII). Read-only GETs, so run regardless of active-scan policy.
+    if tools:
+        findings += run_nuclei_exposures(urls, cookie, politeness=pol)
+
+    # 2c) PII / PHI disclosure (Presidio, Burp-style) — passive scan of the crawled surface
+    # for emails, SSNs, cards (Luhn), phones, names (NER), medical IDs. Masked values only,
+    # never raw PHI. High value for healthcare clients (FHC). Read-only.
+    from .pii import scan_urls as _pii_scan
+    _html = [u for u in urls if not u.split("?")[0].endswith(
+        (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".map"))]
+    for hit in _pii_scan(_html, cookie, cap=300):
+        findings.append(Finding(
+            tool="pii", category="pii-disclosure", url=hit.url, param=hit.entity,
+            evidence=f"{hit.entity} disclosed: {hit.masked} (confidence {hit.score})",
+            verified=True))
 
     # 3) vulnerable JS dependencies
     for vl in vuln_libs:
