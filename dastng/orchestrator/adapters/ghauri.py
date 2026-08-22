@@ -50,6 +50,9 @@ class GhauriAdapter(ToolAdapter):
         for url in targets:
             args = ["ghauri", "-u", url, "--batch", "--level", level,
                     "--timeout", str(ctx.options.get("http_timeout", 10))]
+            _d = ctx.options.get("delay_ms")
+            if _d:   # honor scan politeness: seconds between requests
+                args += ["--delay", str(max(1, int(_d / 1000)))]
             if cookie:
                 args += ["--cookie", cookie]
             try:

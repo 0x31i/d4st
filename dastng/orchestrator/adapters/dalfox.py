@@ -94,6 +94,13 @@ class DalfoxAdapter(ToolAdapter):
                 # dalfox v2 CLI: -f json, --cookies (plural), -S silence. NB: no --no-spinner
                 # (invalid flag in v3 -> silent zero output).
                 args = ["dalfox", "file", list_path, "-f", "json", "-S"]
+                # Throttle: dalfox defaults to 100 concurrent workers, which DoSes a fragile
+                # single-process target. Honor the scan's politeness (worker count + per-request
+                # delay in ms) so safe-deep is actually safe for the roster too.
+                args += ["-w", str(ctx.options.get("workers", 10))]
+                _d = ctx.options.get("delay_ms")
+                if _d:
+                    args += ["--delay", str(int(_d))]
                 if cookie:
                     args += ["--cookies", cookie]
                 proc = self._exec(args, timeout=ctx.options.get("timeout", 1800))

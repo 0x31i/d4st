@@ -137,8 +137,11 @@ class CrlfuzzAdapter(ToolAdapter):
             with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
                 fh.write("\n".join(targets))
                 list_path = fh.name
-            proc = self._exec(["crlfuzz", "-l", list_path, "-s"],
-                              timeout=ctx.options.get("timeout", 600))
+            # Throttle: crlfuzz defaults to 25 concurrency; honor the scan politeness so CRLF
+            # fuzzing doesn't DoS a fragile target.
+            _cargs = ["crlfuzz", "-l", list_path, "-s",
+                      "-c", str(ctx.options.get("workers", 25))]
+            proc = self._exec(_cargs, timeout=ctx.options.get("timeout", 600))
         except Exception as exc:  # noqa: BLE001
             return AdapterResult(tool=self.name, ok=False, command=cmd, note=f"exec error: {exc}")
         findings = parse_crlfuzz(proc.stdout)
