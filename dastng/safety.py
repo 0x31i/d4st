@@ -174,6 +174,71 @@ def get_policy(name: str) -> ScanPolicy:
 
 
 @dataclass
+class TargetHealth:
+    """Adaptive stress monitor that keeps safe-deep a SINGLE profile which self-throttles
+    instead of DoSing a fragile target. Between heavy stages it actively pings the target and
+    escalates a stress stage: 0 = full depth (sqlmap L5), 1 = reduced depth (cap at L3),
+    2 = halt active scanning. A robust target stays at stage 0 and gets full depth; a target
+    that starts failing (connection refused / 5xx / very slow) is stepped down, then the scan
+    halts gracefully with whatever it found rather than grinding for hours against a corpse.
+
+    Strikes are weighted: a hard failure (down/5xx) counts double a slow response, and a
+    healthy ping decays one strike (recovery). >=2 strikes -> reduce depth; >=4 -> halt."""
+    base_url: str
+    cookie: str = ""
+    slow_ms: float = 6000.0
+    ping_timeout: float = 10.0
+    stage: int = 0
+    strikes: int = 0
+    pings: int = 0
+    events: list = field(default_factory=list)
+
+    def ping(self) -> tuple[bool, float]:
+        """Active liveness GET on the base URL. Returns (alive, elapsed_ms). alive is False on
+        connection error/timeout or any 5xx (the signals a stressed app emits before dying)."""
+        import httpx
+        headers = {"Cookie": self.cookie} if self.cookie else {}
+        t0 = time.monotonic()
+        try:
+            r = httpx.get(self.base_url, headers=headers, timeout=self.ping_timeout,
+                          follow_redirects=True)
+            return (r.status_code < 500, (time.monotonic() - t0) * 1000.0)
+        except Exception:  # noqa: BLE001 - any failure = not alive
+            return (False, (time.monotonic() - t0) * 1000.0)
+
+    def check(self) -> int:
+        """Ping and update the stress stage. Returns the current stage (0/1/2). Once halted it
+        stays halted (no thrashing back to active scanning)."""
+        if self.stage >= 2:
+            return self.stage
+        alive, el = self.ping()
+        self.pings += 1
+        if not alive:
+            self.strikes += 2
+            self.events.append(f"target unresponsive/5xx (strikes={self.strikes})")
+        elif el > self.slow_ms:
+            self.strikes += 1
+            self.events.append(f"target slow {int(el)}ms (strikes={self.strikes})")
+        else:
+            self.strikes = max(0, self.strikes - 1)  # recovery
+        if self.strikes >= 4 and self.stage < 2:
+            self.stage = 2
+            self.events.append("HALT: target unhealthy, stopping active scan")
+        elif self.strikes >= 2 and self.stage < 1:
+            self.stage = 1
+            self.events.append("BACKOFF: reducing injection depth (L5 -> L3)")
+        return self.stage
+
+    @property
+    def halted(self) -> bool:
+        return self.stage >= 2
+
+    def sqlmap_level(self, base: int) -> int:
+        """Adaptive sqlmap level: full at stage 0, capped at 3 once the target shows stress."""
+        return base if self.stage == 0 else min(base, 3)
+
+
+@dataclass
 class LockoutMonitor:
     """Detect-and-back-off. Feed it each response; it decides whether to pause or halt."""
     max_strikes: int = 3

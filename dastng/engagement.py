@@ -352,15 +352,20 @@ def run_nuclei_dast(urls: list[str], cookie: str, politeness=None) -> list[Findi
             for n in normalize_nuclei(out)]
 
 
-def run_sqlmap(t: Target, cookie: str, politeness=None, policy=None) -> list[Finding]:
+def run_sqlmap(t: Target, cookie: str, politeness=None, policy=None,
+               level_override: int | None = None) -> list[Finding]:
     """CSRF-aware sqlmap: passes --csrf-token/--csrf-url when the form carries a token.
     Injection depth (level/risk/technique) comes from the ScanPolicy: production-safe uses
-    level 2 / risk 1 / BEU (no time-hang, no stacked queries -> cannot mutate/hang the DB)."""
+    level 2 / risk 1 / BEU (no time-hang, no stacked queries -> cannot mutate/hang the DB).
+    level_override (from the adaptive TargetHealth monitor) caps the level when the target is
+    under stress, so a fragile target gets reduced depth instead of being hammered to death."""
     args = ["sqlmap", "--batch", "--disable-coloring", "--flush-session"]
     if policy is not None:
-        args += policy.sqlmap_args()
+        lvl = level_override if level_override else policy.sqlmap_level
+        args += ["--level", str(lvl), "--risk", str(policy.sqlmap_risk),
+                 f"--technique={policy.sqlmap_technique}"]
     else:
-        args += ["--level", "2", "--risk", "2", "--technique=BEUST"]
+        args += ["--level", str(level_override or 2), "--risk", "2", "--technique=BEUST"]
     if politeness:
         args += politeness.sqlmap_flags()
     if t.method == "POST":
@@ -371,7 +376,10 @@ def run_sqlmap(t: Target, cookie: str, politeness=None, policy=None) -> list[Fin
         args += ["--cookie", cookie]
     if t.csrf_field:
         args += ["--csrf-token", t.csrf_field, "--csrf-url", t.csrf_url]
-    out = _run(args, timeout=900)
+    # Bound wall-time: full depth gets a generous budget, reduced depth (stressed target) is
+    # kept short so a struggling app isn't pinned under a long sqlmap run.
+    _to = 600 if (level_override or (policy.sqlmap_level if policy else 2)) >= 5 else 240
+    out = _run(args, timeout=_to)
     from .scoring.normalize import normalize_sqlmap
     return [Finding(tool="sqlmap", category="sql-injection", url=t.url, param=n.param,
                     method=t.method, evidence="sqlmap-confirmed")
@@ -478,15 +486,22 @@ _MEGA_ROSTER = ["dalfox", "ghauri", "lfi_fuzz", "commix", "crlfuzz", "sstimap", 
 
 
 def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
-               js_dir: str = "") -> list[Finding]:
+               js_dir: str = "", level_override: int | None = None, health=None) -> list[Finding]:
     """Run the full detection roster over the SAFE, converged frontier and normalize each
     adapter's findings to Finding. Tools whose surface is absent (GraphQL/OpenAPI/JWT/JS)
-    cleanly no-op. Every tool is isolated so one failure never sinks the scan."""
+    cleanly no-op. Every tool is isolated so one failure never sinks the scan.
+
+    level_override caps injection depth under target stress; a TargetHealth monitor (health)
+    is re-checked between tools so the roster halts gracefully instead of grinding a dead target
+    through every remaining tool's full timeout."""
     from .orchestrator.adapters import REGISTRY
     from .orchestrator.adapters.base import RunContext
-    opts = {"cookie": cookie, "inject_cap": 0, "timeout": 1800,
-            "sqlmap_level": policy.sqlmap_level, "sqlmap_risk": policy.sqlmap_risk,
-            "sqli_level": policy.sqlmap_level, "lfi_deep": policy.lfi_deep, "js_dir": js_dir}
+    _lvl = level_override or policy.sqlmap_level
+    # Shorter per-tool budget once stressed (reduced depth) so no single tool pins a fragile app.
+    _to = 1800 if _lvl >= 5 else 600
+    opts = {"cookie": cookie, "inject_cap": 0, "timeout": _to,
+            "sqlmap_level": _lvl, "sqlmap_risk": policy.sqlmap_risk,
+            "sqli_level": _lvl, "lfi_deep": policy.lfi_deep, "js_dir": js_dir}
     out: list[Finding] = []
     for name in _MEGA_ROSTER:
         ad = REGISTRY.get(name)
@@ -494,6 +509,10 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
             continue
         if getattr(ad, "active", False) and not policy.active_scan:
             continue
+        # Circuit breaker: if the target went unhealthy, stop launching more active tools
+        # (the halt is surfaced via health.events in the run summary, never silently).
+        if health is not None and getattr(ad, "active", False) and health.check() >= 2:
+            break
         try:
             res = ad.run(RunContext(target=target, seed_urls=safe_urls, options=opts))
         except Exception:  # noqa: BLE001,S112 - one tool must never sink the mega scan
@@ -580,23 +599,40 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     _pii_collector = ResponsePiiCollector()
     set_pii_sink(_pii_collector)
 
+    # Adaptive target-health monitor: keeps safe-deep one profile that self-throttles. It is
+    # pinged between heavy stages; a stressed target steps L5 -> L3, a failing one halts the
+    # active scan (findings preserved) instead of grinding for hours against a dying app —
+    # which is exactly what DoSed the fragile demo target on the first full run.
+    from .safety import TargetHealth
+    health = TargetHealth(base_url=target, cookie=cookie)
+
     # 1) injection tools (breadth) + independent completeness probes (6 blatant classes).
     #    Skipped entirely under passive-only (active_scan=False): read-only recon.
     if tools and policy.active_scan:
         findings += run_nuclei_dast([t.url for t in active_targets
                                      if t.method == "GET" and t.params], cookie, politeness=pol)
         for t in active_targets:
-            if t.params:
-                findings += run_sqlmap(t, cookie, politeness=pol, policy=policy)
+            if not t.params:
+                continue
+            if health.check() >= 2:   # target unhealthy -> stop injecting, keep findings
+                break
+            lvl = health.sqlmap_level(policy.sqlmap_level)
+            findings += run_sqlmap(t, cookie, politeness=pol, policy=policy, level_override=lvl)
         # Full detection roster over the SAFE frontier (dalfox/ghauri/lfi_fuzz/commix/crlfuzz/
         # sstimap/rfi_oast/dotdotpwn/schemathesis/jwt_tool/graphw00f/gitleaks/trufflehog).
         # This is what makes it the mega scan — the roster, not just the core subset.
-        _safe_urls = [t.url for t in active_targets if t.params] or [t.url for t in active_targets]
-        findings += run_roster(target, _safe_urls, cookie, policy,
-                               js_dir=os.environ.get("DASTNG_JS_DIR", ""))
+        if not health.halted:
+            _safe_urls = [t.url for t in active_targets if t.params] or \
+                [t.url for t in active_targets]
+            findings += run_roster(target, _safe_urls, cookie, policy,
+                                   js_dir=os.environ.get("DASTNG_JS_DIR", ""),
+                                   level_override=health.sqlmap_level(policy.sqlmap_level),
+                                   health=health)
         findings = [verify_finding(f, cookie) for f in findings]
-        findings += probe_targets(active_targets, cookie, politeness=pol,
-                                  fuzz_forms=policy.fuzz_forms)
+        # completeness probes only while the target is alive (they replay payloads = more load)
+        if not health.halted:
+            findings += probe_targets(active_targets, cookie, politeness=pol,
+                                      fuzz_forms=policy.fuzz_forms)
 
     # 2) passive/config (hardened-app bulk: headers, cookies, CORS, TLS hygiene)
     for pf in passive_scan(urls, cookie):
@@ -647,7 +683,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
 
     # 4) DOM-based (headless): DOM-XSS + DOM open-redirect on HTML pages. This injects via a
     #    headless browser (client-side), so it is skipped under passive-only (no attack traffic).
-    if dom and policy.active_scan:
+    if dom and policy.active_scan and not health.halted:
         html_pages = sorted({u.split("#")[0] for u in urls
                              if not u.split("?")[0].endswith((".js", ".css", ".png", ".jpg",
                                                               ".svg", ".ico", ".woff", ".map"))})
@@ -679,6 +715,13 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             "state_changing_endpoints_skipped": skipped_state_changing,
             "sqlmap": f"level {policy.sqlmap_level} risk {policy.sqlmap_risk} "
                       f"technique {policy.sqlmap_technique}",
+        },
+        # adaptive health: what the target-stress monitor observed + did (never a silent cap)
+        "health": {
+            "stage": health.stage,          # 0 full depth, 1 reduced (L3), 2 halted
+            "halted": health.halted,
+            "sqlmap_level_used": health.sqlmap_level(policy.sqlmap_level),
+            "events": health.events,
         },
     }
 
