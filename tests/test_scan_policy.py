@@ -44,7 +44,7 @@ def test_staging_and_aggressive_are_full_depth():
 def test_legacy_aliases_resolve():
     assert get_policy("polite").name == "production-safe"
     assert get_policy("normal").name == "staging"
-    assert get_policy("unknown-name").name == "staging"   # safe default
+    assert get_policy("unknown-name").name == "safe-deep"   # safe-deep is THE default
 
 
 def test_sqlmap_args_render():

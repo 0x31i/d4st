@@ -246,13 +246,13 @@ def score(oracle: str, results_dir: str, burp_path: str | None, out_path: str | 
 @click.option("--target", "-t", required=True, help="Base URL (blind: no endpoints supplied).")
 @click.option("--session", "-s", "session_path", required=True, help="Captured session JSON.")
 @click.option("--depth", default=3, type=int, help="Crawl depth.")
-@click.option("--profile", default="staging",
-              type=click.Choice(["production-safe", "passive-only", "staging", "aggressive",
-                                 "polite", "normal"]),
-              help="Scan safety policy. 'production-safe': live/client infra (throttled, no "
-                   "data mutation, no destructive endpoints, safe sqlmap). 'passive-only': "
-                   "read-only recon. 'staging'/'aggressive': disposable targets. "
-                   "(polite=production-safe, normal=staging aliases.)")
+@click.option("--profile", default="safe-deep",
+              type=click.Choice(["safe-deep", "production-safe", "passive-only", "staging",
+                                 "aggressive", "polite", "normal"]),
+              help="Scan policy. DEFAULT 'safe-deep': one posture for every scan — safe for "
+                   "live infra (throttled, no data mutation, no destructive/auth endpoints, "
+                   "non-corrupting sqlmap) AND maximum depth (full tool roster + full payload "
+                   "corpus + convergence discovery). Others are narrower overrides.")
 @click.option("--out", "-o", "out_path", default=None, help="Write findings JSON here.")
 def engagement(target: str, session_path: str, depth: int, profile: str,
                out_path: str | None) -> None:
