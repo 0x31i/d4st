@@ -532,11 +532,13 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     #      /.env, /swagger, /actuator, backups) — the holes nothing links to.
     from .orchestrator.adapters import REGISTRY
     from .orchestrator.adapters.base import RunContext as _RC
-    # Discovery throttle derived from the policy so content brute-forcing stays gentle on
-    # fragile targets (feroxbuster's default 50 threads DoSes single-process apps).
-    _ferox_threads = max(2, int(pol.concurrency)) if pol else 10
-    _ferox_rate = int(pol.rps * pol.concurrency) if (pol and pol.rps > 0) else 0
-    _dopts = {"cookie": cookie, "harvest_rounds": 3, "ferox_depth": 2, "timeout": 900,
+    # Discovery throttle: gentle but not glacial. feroxbuster's default 50 threads DoSes
+    # fragile single-process apps, but the policy's 2-rps floor timed out over a 4.7k wordlist.
+    # Content discovery is read-only GETs (lower risk than injection), so cap threads modestly
+    # and use a moderate rate that still finishes; injection roster stays fully throttled.
+    _ferox_threads = 10
+    _ferox_rate = max(20, int(pol.rps * pol.concurrency)) if pol else 20
+    _dopts = {"cookie": cookie, "harvest_rounds": 3, "ferox_depth": 2, "timeout": 1500,
               "ferox_threads": _ferox_threads, "ferox_rate": _ferox_rate}
     for _tool, _seeds in (("linkharvest", urls), ("feroxbuster", None)):
         try:
