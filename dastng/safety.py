@@ -81,8 +81,11 @@ class Politeness:
         f = ["-c", str(self.concurrency)]
         if self.rps > 0:
             f += ["-rl", str(int(self.rps))]
-        if self.delay_ms:
-            f += ["-delay", f"{self.delay_ms}ms"]
+        # katana's -delay takes INTEGER SECONDS, not "250ms" (that errors out and kills the
+        # crawl -> 0 urls). The -rl rate-limit is the real throttle; only add -delay for
+        # whole-second delays.
+        if self.delay_ms >= 1000:
+            f += ["-delay", str(self.delay_ms // 1000)]
         return f
 
     def nuclei_flags(self) -> list[str]:
