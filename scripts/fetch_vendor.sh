@@ -32,3 +32,11 @@ pip install --only-binary=:all: "spacy==3.7.5" presidio-analyzer >/dev/null 2>&1
   python -m spacy download en_core_web_lg >/dev/null 2>&1 && \
   echo "PII engine (Presidio + en_core_web_lg) installed" || \
   echo "PII engine optional install skipped (built-in fallback will be used)"
+
+# Real-world content-discovery wordlists (SecLists) for feroxbuster.
+mkdir -p "$ROOT/vendor/seclists"
+for f in common.txt raft-medium-directories.txt; do
+  [ -s "$ROOT/vendor/seclists/$f" ] || curl -fsSL -o "$ROOT/vendor/seclists/$f" \
+    "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/$f"
+done
+echo "SecLists wordlists fetched (common.txt, raft-medium-directories.txt)"
