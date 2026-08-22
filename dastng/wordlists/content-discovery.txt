@@ -162,7 +162,6 @@ jenkins
 readme.md
 README.md
 CHANGELOG.md
-acquisitions.md
 TODO
 todo.txt
 notes.txt

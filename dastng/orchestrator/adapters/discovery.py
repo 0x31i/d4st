@@ -70,12 +70,20 @@ class FeroxbusterAdapter(ToolAdapter):
             return AdapterResult(tool=self.name, ok=True, command=cmd, note="dry-run")
         if not self.available():
             return AdapterResult(tool=self.name, ok=False, command=cmd, note="feroxbuster not found")
-        # Curated high-value wordlist (sensitive files + API roots) so content discovery finds
-        # the well-known holes a crawler can't reach (/ftp, /.git, /.env, /swagger, /actuator,
-        # backups) and feeds them to the frontier for nuclei/PII. Override via options.
+        # Real-world content discovery: default to the standard SecLists common.txt (~4.7k
+        # entries seen in actual engagements) so hits are legitimate, not app-tailored. Falls
+        # back to raft-medium, then a small generic supplement. Override via options.
         import os
-        wl = ctx.options.get("ferox_wordlist") or os.path.join(
-            os.path.dirname(__file__), "..", "..", "wordlists", "content-discovery.txt")
+        _root = os.path.join(os.path.dirname(__file__), "..", "..", "..")
+        wl = ctx.options.get("ferox_wordlist")
+        if not wl:
+            for cand in (os.path.join(_root, "vendor", "seclists", "common.txt"),
+                         os.path.join(_root, "vendor", "seclists", "raft-medium-directories.txt"),
+                         os.path.join(os.path.dirname(__file__), "..", "..", "wordlists",
+                                      "content-discovery.txt")):
+                if os.path.exists(cand):
+                    wl = cand
+                    break
         # NB: `--json -q` emits nothing (quiet suppresses the JSON stream). `--json -o
         # /dev/stdout` routes JSONL results to stdout. feroxbuster auto-filters the SPA
         # catch-all (404-like wildcard) itself, so real resources (/ftp, /metrics) survive.
