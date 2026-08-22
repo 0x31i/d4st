@@ -88,7 +88,13 @@ class FeroxbusterAdapter(ToolAdapter):
         # /dev/stdout` routes JSONL results to stdout. feroxbuster auto-filters the SPA
         # catch-all (404-like wildcard) itself, so real resources (/ftp, /metrics) survive.
         args = ["feroxbuster", "-u", ctx.target, "--json", "-o", "/dev/stdout", "--no-state",
-                "-d", str(ctx.options.get("ferox_depth", 2))]
+                "-d", str(ctx.options.get("ferox_depth", 2)),
+                # Throttle: feroxbuster's default 50 threads DoSes fragile targets. The safe
+                # profile passes ferox_threads/ferox_rate so content discovery stays gentle.
+                "-t", str(ctx.options.get("ferox_threads", 10))]
+        _rate = ctx.options.get("ferox_rate")
+        if _rate:
+            args += ["--rate-limit", str(_rate)]
         if os.path.exists(os.path.expanduser(wl)):
             args += ["-w", os.path.expanduser(wl)]
         cookie = _cookie_header(ctx.session, ctx.target) or (ctx.options.get("cookie") or "")
