@@ -70,9 +70,20 @@ class FeroxbusterAdapter(ToolAdapter):
             return AdapterResult(tool=self.name, ok=True, command=cmd, note="dry-run")
         if not self.available():
             return AdapterResult(tool=self.name, ok=False, command=cmd, note="feroxbuster not found")
-        args = ["feroxbuster", "-u", ctx.target, "--json", "-q", "--no-state",
+        # Curated high-value wordlist (sensitive files + API roots) so content discovery finds
+        # the well-known holes a crawler can't reach (/ftp, /.git, /.env, /swagger, /actuator,
+        # backups) and feeds them to the frontier for nuclei/PII. Override via options.
+        import os
+        wl = ctx.options.get("ferox_wordlist") or os.path.join(
+            os.path.dirname(__file__), "..", "..", "wordlists", "content-discovery.txt")
+        # NB: `--json -q` emits nothing (quiet suppresses the JSON stream). `--json -o
+        # /dev/stdout` routes JSONL results to stdout. feroxbuster auto-filters the SPA
+        # catch-all (404-like wildcard) itself, so real resources (/ftp, /metrics) survive.
+        args = ["feroxbuster", "-u", ctx.target, "--json", "-o", "/dev/stdout", "--no-state",
                 "-d", str(ctx.options.get("ferox_depth", 2))]
-        cookie = _cookie_header(ctx.session, ctx.target)
+        if os.path.exists(os.path.expanduser(wl)):
+            args += ["-w", os.path.expanduser(wl)]
+        cookie = _cookie_header(ctx.session, ctx.target) or (ctx.options.get("cookie") or "")
         if cookie:
             args += ["-H", f"Cookie: {cookie}"]
         try:

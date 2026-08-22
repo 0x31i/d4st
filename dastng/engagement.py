@@ -479,6 +479,22 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     pol = policy.politeness
     urls = blind_crawl(target, cookie, depth=depth, politeness=pol)
 
+    # Convergence discovery — the crawl alone misses surface the scanners then never see. Feed
+    # the frontier from two more sources so nuclei/PII/injection cover what katana can't reach:
+    #  (a) link-harvester: exhaustively expand index/listing pages katana under-follows.
+    #  (b) feroxbuster: content brute-force well-known sensitive paths + API roots (/ftp, /.git,
+    #      /.env, /swagger, /actuator, backups) — the holes nothing links to.
+    from .orchestrator.adapters import REGISTRY
+    from .orchestrator.adapters.base import RunContext as _RC
+    _dopts = {"cookie": cookie, "harvest_rounds": 3, "ferox_depth": 2, "timeout": 900}
+    for _tool, _seeds in (("linkharvest", urls), ("feroxbuster", None)):
+        try:
+            _r = REGISTRY[_tool].run(_RC(target=target, seed_urls=_seeds or [], options=_dopts))
+            if _r.discovered_urls:
+                urls = sorted(set(urls) | set(_r.discovered_urls))
+        except Exception:  # noqa: BLE001,S112 - a discovery tool failing must not sink the scan
+            continue
+
     # JS/API discovery: pull API routes out of JS so unlinked endpoints get tested too.
     js_urls = [u for u in urls if u.split("?")[0].endswith(".js")]
     api_eps, vuln_libs = analyze_js(js_urls, cookie, host)
