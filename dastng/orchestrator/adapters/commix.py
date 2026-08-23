@@ -80,9 +80,13 @@ class CommixAdapter(ToolAdapter):
             try:
                 out_dir = tempfile.mkdtemp(prefix="commix_")
                 args = ["commix", "--url", url, "--batch", "--output-dir", out_dir]
+                _d = ctx.options.get("delay_ms")
+                if _d:   # honor scan politeness between requests
+                    args += ["--delay", str(max(1, int(_d / 1000)))]
                 if cookie:
                     args += ["--cookie", cookie]
-                proc = self._exec(args, timeout=ctx.options.get("timeout", 900))
+                # per-URL wall-time cap: don't let one target burn the roster's full budget
+                proc = self._exec(args, timeout=min(int(ctx.options.get("timeout", 900)), 150))
                 findings.extend(parse_commix(proc.stdout, url))
             except Exception:  # noqa: BLE001 - one target failing must not sink the rest
                 errors += 1
