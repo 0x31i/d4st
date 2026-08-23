@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
+from collections import Counter as _Counter
 import tempfile
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -520,7 +522,7 @@ def _stratified_sample(urls: list[str], cap: int) -> list[str]:
 
 def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
                js_dir: str = "", level_override: int | None = None, health=None,
-               per_url_cap: int = 0) -> list[Finding]:
+               per_url_cap: int = 0, progress=None) -> list[Finding]:
     """Run the full detection roster over the SAFE, converged frontier and normalize each
     adapter's findings to Finding. Tools whose surface is absent (GraphQL/OpenAPI/JWT/JS)
     cleanly no-op. Every tool is isolated so one failure never sinks the scan.
@@ -572,7 +574,52 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
             ev = f.get("evidence") or f.get("name") or f.get("message_str") or ""
             out.append(Finding(tool=name, category=fcat, url=str(url).split("?")[0],
                                param=f.get("param"), evidence=str(ev)[:160]))
+        # checkpoint after each roster tool so a kill mid-roster still shows tool-by-tool progress
+        if progress is not None:
+            try:
+                progress.timeline.append({"stage": f"roster:{name}",
+                                          "elapsed_s": round(time.monotonic() - progress.t0),
+                                          "tool_findings": len(res.findings or [])})
+            except Exception:  # noqa: BLE001,S110
+                pass
     return out
+
+
+class _Progress:
+    """Incremental checkpoint writer: after every stage, atomically rewrite a JSON file with
+    everything found so far + a stage timeline. So a scan that is killed / crashes / hangs still
+    leaves an observable, up-to-date record of what it accomplished (instead of losing the whole
+    in-memory run). Enabled by DASTNG_PROGRESS_FILE. Cheap (a few hundred findings), best-effort
+    (never raises into the scan)."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.t0 = time.monotonic()
+        self.timeline: list[dict] = []
+
+    def update(self, stage: str, findings: list, *, urls: int = 0, targets: int = 0,
+               note: str = "") -> None:
+        if not self.path:
+            return
+        elapsed = round(time.monotonic() - self.t0)
+        self.timeline.append({"stage": stage, "elapsed_s": elapsed,
+                              "cumulative_findings": len(findings), "note": note})
+        rec = {
+            "status": "in-progress", "last_stage": stage, "elapsed_s": elapsed,
+            "urls": urls, "targets": targets,
+            "n_findings": len(findings),
+            "by_category": dict(_Counter(getattr(f, "category", "") for f in findings)),
+            "by_tool": dict(_Counter(getattr(f, "tool", "") for f in findings)),
+            "timeline": self.timeline,
+            "findings": [f.__dict__ for f in findings],
+        }
+        try:  # atomic write so a reader never sees a half-written file
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(rec, fh, default=str)
+            os.replace(tmp, self.path)
+        except Exception:  # noqa: BLE001,S110 - progress writing must never break the scan
+            pass
 
 
 def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
@@ -655,6 +702,13 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         active_targets = [t for t in active_targets if t.method != "POST"]
     findings: list[Finding] = []
 
+    # Incremental progress checkpoint (crash-survivable observability): after each stage, rewrite
+    # DASTNG_PROGRESS_FILE with everything found so far + a stage timeline. So even a killed/hung
+    # scan leaves a readable record of what it got done.
+    _prog = _Progress(os.environ.get("DASTNG_PROGRESS_FILE", ""))
+    _prog.update("crawl+discovery", findings, urls=len(urls), targets=len(targets),
+                 note=f"{len(active_targets)} active targets")
+
     # Response-pipeline PII sink: every probe response (incl. audit-time responses to injected
     # payloads) is inspected for PII, Burp-style — not just the crawled surface.
     from .pii import ResponsePiiCollector
@@ -684,6 +738,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     if tools and policy.active_scan:
         findings += run_nuclei_dast([t.url for t in active_targets
                                      if t.method == "GET" and t.params], cookie, politeness=pol)
+        _prog.update("nuclei-dast", findings, urls=len(urls), targets=len(targets))
         # Full detection roster over the SAFE frontier (dalfox/ghauri/lfi_fuzz/commix/crlfuzz/
         # sstimap/rfi_oast/dotdotpwn/schemathesis/jwt_tool/graphw00f/gitleaks/trufflehog).
         # This is what makes it the mega scan — the roster, not just the core subset.
@@ -695,11 +750,13 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             findings += run_roster(target, _safe_urls, cookie, policy,
                                    js_dir=os.environ.get("DASTNG_JS_DIR", ""),
                                    level_override=health.sqlmap_level(policy.sqlmap_level),
-                                   health=health, per_url_cap=_inject_cap)
+                                   health=health, per_url_cap=_inject_cap, progress=_prog)
+        _prog.update("roster", findings, urls=len(urls), targets=len(targets))
         # completeness probes only while the target is alive (they replay payloads = more load)
         if not health.halted:
             findings += probe_targets(active_targets, cookie, politeness=pol,
                                       fuzz_forms=policy.fuzz_forms)
+        _prog.update("probes", findings, urls=len(urls), targets=len(targets))
         # verify (deterministic replay) the fast-detector findings now, while the target is
         # still healthy — sqlmap (section 5) may stress it afterward.
         findings = [verify_finding(f, cookie) for f in findings]
@@ -708,12 +765,14 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     for pf in passive_scan(urls, cookie):
         findings.append(Finding(tool="passive", category=pf.category, url=pf.url,
                                 param=pf.check, evidence=pf.detail, verified=True))
+    _prog.update("passive", findings, urls=len(urls), targets=len(targets))
 
     # 2b) passive info-disclosure via CLI detectors (nuclei exposures/misconfig + PII/email
     # extractor) — the OSS analog to Burp's passive scanner (source/key/token/config
     # disclosure, emails/PII). Read-only GETs, so run regardless of active-scan policy.
     if tools:
         findings += run_nuclei_exposures(urls, cookie, politeness=pol)
+        _prog.update("nuclei-exposures", findings, urls=len(urls), targets=len(targets))
 
     # 2c) PII / PHI disclosure (Presidio, Burp-style) — high-precision structured profile
     # (email, SSN, card w/ Luhn, IBAN, medical/passport/ITIN; NO NER-names, which false-
@@ -736,6 +795,8 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             tool="pii", category="pii-disclosure", url=hit.url, param=hit.entity,
             evidence=f"{hit.entity} disclosed: {hit.masked} (confidence {hit.score})",
             verified=True))
+
+    _prog.update("pii", findings, urls=len(urls), targets=len(targets))
 
     # 3) vulnerable JS dependencies
     for vl in vuln_libs:
@@ -765,6 +826,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             for d in dom_probe(pg, cookie, params=sorted(page_params.get(pg, []))):
                 findings.append(Finding(tool="dom", category=d.category, url=d.url,
                                         param=d.source, evidence=d.evidence, verified=True))
+    _prog.update("dom", findings, urls=len(urls), targets=len(targets))
 
     # 5) DEEP sqlmap exploitation LAST — the slowest + most target-hostile stage. By now the
     #    full detection matrix (nuclei/roster/probes/passive/PII/DOM) is already captured, so
@@ -776,11 +838,15 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             # stratified per-category spread (not the first N of a sorted, LFI-dominated list)
             _keep = set(_stratified_sample([t.url for t in _sql_targets], _inject_cap))
             _sql_targets = [t for t in _sql_targets if t.url in _keep]
-        for t in _sql_targets:
+        for _i, t in enumerate(_sql_targets):
             if health.check() >= 2:   # target unhealthy -> stop, keep everything already found
                 break
             lvl = health.sqlmap_level(policy.sqlmap_level)
             findings += run_sqlmap(t, cookie, politeness=pol, policy=policy, level_override=lvl)
+            if _i % 5 == 0:   # checkpoint periodically through the slow depth loop
+                _prog.update(f"sqlmap[{_i + 1}/{len(_sql_targets)}]", findings,
+                             urls=len(urls), targets=len(targets))
+    _prog.update("sqlmap", findings, urls=len(urls), targets=len(targets))
 
     # 6) ZAP independent crawl + scan — a SECOND engine as a cross-check / accuracy insurance
     #    (its own spider + active rules corroborate the native stack; disagreements flag gaps on
@@ -804,6 +870,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 zap_note = "ran"
             except Exception as exc:  # noqa: BLE001 - ZAP failure must not sink the scan
                 zap_note = f"error: {exc}"
+    _prog.update("zap", findings, urls=len(urls), targets=len(targets), note=zap_note)
 
     # dedup by (category, path, param)
     seen: set = set(); uniq: list[Finding] = []
