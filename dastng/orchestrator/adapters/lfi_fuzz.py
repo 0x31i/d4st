@@ -91,13 +91,19 @@ class LfiFuzzAdapter(ToolAdapter):
                 args = ["ffuf", "-u", fuzz_url, "-w", f"{path}:FUZZ", "-mr", matcher,
                         "-s", "-t", str(ctx.options.get("workers", ctx.options.get("ffuf_threads", 40))),
                         "-timeout", str(ctx.options.get("http_timeout", 6))]
-                _rate = ctx.options.get("rps")
-                if _rate:
-                    args += ["-rate", str(int(_rate))]
+                # Rate: LFI fuzzing is READ-ONLY GET file-reading (content-discovery risk class,
+                # like feroxbuster), NOT attack traffic — so it uses the faster read-only tier,
+                # not the 2-rps injection throttle. Pinning it to the injection rate over a
+                # ~5.4k-payload corpus took ~12min PER non-vulnerable URL (benchmark-intractable).
+                _rate = ctx.options.get("lfi_rate") or max(int(ctx.options.get("rps", 2) or 2) * 6, 12)
+                args += ["-rate", str(int(_rate))]
                 if cookie:
                     args += ["-H", f"Cookie: {cookie}"]
                 try:
-                    proc = self._exec(args, timeout=ctx.options.get("timeout", 120))
+                    # Tight per-wordlist wall-time: a vulnerable case hits fast (small list first,
+                    # then break); a non-vulnerable one must not burn the roster's 1800s budget
+                    # grinding the whole corpus. Cap at 90s regardless of the roster timeout.
+                    proc = self._exec(args, timeout=min(int(ctx.options.get("timeout", 120)), 90))
                 except Exception:  # noqa: BLE001,S112 - one URL's tool error must not sink the scan
                     continue
                 payloads = _parse_ffuf(proc.stdout)
