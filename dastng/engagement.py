@@ -342,15 +342,22 @@ def run_nuclei_dast(urls: list[str], cookie: str, politeness=None) -> list[Findi
         return []
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
         fh.write("\n".join(urls)); path = fh.name
-    args = ["nuclei", "-l", path, "-dast", "-jsonl", "-silent"]
+    # STREAM to a file (-o), not stdout: nuclei buffers stdout until exit, so a timeout-kill
+    # loses everything it found (the silent 0-findings bug on the WAVSEP benchmark — nuclei ran
+    # the full 90min budget over 1861 targets, got killed, and we got nothing). Writing JSONL to
+    # disk means whatever it found up to the kill is preserved and parsed. -stats optional.
+    out_file = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False).name
+    args = ["nuclei", "-l", path, "-dast", "-jsonl", "-o", out_file, "-silent"]
     if politeness:
         args += politeness.nuclei_flags()
     if cookie:
         args += ["-H", f"Cookie: {cookie}"]
-    # nuclei buffers output until it exits, so a timeout-kill loses EVERYTHING it found. Give it
-    # a generous budget (overridable) so it completes on a large frontier instead of being killed
-    # empty — the silent 0-findings bug on the WAVSEP benchmark.
-    out = _run(args, timeout=int(os.environ.get("DASTNG_NUCLEI_TIMEOUT", "5400") or "5400"))
+    _run(args, timeout=int(os.environ.get("DASTNG_NUCLEI_TIMEOUT", "5400") or "5400"))
+    try:  # read whatever nuclei streamed to disk (complete OR timeout-truncated)
+        with open(out_file, encoding="utf-8", errors="ignore") as _fh:
+            out = _fh.read()
+    except Exception:  # noqa: BLE001
+        out = ""
     from .scoring.normalize import normalize_nuclei
     return [Finding(tool="nuclei", category=n.category, url=n.url, param=n.param,
                     evidence=(n.raw.get("info", {}) or {}).get("name", ""))
