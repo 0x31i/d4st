@@ -487,8 +487,37 @@ _MEGA_ROSTER = ["dalfox", "ghauri", "lfi_fuzz", "commix", "crlfuzz", "sstimap", 
                 "dotdotpwn", "schemathesis", "jwt_tool", "graphw00f", "gitleaks", "trufflehog"]
 
 
+# Roster tools that loop one subprocess PER URL (expensive at scale) vs tools that batch a whole
+# URL list in one process. Batch tools always get the FULL frontier (they scale and are the
+# primary breadth detectors — dalfox for XSS especially); per-URL tools get a stratified,
+# per-category-balanced cap so they cover a SPREAD of the surface instead of the first N of a
+# sorted list (the bug that fed dalfox 40 LFI URLs and zero XSS on the first WAVSEP benchmark).
+_PER_URL_TOOLS = {"ghauri", "commix", "lfi_fuzz", "sstimap", "rfi_oast", "dotdotpwn"}
+
+
+def _stratified_sample(urls: list[str], cap: int) -> list[str]:
+    """Round-robin sample up to `cap` URLs spread across path-directory groups, so a per-URL
+    tool sees a balance of every app area / vuln category rather than all-of-one. cap<=0 = all."""
+    if cap <= 0 or len(urls) <= cap:
+        return urls
+    groups: dict[str, list[str]] = {}
+    for u in urls:
+        d = urlsplit(u).path.rsplit("/", 1)[0]
+        groups.setdefault(d, []).append(u)
+    order = sorted(groups)
+    out: list[str] = []
+    i = 0
+    while len(out) < cap and any(groups[g] for g in order):
+        g = order[i % len(order)]
+        if groups[g]:
+            out.append(groups[g].pop(0))
+        i += 1
+    return out
+
+
 def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
-               js_dir: str = "", level_override: int | None = None, health=None) -> list[Finding]:
+               js_dir: str = "", level_override: int | None = None, health=None,
+               per_url_cap: int = 0) -> list[Finding]:
     """Run the full detection roster over the SAFE, converged frontier and normalize each
     adapter's findings to Finding. Tools whose surface is absent (GraphQL/OpenAPI/JWT/JS)
     cleanly no-op. Every tool is isolated so one failure never sinks the scan.
@@ -511,6 +540,8 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
             "sqli_level": _lvl, "lfi_deep": policy.lfi_deep, "js_dir": js_dir,
             "workers": max(1, _pol.concurrency), "delay_ms": _pol.delay_ms,
             "rps": _pol.rps}
+    # Per-URL tools get a stratified, per-category-balanced subset; batch tools get everything.
+    capped_urls = _stratified_sample(safe_urls, per_url_cap) if per_url_cap else safe_urls
     out: list[Finding] = []
     for name in _MEGA_ROSTER:
         ad = REGISTRY.get(name)
@@ -522,8 +553,9 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
         # (the halt is surfaced via health.events in the run summary, never silently).
         if health is not None and getattr(ad, "active", False) and health.check() >= 2:
             break
+        tool_urls = capped_urls if name in _PER_URL_TOOLS else safe_urls
         try:
-            res = ad.run(RunContext(target=target, seed_urls=safe_urls, options=opts))
+            res = ad.run(RunContext(target=target, seed_urls=tool_urls, options=opts))
         except Exception:  # noqa: BLE001,S112 - one tool must never sink the mega scan
             continue
         cat = _ROSTER_CAT.get(name)
@@ -637,14 +669,14 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         # sstimap/rfi_oast/dotdotpwn/schemathesis/jwt_tool/graphw00f/gitleaks/trufflehog).
         # This is what makes it the mega scan — the roster, not just the core subset.
         if not health.halted:
+            # FULL frontier to the roster: batch tools (dalfox/nuclei) cover every case; the
+            # per-URL subprocess tools get a stratified per-category cap inside run_roster.
             _safe_urls = [t.url for t in active_targets if t.params] or \
                 [t.url for t in active_targets]
-            if _inject_cap:
-                _safe_urls = _safe_urls[:_inject_cap]
             findings += run_roster(target, _safe_urls, cookie, policy,
                                    js_dir=os.environ.get("DASTNG_JS_DIR", ""),
                                    level_override=health.sqlmap_level(policy.sqlmap_level),
-                                   health=health)
+                                   health=health, per_url_cap=_inject_cap)
         # completeness probes only while the target is alive (they replay payloads = more load)
         if not health.halted:
             findings += probe_targets(active_targets, cookie, politeness=pol,
@@ -722,7 +754,9 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     if tools and policy.active_scan:
         _sql_targets = [t for t in active_targets if t.params]
         if _inject_cap:
-            _sql_targets = _sql_targets[:_inject_cap]
+            # stratified per-category spread (not the first N of a sorted, LFI-dominated list)
+            _keep = set(_stratified_sample([t.url for t in _sql_targets], _inject_cap))
+            _sql_targets = [t for t in _sql_targets if t.url in _keep]
         for t in _sql_targets:
             if health.check() >= 2:   # target unhealthy -> stop, keep everything already found
                 break
