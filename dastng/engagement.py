@@ -345,7 +345,10 @@ def run_nuclei_dast(urls: list[str], cookie: str, politeness=None) -> list[Findi
         args += politeness.nuclei_flags()
     if cookie:
         args += ["-H", f"Cookie: {cookie}"]
-    out = _run(args, timeout=1800)
+    # nuclei buffers output until it exits, so a timeout-kill loses EVERYTHING it found. Give it
+    # a generous budget (overridable) so it completes on a large frontier instead of being killed
+    # empty — the silent 0-findings bug on the WAVSEP benchmark.
+    out = _run(args, timeout=int(os.environ.get("DASTNG_NUCLEI_TIMEOUT", "5400") or "5400"))
     from .scoring.normalize import normalize_nuclei
     return [Finding(tool="nuclei", category=n.category, url=n.url, param=n.param,
                     evidence=(n.raw.get("info", {}) or {}).get("name", ""))
@@ -591,6 +594,18 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
 
     policy = get_policy(profile)
     pol = policy.politeness
+    # Rate override for robust targets (owned labs / benchmark apps with thousands of cases):
+    # safe-deep's 2-rps throttle is right for fragile client prod, but it makes the active
+    # detectors (nuclei-dast/dalfox) time out over a huge frontier. DASTNG_RPS / DASTNG_CONCURRENCY
+    # let an operator raise the rate for a target that can take it, WITHOUT changing depth
+    # (L5 / full payloads / full roster stay the same). The adaptive health monitor still backs
+    # off if the target starts struggling, so this is a ceiling, not a foot-gun.
+    _rps_ov, _conc_ov = os.environ.get("DASTNG_RPS"), os.environ.get("DASTNG_CONCURRENCY")
+    if _rps_ov or _conc_ov:
+        import dataclasses
+        pol = dataclasses.replace(pol, rps=float(_rps_ov or pol.rps),
+                                  concurrency=int(_conc_ov or pol.concurrency))
+        policy = dataclasses.replace(policy, politeness=pol)  # so run_roster sees it too
     urls = blind_crawl(target, cookie, depth=depth, politeness=pol)
 
     # Convergence discovery — the crawl alone misses surface the scanners then never see. Feed

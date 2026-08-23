@@ -95,9 +95,13 @@ class DalfoxAdapter(ToolAdapter):
                 # (invalid flag in v3 -> silent zero output).
                 args = ["dalfox", "file", list_path, "-f", "json", "-S"]
                 # Throttle: dalfox defaults to 100 concurrent workers, which DoSes a fragile
-                # single-process target. Honor the scan's politeness (worker count + per-request
-                # delay in ms) so safe-deep is actually safe for the roster too.
-                args += ["-w", str(ctx.options.get("workers", 10))]
+                # single-process target. Honor the scan's politeness (worker count + rate limit).
+                # NB: dalfox v3 renamed the workers flag to --workers (the old -w now errors out
+                # with "unexpected argument" -> silent 0 findings); --rate-limit caps global rps.
+                args += ["--workers", str(ctx.options.get("workers", 10))]
+                _rate = ctx.options.get("rps")
+                if _rate:
+                    args += ["--rate-limit", str(int(_rate))]
                 _d = ctx.options.get("delay_ms")
                 if _d:
                     args += ["--delay", str(int(_d))]
