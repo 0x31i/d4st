@@ -539,7 +539,11 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
             "sqlmap_level": _lvl, "sqlmap_risk": policy.sqlmap_risk,
             "sqli_level": _lvl, "lfi_deep": policy.lfi_deep, "js_dir": js_dir,
             "workers": max(1, _pol.concurrency), "delay_ms": _pol.delay_ms,
-            "rps": _pol.rps}
+            "rps": _pol.rps,
+            # RFI/SSRF out-of-band detection: interface the target can reach back to (a same-LAN
+            # IP for a self-hosted OastServer, or a public interactsh host). Without it, rfi_oast
+            # falls back to in-band reflection only. Set via DASTNG_OAST_HOST_IP.
+            "oast_host_ip": os.environ.get("DASTNG_OAST_HOST_IP", "")}
     # Per-URL tools get a stratified, per-category-balanced subset; batch tools get everything.
     capped_urls = _stratified_sample(safe_urls, per_url_cap) if per_url_cap else safe_urls
     out: list[Finding] = []
@@ -778,7 +782,9 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         else:
             import tempfile as _tf
             try:
-                findings += run_zap(target, cookie, _tf.mkdtemp(prefix="dastng-zap-"))
+                _zap_to = int(os.environ.get("DASTNG_ZAP_TIMEOUT", "2400") or "2400")
+                findings += run_zap(target, cookie, _tf.mkdtemp(prefix="dastng-zap-"),
+                                    timeout=_zap_to)
                 zap_ran = True
                 zap_note = "ran"
             except Exception as exc:  # noqa: BLE001 - ZAP failure must not sink the scan
