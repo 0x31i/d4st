@@ -105,9 +105,15 @@ class DalfoxAdapter(ToolAdapter):
                 _d = ctx.options.get("delay_ms")
                 if _d:
                     args += ["--delay", str(int(_d))]
+                # Hang guards: dalfox can stall internally on a pathological endpoint (observed
+                # hanging 13min on one WAVSEP case, ~0 CPU, no requests). --timeout bounds a
+                # single slow request; --scan-timeout caps the per-target injection stage; the
+                # subprocess wall-clock (below) is the belt-and-suspenders that also covers the
+                # discovery/mining phases scan-timeout doesn't.
+                args += ["--timeout", "8", "--scan-timeout", "90"]
                 if cookie:
                     args += ["--cookies", cookie]
-                proc = self._exec(args, timeout=ctx.options.get("timeout", 1800))
+                proc = self._exec(args, timeout=min(int(ctx.options.get("timeout", 1800)), 150))
             except Exception:  # noqa: BLE001,S112 - one endpoint's error must not sink the scan
                 continue
             findings.extend(parse_dalfox(proc.stdout))
