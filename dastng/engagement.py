@@ -529,7 +529,7 @@ def _stratified_sample(urls: list[str], cap: int) -> list[str]:
 
 def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
                js_dir: str = "", level_override: int | None = None, health=None,
-               per_url_cap: int = 0, progress=None) -> list[Finding]:
+               per_url_cap: int = 0, progress=None, base_findings=None) -> list[Finding]:
     """Run the full detection roster over the SAFE, converged frontier and normalize each
     adapter's findings to Finding. Tools whose surface is absent (GraphQL/OpenAPI/JWT/JS)
     cleanly no-op. Every tool is isolated so one failure never sinks the scan.
@@ -581,12 +581,11 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
             ev = f.get("evidence") or f.get("name") or f.get("message_str") or ""
             out.append(Finding(tool=name, category=fcat, url=str(url).split("?")[0],
                                param=f.get("param"), evidence=str(ev)[:160]))
-        # checkpoint after each roster tool so a kill mid-roster still shows tool-by-tool progress
+        # checkpoint after each roster tool so a kill mid-roster still shows tool-by-tool
+        # progress AND flushes cumulative findings to disk (base + roster-so-far).
         if progress is not None:
             try:
-                progress.timeline.append({"stage": f"roster:{name}",
-                                          "elapsed_s": round(time.monotonic() - progress.t0),
-                                          "tool_findings": len(res.findings or [])})
+                progress.update(f"roster:{name}", (base_findings or []) + out)
             except Exception:  # noqa: BLE001,S110
                 pass
     return out
@@ -757,7 +756,8 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             findings += run_roster(target, _safe_urls, cookie, policy,
                                    js_dir=os.environ.get("DASTNG_JS_DIR", ""),
                                    level_override=health.sqlmap_level(policy.sqlmap_level),
-                                   health=health, per_url_cap=_inject_cap, progress=_prog)
+                                   health=health, per_url_cap=_inject_cap, progress=_prog,
+                                   base_findings=list(findings))
         _prog.update("roster", findings, urls=len(urls), targets=len(targets))
         # completeness probes only while the target is alive (they replay payloads = more load)
         if not health.halted:
