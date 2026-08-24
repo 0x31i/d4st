@@ -18,11 +18,26 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from collections import Counter as _Counter
 import tempfile
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
+
+
+def _bootstrap_tool_path() -> None:
+    """Put the dast-ng tool locations on PATH so every adapter's shutil.which(binary) resolves,
+    however the engagement was launched: ~/.dastng/bin (wrapper scripts + symlinks for git/venv
+    tools), ~/go/bin (Go tools like crlfuzz), and the active venv's bin (pip console scripts).
+    Override the tool-bin dir with DASTNG_TOOLS_BIN."""
+    extra = [os.environ.get("DASTNG_TOOLS_BIN", os.path.expanduser("~/.dastng/bin")),
+             os.path.expanduser("~/go/bin"), os.path.dirname(sys.executable)]
+    cur = os.environ.get("PATH", "").split(os.pathsep)
+    os.environ["PATH"] = os.pathsep.join([p for p in extra if p and p not in cur] + cur)
+
+
+_bootstrap_tool_path()
 
 from .orchestrator.forms import fetch_forms
 
