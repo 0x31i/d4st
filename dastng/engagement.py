@@ -1094,18 +1094,33 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         f" -config ajaxSpider.maxDuration={_spider_min}"
         " -config ajaxSpider.maxCrawlDepth=10"
         " -config ajaxSpider.browserId=firefox-headless"
+        # Fragile single-process targets (Juice/Node, many client apps) drop connections under
+        # ZAP's default per-host concurrency (NoHttpResponseException / connect timeouts, which
+        # also stall the run). Throttle so the active scan completes cleanly.
+        " -config scanner.threadPerHost=2"
+        " -config connection.timeoutInSecs=30"
     )
     os.makedirs(out_dir, exist_ok=True)
-    # -m 10: traditional spider 10 min. -j: AJAX spider (SPA). -a: alpha passive rules.
-    # -T 90: allow the whole scan up to 90 min before the wrapper gives up (the outer subprocess
-    # timeout is still the hard ceiling). -I: don't fail the run on informational alerts.
+    # -m: traditional spider minutes. -a: alpha passive rules. -T 90: wrapper wait budget (the
+    # outer subprocess timeout is the hard ceiling). -I: don't fail the run on informational alerts.
+    # -j (AJAX spider) is OPT-IN via DASTNG_ZAP_AJAX=1: it needs a working browser, which fails in
+    # zaproxy/zap-stable ("Failed to configure ZAP extension on browser launch") and destabilizes
+    # the run so the report is never written. The traditional spider + active scan (which DO raise
+    # SQLi/redirect/etc. alerts) do not need a browser and stay on by default.
     args = ["docker", "run", "--rm", "--add-host=host.docker.internal:host-gateway",
             "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
             "zaproxy/zap-stable", "zap-full-scan.py", "-t", zt,
-            "-J", "zap.json", "-j", "-a", "-m", str(_spider_min), "-T", "90", "-I", "-z", zopts]
-    _run(args, timeout=timeout)
+            "-J", "zap.json", "-a", "-m", str(_spider_min), "-T", "90", "-I", "-z", zopts]
+    if os.environ.get("DASTNG_ZAP_AJAX", "0") == "1":
+        args.insert(-3, "-j")
+    _zap_out = _run(args, timeout=timeout)
     report_path = os.path.join(out_dir, "zap.json")
     if not os.path.exists(report_path):
+        # NEVER silently return 0. A missing report means zap-full-scan crashed / timed out before
+        # writing -J (usually the container's browser-based rules). Surface it with the tail so a
+        # broken ZAP is diagnosable instead of masquerading as a clean 0-findings result.
+        _tail = "\n".join((_zap_out or "").splitlines()[-15:])
+        print(f"[zap] NO report written — scan did not complete cleanly. Tail:\n{_tail}", flush=True)
         return []
     with open(report_path, encoding="utf-8") as fh:
         report = json.load(fh)
