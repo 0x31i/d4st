@@ -32,7 +32,8 @@ def _bootstrap_tool_path() -> None:
     tools), ~/go/bin (Go tools like crlfuzz), and the active venv's bin (pip console scripts).
     Override the tool-bin dir with DASTNG_TOOLS_BIN."""
     extra = [os.environ.get("DASTNG_TOOLS_BIN", os.path.expanduser("~/.dastng/bin")),
-             os.path.expanduser("~/go/bin"), os.path.dirname(sys.executable)]
+             os.path.expanduser("~/go/bin"), os.path.dirname(sys.executable),
+             "/opt/homebrew/bin", "/usr/local/bin"]   # standard CLI-tool dirs (nuclei/katana/...)
     cur = os.environ.get("PATH", "").split(os.pathsep)
     os.environ["PATH"] = os.pathsep.join([p for p in extra if p and p not in cur] + cur)
 
