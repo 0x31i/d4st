@@ -64,24 +64,40 @@ def _run(args: list[str], timeout: int, stdin: str | None = None) -> str:
 # ----- discovery --------------------------------------------------------------
 
 def blind_crawl(target: str, cookie: str, depth: int = 3, duration: str = "3m",
-                politeness=None) -> list[str]:
+                politeness=None, headless: bool | None = None,
+                seeds: list[str] | None = None) -> list[str]:
     """katana blind crawl (logout-safe, host-scoped, plain-URL output).
 
-    Headless SPA mode (default on): -hl drives a real browser, -aff auto-fills/submits forms,
-    -xhr captures the XHR/fetch API calls an SPA makes at runtime. This is how the crawl reaches
-    the /rest + /api surface of an Angular/React app (the coverage gap that made Juice Shop
-    finish shallow). Disable with DASTNG_HEADLESS_CRAWL=0 (e.g. no browser available)."""
-    args = ["katana", "-u", target, "-jc", "-silent", "-d", str(depth), "-ct", duration,
-            "-cos", "logout|signout|/setup|reset", "-fs", "fqdn", "-kf", "all"]
-    if os.environ.get("DASTNG_HEADLESS_CRAWL", "1") != "0":
-        args += ["-hl", "-aff", "-xhr"]   # headless browser + auto-form-fill + XHR extraction
-    args += politeness.katana_flags() if politeness else ["-c", "10"]
-    if cookie:
-        args += ["-H", f"Cookie: {cookie}"]
-    # headless crawling is slower (real browser); give it a generous budget.
-    out = _run(args, timeout=1800)
-    urls = sorted({ln.strip() for ln in out.splitlines() if ln.strip().startswith("http")})
-    return urls
+    Headless SPA mode: -hl drives a real browser, -aff auto-fills/submits forms, -xhr captures
+    the XHR/fetch API calls an SPA makes at runtime. This is how the crawl reaches the
+    /rest + /api surface of an Angular/React app. But it is slow and adds nothing on a
+    server-rendered app (JSP/PHP/ASP) whose links are already in the raw HTML.
+
+    The `headless` decision comes from the fingerprint stage (SPA => True, MPA => False).
+    Precedence: explicit DASTNG_HEADLESS_CRAWL env (operator override) > `headless` arg
+    (fingerprint) > legacy default (on). Pass `seeds` to crawl several entry roots (used when
+    the landing page is link-poor and the fingerprint discovered richer entry points)."""
+    env = os.environ.get("DASTNG_HEADLESS_CRAWL")
+    if env is not None:
+        use_headless = env != "0"                # operator override wins
+    elif headless is not None:
+        use_headless = headless                  # fingerprint decision
+    else:
+        use_headless = True                      # legacy default
+
+    roots = list(dict.fromkeys([target, *(seeds or [])]))
+    urls: set[str] = set()
+    for root in roots:
+        args = ["katana", "-u", root, "-jc", "-silent", "-d", str(depth), "-ct", duration,
+                "-cos", "logout|signout|/setup|reset", "-fs", "fqdn", "-kf", "all"]
+        if use_headless:
+            args += ["-hl", "-aff", "-xhr"]      # headless browser + auto-form-fill + XHR
+        args += politeness.katana_flags() if politeness else ["-c", "10"]
+        if cookie:
+            args += ["-H", f"Cookie: {cookie}"]
+        out = _run(args, timeout=1800)           # generous budget (headless is slow)
+        urls |= {ln.strip() for ln in out.splitlines() if ln.strip().startswith("http")}
+    return sorted(urls)
 
 
 def discover_targets(urls: list[str], cookie: str, host: str) -> list[Target]:
@@ -680,7 +696,44 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         pol = dataclasses.replace(pol, rps=float(_rps_ov or pol.rps),
                                   concurrency=int(_conc_ov or pol.concurrency))
         policy = dataclasses.replace(policy, politeness=pol)  # so run_roster sees it too
-    urls = blind_crawl(target, cookie, depth=depth, politeness=pol)
+
+    # ---- pre-flight fingerprint: decide crawl strategy WITHOUT a human -------
+    # Detect app type (SPA vs server-rendered vs API), pick headless-vs-plain, and, when the
+    # landing page is link-poor, auto-discover real entry seeds (robots/sitemap/text-hints/
+    # conventional index files). This is what lets an unattended engagement adapt instead of
+    # crawling one URL off a link-less landing page.
+    from .fingerprint import fingerprint_target
+    try:
+        appprof = fingerprint_target(target, host, cookie)
+        print(f"[fingerprint] {appprof.summary()}")
+        for _s in appprof.signals:
+            print(f"[fingerprint]   - {_s}")
+    except Exception as _fe:  # noqa: BLE001 - fingerprint must never sink the scan
+        print(f"[fingerprint] failed ({_fe}); conservative plain crawl from seed only")
+        appprof = None
+
+    _headless = appprof.headless if appprof else None
+    _seeds = appprof.entry_seeds if appprof else []
+    urls = blind_crawl(target, cookie, depth=depth, politeness=pol,
+                       headless=_headless, seeds=_seeds)
+
+    # ---- crawl-reach self-check: escalate if coverage came back trivially small ----
+    # A healthy crawl reaches many URLs; ~one means the strategy was wrong (headless on a
+    # server-rendered app that needs none, or a seed with nothing to follow). Try the opposite
+    # headless mode from any discovered seeds before giving up. Logged, never silent.
+    if len(urls) <= max(3, len(_seeds) + 1):
+        alt_headless = not (_headless if _headless is not None else True)
+        alt_roots = _seeds or ([appprof.target] if appprof else [target])
+        print(f"[crawl-reach] only {len(urls)} URL(s) from primary strategy; "
+              f"escalating: headless={alt_headless}, {len(alt_roots)} seed root(s)")
+        try:
+            alt = blind_crawl(target, cookie, depth=depth, politeness=pol,
+                              headless=alt_headless, seeds=alt_roots)
+            if len(alt) > len(urls):
+                print(f"[crawl-reach] escalation recovered {len(alt)} URL(s)")
+                urls = sorted(set(urls) | set(alt))
+        except Exception as _ce:  # noqa: BLE001
+            print(f"[crawl-reach] escalation failed: {_ce}")
 
     # Convergence discovery — the crawl alone misses surface the scanners then never see. Feed
     # the frontier from two more sources so nuclei/PII/injection cover what katana can't reach:
