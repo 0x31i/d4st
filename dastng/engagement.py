@@ -432,12 +432,21 @@ def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[
     if not urls:
         return []
     import os
-    tdirs = [os.path.expanduser("~/nuclei-templates/http/exposures"),
-             os.path.expanduser("~/nuclei-templates/http/misconfiguration"),
-             os.path.join(os.path.dirname(__file__), "rules", "pii-disclosure.yaml")]
+    # Broad, SAFE template coverage. Previously only exposures+misconfiguration (~1.7k of the
+    # ~11k http templates) — leaving CVE, known-vuln, exposed-panel and takeover detection off
+    # the table. Add them for real depth. The intrusive classes stay OUT two ways: (1) we do NOT
+    # include http/default-logins (it submits credentials and can lock accounts), and (2) -etags
+    # excludes any intrusive/dos/fuzz/brute-force/default-login template that ships inside the
+    # dirs we do load. Everything kept is read-only GET/HEAD detection — safe under any policy.
+    base = os.path.expanduser("~/nuclei-templates/http")
+    tdirs = [os.path.join(base, d) for d in (
+        "exposures", "misconfiguration", "vulnerabilities", "cves",
+        "exposed-panels", "takeovers", "miscellaneous")]
+    tdirs.append(os.path.join(os.path.dirname(__file__), "rules", "pii-disclosure.yaml"))
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
         fh.write("\n".join(urls)); path = fh.name
-    args = ["nuclei", "-l", path, "-jsonl", "-silent"]
+    args = ["nuclei", "-l", path, "-jsonl", "-silent",
+            "-etags", "intrusive,dos,fuzz,brute-force,default-login"]
     for t in tdirs:
         if os.path.exists(t):
             args += ["-t", t]
@@ -445,7 +454,9 @@ def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[
         args += politeness.nuclei_flags()
     if cookie:
         args += ["-H", f"Cookie: {cookie}"]
-    out = _run(args, timeout=1800)
+    # 8k+ templates over a large frontier needs a real budget; honor the operator override.
+    _to = int(os.environ.get("DASTNG_NUCLEI_TIMEOUT", "3600") or "3600")
+    out = _run(args, timeout=_to)
     findings: list[Finding] = []
     for line in out.splitlines():
         line = line.strip()
@@ -456,11 +467,28 @@ def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[
         except json.JSONDecodeError:
             continue
         info = o.get("info", {}) or {}
-        cat = "pii-disclosure" if "pii" in (o.get("template-id") or "") else "info-disclosure"
+        tid = (o.get("template-id") or "")
+        tid_l = tid.lower()
+        sev = (info.get("severity") or "").lower()
+        if "pii" in tid_l:
+            cat = "pii-disclosure"
+        elif tid_l.startswith("cve-") or "cve" in tid_l:
+            cat = "vulnerability"
+        elif "takeover" in tid_l:
+            cat = "takeover"
+        elif "panel" in tid_l or "-login" in tid_l:
+            cat = "exposed-panel"
+        elif sev in ("high", "critical"):
+            cat = "vulnerability"
+        elif sev == "medium":
+            cat = "misconfiguration"
+        else:
+            cat = "info-disclosure"
+        _name = info.get("name") or tid
         findings.append(Finding(tool="nuclei", category=cat,
                                 url=o.get("matched-at") or o.get("url") or "",
-                                param=o.get("template-id"),
-                                evidence=(info.get("name") or o.get("template-id") or "")[:160],
+                                param=tid,
+                                evidence=(f"[{sev}] {_name}" if sev else _name)[:160],
                                 verified=True))
     return findings
 
@@ -572,7 +600,12 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
     # tool honors the same throttle the Python probes do.
     _pol = policy.politeness
     opts = {"cookie": cookie, "inject_cap": 0, "timeout": _to,
-            "sqlmap_level": _lvl, "sqlmap_risk": policy.sqlmap_risk,
+            "sqlmap_level": _lvl,
+            # Owned-lab depth lever: safe-deep defaults risk 1 (safe payloads only) for live
+            # client infra. DASTNG_SQLMAP_RISK lets an operator raise it (2 adds OR-based, 3 adds
+            # heavy time-based) on an authorized owned/benchmark target, without changing the
+            # safe default. The adaptive health monitor still backs off if the target struggles.
+            "sqlmap_risk": int(os.environ.get("DASTNG_SQLMAP_RISK", policy.sqlmap_risk)),
             "sqli_level": _lvl, "lfi_deep": policy.lfi_deep, "js_dir": js_dir,
             "workers": max(1, _pol.concurrency), "delay_ms": _pol.delay_ms,
             "rps": _pol.rps,
@@ -705,7 +738,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     from .fingerprint import fingerprint_target
     try:
         appprof = fingerprint_target(target, host, cookie)
-        print(f"[fingerprint] {appprof.summary()}")
+        print(f"[fingerprint] {appprof.summary()}", flush=True)
         for _s in appprof.signals:
             print(f"[fingerprint]   - {_s}")
     except Exception as _fe:  # noqa: BLE001 - fingerprint must never sink the scan
@@ -953,8 +986,11 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             import tempfile as _tf
             try:
                 _zap_to = int(os.environ.get("DASTNG_ZAP_TIMEOUT", "2400") or "2400")
+                # Feed ZAP the fingerprint's link-rich entry seed so its spider populates a real
+                # tree to attack (a link-less landing => 0 findings).
+                _zap_seed = (_seeds[0] if _seeds else "")
                 findings += run_zap(target, cookie, _tf.mkdtemp(prefix="dastng-zap-"),
-                                    timeout=_zap_to)
+                                    timeout=_zap_to, seed_url=_zap_seed)
                 zap_ran = True
                 zap_note = "ran"
             except Exception as exc:  # noqa: BLE001 - ZAP failure must not sink the scan
@@ -1011,10 +1047,15 @@ def zap_available() -> bool:
         return False
 
 
-def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400) -> list[Finding]:
+def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
+            seed_url: str = "") -> list[Finding]:
     """OWASP ZAP full-scan via docker (authenticated, logout-excluded). Adds the passive
     categories (CSRF, cookie/session hygiene, CSP, headers) and a generative active scan that
-    corroborates injection classes. Requires a running docker (colima) + the zaproxy image."""
+    corroborates injection classes. Requires a running docker (colima) + the zaproxy image.
+
+    seed_url: point ZAP at a link-rich entry (the fingerprint's discovered seed) instead of a
+    link-less landing page, so its spider actually populates a tree to attack — the difference
+    between 0 findings and a real scan on WAVSEP's link-less index / an SPA shell."""
     import os
 
     from .scoring.normalize import normalize_zap
@@ -1031,19 +1072,37 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400) -> list
         "-config anticsrf.tokens.token(0).name=user_token "
         "-config anticsrf.tokens.token(0).enabled=true"
     )
+    # Seed at a link-rich entry when the fingerprint found one (a link-less landing gives ZAP's
+    # spider nothing to follow => 0 findings). Fall back to the raw target.
+    zt = seed_url or target
     # Docker networking: inside the container, localhost/127.0.0.1 is the CONTAINER, not the
     # host — so a localhost target silently scans nothing (ZAP's 0-findings bug). Rewrite to
     # host.docker.internal (Docker Desktop's host alias) so ZAP reaches the app on the Mac.
-    zt = target
     for lh in ("localhost", "127.0.0.1"):
         if f"//{lh}" in zt or f"//{lh}:" in zt:
             zt = zt.replace(f"//{lh}", "//host.docker.internal")
             break
+    # Thoroughness config: the default full-scan spiders for 1 MINUTE and skips alpha rules —
+    # far too shallow, which is why it returned nothing. Give the traditional spider 10 min and
+    # real depth; give the AJAX spider (SPA coverage) a real duration + crawl depth; include the
+    # alpha passive rules. These are read-only crawl/passive levers — no change to attack safety.
+    _spider_min = int(os.environ.get("DASTNG_ZAP_SPIDER_MIN", "10") or "10")
+    zopts += (
+        f" -config spider.maxDuration={_spider_min}"
+        " -config spider.maxDepth=10"
+        " -config spider.maxChildren=0"
+        f" -config ajaxSpider.maxDuration={_spider_min}"
+        " -config ajaxSpider.maxCrawlDepth=10"
+        " -config ajaxSpider.browserId=firefox-headless"
+    )
     os.makedirs(out_dir, exist_ok=True)
+    # -m 10: traditional spider 10 min. -j: AJAX spider (SPA). -a: alpha passive rules.
+    # -T 90: allow the whole scan up to 90 min before the wrapper gives up (the outer subprocess
+    # timeout is still the hard ceiling). -I: don't fail the run on informational alerts.
     args = ["docker", "run", "--rm", "--add-host=host.docker.internal:host-gateway",
             "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
             "zaproxy/zap-stable", "zap-full-scan.py", "-t", zt,
-            "-J", "zap.json", "-j", "-I", "-z", zopts]
+            "-J", "zap.json", "-j", "-a", "-m", str(_spider_min), "-T", "90", "-I", "-z", zopts]
     _run(args, timeout=timeout)
     report_path = os.path.join(out_dir, "zap.json")
     if not os.path.exists(report_path):
