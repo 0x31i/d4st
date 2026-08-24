@@ -755,8 +755,16 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     #    runs LAST; a fragile target that dies under it has already yielded everything else.
     #    Skipped entirely under passive-only (active_scan=False): read-only recon.
     if tools and policy.active_scan:
-        findings += run_nuclei_dast([t.url for t in active_targets
-                                     if t.method == "GET" and t.params], cookie, politeness=pol)
+        # nuclei-dast is a subprocess detector too: at WAVSEP scale (~1800 targets) it can't
+        # finish at any safe rate and, running FIRST, it blocks everything (the recurring stall).
+        # Cap it to a stratified per-category sample like the other active tools when a cap is
+        # set; the uncapped deterministic probes are the full-coverage recall backbone. Small
+        # real apps (no cap) still get every target.
+        _nd_targets = [t.url for t in active_targets if t.method == "GET" and t.params]
+        if _inject_cap:
+            _ncap = int(os.environ.get("DASTNG_NUCLEI_CAP", "400") or "400")
+            _nd_targets = _stratified_sample(_nd_targets, _ncap)
+        findings += run_nuclei_dast(_nd_targets, cookie, politeness=pol)
         _prog.update("nuclei-dast", findings, urls=len(urls), targets=len(targets))
         # Full detection roster over the SAFE frontier (dalfox/ghauri/lfi_fuzz/commix/crlfuzz/
         # sstimap/rfi_oast/dotdotpwn/schemathesis/jwt_tool/graphw00f/gitleaks/trufflehog).
