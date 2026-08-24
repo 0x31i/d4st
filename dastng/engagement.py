@@ -247,8 +247,16 @@ def verify_sqli(url: str, param: str, method: str, cookie: str) -> tuple[bool, s
         base = _req(method, url, param, "1", cookie).text
     except Exception:  # noqa: BLE001
         return False, "boolean replay failed"
-    if len(t) != len(f) and abs(len(t) - len(base)) < abs(len(f) - len(base)):
-        return True, f"boolean-based diff (true={len(t)} false={len(f)} base={len(base)})"
+    # Require a MATERIAL length delta, not a 1-2 byte artifact. The TRUE/FALSE payloads differ
+    # in length themselves ("OR" vs "AND") and get reflected into the response (e.g. into a
+    # redirect URL on a ?to=/?url= param), so a tiny diff is reflection noise, NOT a boolean-SQLi
+    # signal — that was the /redirect?to= false positive mislabeled as SQLi. A real boolean SQLi
+    # swaps a row's worth of content, so gate on a threshold that clears payload-reflection jitter.
+    _delta = abs(len(t) - len(f))
+    _material = _delta > max(40, int(0.02 * max(1, len(base))))
+    if _material and abs(len(t) - len(base)) < abs(len(f) - len(base)):
+        return True, (f"boolean-based diff (true={len(t)} false={len(f)} "
+                      f"base={len(base)}, delta={_delta})")
     return False, "no SQL error or boolean signal"
 
 
