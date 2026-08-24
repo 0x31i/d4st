@@ -65,13 +65,21 @@ def _run(args: list[str], timeout: int, stdin: str | None = None) -> str:
 
 def blind_crawl(target: str, cookie: str, depth: int = 3, duration: str = "3m",
                 politeness=None) -> list[str]:
-    """katana blind crawl (logout-safe, host-scoped, plain-URL output)."""
+    """katana blind crawl (logout-safe, host-scoped, plain-URL output).
+
+    Headless SPA mode (default on): -hl drives a real browser, -aff auto-fills/submits forms,
+    -xhr captures the XHR/fetch API calls an SPA makes at runtime. This is how the crawl reaches
+    the /rest + /api surface of an Angular/React app (the coverage gap that made Juice Shop
+    finish shallow). Disable with DASTNG_HEADLESS_CRAWL=0 (e.g. no browser available)."""
     args = ["katana", "-u", target, "-jc", "-silent", "-d", str(depth), "-ct", duration,
             "-cos", "logout|signout|/setup|reset", "-fs", "fqdn", "-kf", "all"]
+    if os.environ.get("DASTNG_HEADLESS_CRAWL", "1") != "0":
+        args += ["-hl", "-aff", "-xhr"]   # headless browser + auto-form-fill + XHR extraction
     args += politeness.katana_flags() if politeness else ["-c", "10"]
     if cookie:
         args += ["-H", f"Cookie: {cookie}"]
-    out = _run(args, timeout=600)
+    # headless crawling is slower (real browser); give it a generous budget.
+    out = _run(args, timeout=1800)
     urls = sorted({ln.strip() for ln in out.splitlines() if ln.strip().startswith("http")})
     return urls
 
@@ -970,9 +978,18 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400) -> list
         "-config anticsrf.tokens.token(0).name=user_token "
         "-config anticsrf.tokens.token(0).enabled=true"
     )
+    # Docker networking: inside the container, localhost/127.0.0.1 is the CONTAINER, not the
+    # host — so a localhost target silently scans nothing (ZAP's 0-findings bug). Rewrite to
+    # host.docker.internal (Docker Desktop's host alias) so ZAP reaches the app on the Mac.
+    zt = target
+    for lh in ("localhost", "127.0.0.1"):
+        if f"//{lh}" in zt or f"//{lh}:" in zt:
+            zt = zt.replace(f"//{lh}", "//host.docker.internal")
+            break
     os.makedirs(out_dir, exist_ok=True)
-    args = ["docker", "run", "--rm", "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
-            "zaproxy/zap-stable", "zap-full-scan.py", "-t", target,
+    args = ["docker", "run", "--rm", "--add-host=host.docker.internal:host-gateway",
+            "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
+            "zaproxy/zap-stable", "zap-full-scan.py", "-t", zt,
             "-J", "zap.json", "-j", "-I", "-z", zopts]
     _run(args, timeout=timeout)
     report_path = os.path.join(out_dir, "zap.json")
