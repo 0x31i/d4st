@@ -539,6 +539,97 @@ def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[
     return findings
 
 
+# ---- SPA / JSON-API CSRF heuristic -------------------------------------------------------
+# Form-based CSRF tools (XSRFProbe, ZAP's anti-CSRF-token rule) need HTML forms and miss the SPA
+# case, where state changes go through XHR/JSON APIs. CSRF is exploitable when ALL hold: the
+# request (1) is state-changing, (2) carries NO anti-CSRF token, (3) is authenticated by a COOKIE
+# whose SameSite does not block cross-site sending, and (4) the server does not validate
+# Origin/Referer. This checks all four — deterministically, and generalises to any real client app.
+_CSRF_TOKEN_HINTS = ("csrf", "xsrf", "authenticity_token", "requestverificationtoken",
+                     "anticsrf", "_token", "nonce", "veri_token", "__requestverificationtoken")
+_CSRF_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_CSRF_ORIGIN = "https://evil.example"
+
+
+def _has_csrf_token(t: "Target") -> bool:
+    if getattr(t, "csrf_field", None):
+        return True
+    blob = " ".join(list(t.params or []) + list((t.values or {}).keys())).lower()
+    return any(h in blob for h in _CSRF_TOKEN_HINTS)
+
+
+def _samesite_gap(url: str, cookie: str) -> tuple[bool, str]:
+    """True if the app sets a session-ish cookie WITHOUT SameSite=Strict/Lax — the precondition
+    for CSRF (the browser then auto-attaches that cookie on a cross-site request). SameSite is a
+    per-cookie property, so judge the FIRST response that sets a session cookie (endpoint first,
+    then site root) rather than mixing cookies from different responses. Read-only GET."""
+    import httpx
+    root = f"{urlsplit(url).scheme}://{urlsplit(url).netloc}/"
+    for u in dict.fromkeys((url, root)):
+        try:
+            r = httpx.get(u, headers={"Cookie": cookie} if cookie else {}, timeout=10,
+                          follow_redirects=False)
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            low = "; ".join(r.headers.get_list("set-cookie")).lower()
+        except Exception:  # noqa: BLE001
+            low = (r.headers.get("set-cookie", "") or "").lower()
+        if not low.strip():
+            continue
+        if not any(k in low for k in ("session", "token", "auth", "sid", "jwt", "connect.sid")):
+            continue  # not a session cookie; keep looking
+        if "samesite=strict" in low or "samesite=lax" in low:
+            return False, "session cookie has SameSite"
+        return True, "session cookie set without SameSite"
+    return False, "no session cookie observed"
+
+
+def _origin_check(t: "Target", cookie: str) -> tuple[str, str]:
+    """Replay the state-changing request with a FORGED Origin/Referer. Returns one of
+    'accepted' (server does NOT validate Origin => CSRF-able), 'rejected' (401/403 => Origin or
+    auth enforced => protected), or 'inconclusive'. SENDS a benign state-changing request — the
+    caller gates this behind fuzz_forms."""
+    import httpx
+    headers = {"Origin": _CSRF_ORIGIN, "Referer": _CSRF_ORIGIN + "/"}
+    if cookie:
+        headers["Cookie"] = cookie
+    data = {p: (t.values.get(p) or "dastcsrf") for p in (t.params or [])} or {"dastcsrf": "1"}
+    try:
+        r = httpx.request(t.method.upper(), t.url, data=data, headers=headers, timeout=12,
+                          follow_redirects=False)
+    except Exception as exc:  # noqa: BLE001
+        return "inconclusive", f"replay error: {exc}"
+    if r.status_code in (401, 403):
+        return "rejected", f"cross-origin {t.method} rejected (status {r.status_code})"
+    if r.status_code < 400 or r.status_code in (301, 302, 303, 307, 308):
+        return "accepted", f"forged-Origin {t.method} accepted (status {r.status_code})"
+    return "inconclusive", f"status {r.status_code}"
+
+
+def verify_csrf(t: "Target", cookie: str, active: bool = False) -> tuple[bool, str]:
+    """SPA/API CSRF heuristic. CSRF is exploitable only when ALL hold: state-changing method,
+    NO anti-CSRF token, a cookie session WITHOUT SameSite (so it's auto-sent cross-site), and the
+    server does NOT validate Origin/Referer. The SameSite gap is a hard precondition. active=True
+    adds the forged-Origin confirmation (sends a benign state-changing request — gate behind
+    fuzz_forms); without it the result is a lower-confidence '(passive)' flag."""
+    if (t.method or "GET").upper() not in _CSRF_METHODS:
+        return False, "not state-changing"
+    if _has_csrf_token(t):
+        return False, "anti-CSRF token present"
+    gap, gnote = _samesite_gap(t.url, cookie)
+    if not gap:
+        return False, f"not CSRF-exploitable ({gnote})"   # SameSite set / no session cookie
+    if active:
+        verdict, onote = _origin_check(t, cookie)
+        if verdict == "rejected":
+            return False, f"Origin/Referer validated — protected ({onote})"
+        if verdict == "accepted":
+            return True, f"CSRF confirmed: {gnote}; {onote}; no anti-CSRF token"
+        return True, f"CSRF (likely): {gnote}; no anti-CSRF token; Origin check {onote}"
+    return True, f"CSRF (passive): {gnote}; no anti-CSRF token"
+
+
 def probe_targets(targets: list[Target], cookie: str, politeness=None,
                   fuzz_forms: bool = True) -> list[Finding]:
     """Completeness safety-net: independently replay EVERY blatant-vuln class on every
@@ -558,6 +649,15 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
             continue
         if politeness:
             politeness.wait()
+        # Per-endpoint CSRF (SPA/API heuristic). Passive (no mutation) always; the active
+        # forged-Origin confirmation SENDS a benign state-changing request, so it is gated behind
+        # fuzz_forms exactly like stored-XSS (production-safe never mutates).
+        try:
+            ok, note = verify_csrf(t, cookie, active=fuzz_forms)
+            if ok:
+                add("csrf", t.url, None, t.method, note)
+        except Exception:  # noqa: BLE001,S110 - never let CSRF probing sink the roster
+            pass
         for param in t.params:
             ok, note = verify_cmdi(t.url, param, t.method, cookie)
             if ok:
