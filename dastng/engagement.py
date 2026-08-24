@@ -1134,14 +1134,33 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
             ru = _zap_host_rewrite(u)
             if (urlsplit(ru).hostname or "").lower() in (want, "host.docker.internal"):
                 feed.append(ru)
-        feed = sorted(set(feed)) or [zt]
-        cap = int(os.environ.get("DASTNG_ZAP_URL_CAP", "3000") or "3000")
+        # Drop static assets: active-scanning .js/.css/images/fonts has no injectable surface,
+        # just bloats the scan tree and the JVM footprint (contributes to OOM). Passive rules
+        # (CORS/CSP/headers) still fire from the dynamic responses we keep.
+        _STATIC = re.compile(r'\.(?:js|css|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|webp|mp4|pdf)'
+                             r'(?:\?|$)', re.I)
+        feed = [u for u in feed if not _STATIC.search(u)]
+        # Dedup to distinct ENDPOINTS (path + query-param NAMES). The crawl yields hundreds of
+        # query-VALUE variations of the same few endpoints; feeding all of them bloats — and can
+        # OOM-crash — ZAP's active scan for zero extra coverage, because ZAP fuzzes the param
+        # values itself. Keep one representative URL per (path, sorted param names).
+        _byep = {}
+        for u in sorted(set(feed)):
+            _pp = urlsplit(u)
+            _names = tuple(sorted(kv.split('=')[0] for kv in _pp.query.split('&') if kv))
+            _byep.setdefault((_pp.path, _names), u)
+        feed = list(_byep.values()) or [zt]
+        cap = int(os.environ.get("DASTNG_ZAP_URL_CAP", "150") or "150")
         if len(feed) > cap:
             feed = _stratified_sample(feed, cap)
         with open(os.path.join(out_dir, "frontier.txt"), "w", encoding="utf-8") as fh:
             fh.write("\n".join(feed))
-        # Active-scan time budget from the outer timeout, leaving margin for import + passive.
-        budget = max(10, timeout // 60 - 15)
+        # Active-scan budget must fit INSIDE the outer subprocess timeout alongside ZAP startup,
+        # the URL import (one GET per fed URL), the passive-wait, and the report job — otherwise
+        # ZAP is killed mid-active-scan and never writes the report (the Juice 198-URL/high-strength
+        # timeout). Reserve ~20 min of headroom (passive 8 + import/startup/report ~12).
+        _passive_min = 8
+        budget = max(10, timeout // 60 - 20)
         # Attack strength: 'medium' is right for a huge frontier (WAVSEP); a small target can
         # afford 'high' for maximum thoroughness. DASTNG_ZAP_STRENGTH overrides.
         strength = os.environ.get("DASTNG_ZAP_STRENGTH", "medium").lower()
@@ -1162,7 +1181,7 @@ jobs:
   - type: import
     parameters: {{type: url, fileName: /zap/wrk/frontier.txt}}
   - type: passiveScan-wait
-    parameters: {{maxDuration: 15}}
+    parameters: {{maxDuration: {_passive_min}}}
   - type: activeScan
     parameters:
       context: dastng
@@ -1180,9 +1199,13 @@ jobs:
             fh.write(plan)
         print(f"[zap] frontier mode: feeding {len(feed)} URL(s) to ZAP "
               f"(active-scan budget {budget} min)", flush=True)
+        # ZAP's ergonomic default heap is ~25% of visible RAM (~1.5G on a 6G VM) — too small to
+        # active-scan 100+ URLs, which OOM-crashes the JVM mid-scan (no report). Bump the heap
+        # (DASTNG_ZAP_XMX, default 3g). zap.sh forwards -Xmx to the JVM.
+        _xmx = os.environ.get("DASTNG_ZAP_XMX", "3g")
         args = ["docker", "run", "--rm", "--add-host=host.docker.internal:host-gateway",
                 "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
-                "zaproxy/zap-stable", "zap.sh", "-cmd",
+                "zaproxy/zap-stable", "zap.sh", f"-Xmx{_xmx}", "-cmd",
                 "-autorun", "/zap/wrk/plan.yaml", *auth_cfg]
         _zap_out = _run(args, timeout=timeout)
         return _parse()
