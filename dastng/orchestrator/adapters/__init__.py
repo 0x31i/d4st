@@ -17,9 +17,11 @@ from . import (
     lfi_fuzz,  # noqa: F401
     linkharvest,  # noqa: F401
     nuclei,  # noqa: F401
+    openredirex,  # noqa: F401
     rfi_oast,  # noqa: F401
     secrets,  # noqa: F401
     sqlmap,  # noqa: F401
+    xsrfprobe,  # noqa: F401
     zap,  # noqa: F401
 )
 from .base import REGISTRY, AdapterResult, ToolAdapter, get_adapter, register
