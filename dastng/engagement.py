@@ -539,6 +539,63 @@ def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[
     return findings
 
 
+# ---- soft-404 guard ----------------------------------------------------------------------
+# Apps with catch-all / SPA routing return 2xx for ANY path, so file-existence checks (ZAP's
+# .env / .htaccess / Trace.axd / backup-file leaks, feroxbuster hits) false-positive: the scanner
+# requests /.env, gets the SPA index (200), and reports a leak. This is the same auto-calibration
+# real content scanners do (ffuf -ac, feroxbuster --filter-similar): fingerprint the not-found
+# response, then drop findings whose URL just returns that page.
+_SOFT404_RANDOM = ("dastng-nx-9q2z7x1a4k", "dastng-nx-4k8w3v6bqp.bak")
+# Findings that ASSERT a file/path exists (soft-404-prone). Header/behaviour findings (CORS, CSP,
+# missing-header, SQLi, XSS) are NOT existence claims and must never be dropped by this guard.
+_EXISTENCE_MARKERS = (
+    "information leak", "information disclosure", "source code disclosure", "backup file",
+    ".env", ".htaccess", ".htpasswd", "trace.axd", "elmah", ".git", ".svn", ".bak", ".old",
+    ".swp", "config file", "exposed", "directory browsing", "directory listing", "file found",
+    "wp-config", "web.config", ".ds_store", "php info", "phpinfo",
+)
+
+
+def _is_soft404_fp(url: str, cookie: str) -> bool:
+    """Directory-LOCAL soft-404 calibration (what ffuf -ac / feroxbuster --filter-similar do):
+    fetch the finding URL and a random SIBLING in the same directory. If both return the same
+    status + near-identical body, the 'file' is just that directory's catch-all response — a false
+    positive, not a real exposed file. Per-directory, so it handles apps whose /api, /rest, /ftp
+    subtrees each have their own not-found response."""
+    import httpx
+    clean = url.split("?")[0].split("#")[0]
+    parent = clean.rsplit("/", 1)[0]
+    sib = f"{parent}/{_SOFT404_RANDOM[0]}"
+    hdr = {"Cookie": cookie} if cookie else {}
+    try:
+        r1 = httpx.get(clean, headers=hdr, timeout=10, follow_redirects=False)
+        r2 = httpx.get(sib, headers=hdr, timeout=10, follow_redirects=False)
+    except Exception:  # noqa: BLE001
+        return False
+    if r1.status_code != r2.status_code:
+        return False                      # the real file responds differently => keep it
+    l1, l2 = len(r1.text or ""), len(r2.text or "")
+    return abs(l1 - l2) <= max(64, int(0.15 * max(l1, l2, 1)))
+
+
+def _soft404_filter(findings, target: str, cookie: str, host_rewrite=None):
+    """Drop file-EXISTENCE findings that just return the directory's soft-404/catch-all page.
+    Header/behaviour findings (CORS, CSP, missing-header, SQLi, ...) are never existence claims and
+    are untouched. host_rewrite(url)->url maps a scanner-internal host (host.docker.internal) back
+    to the reachable target host. Returns (kept, n_dropped)."""
+    kept, dropped = [], 0
+    for f in findings:
+        ev = (f"{getattr(f, 'category', '')} {getattr(f, 'evidence', '')}").lower()
+        url = getattr(f, "url", "") or ""
+        if host_rewrite:
+            url = host_rewrite(url)
+        if any(m in ev for m in _EXISTENCE_MARKERS) and url and _is_soft404_fp(url, cookie):
+            dropped += 1
+            continue
+        kept.append(f)
+    return kept, dropped
+
+
 # ---- SPA / JSON-API CSRF heuristic -------------------------------------------------------
 # Form-based CSRF tools (XSRFProbe, ZAP's anti-CSRF-token rule) need HTML forms and miss the SPA
 # case, where state changes go through XHR/JSON APIs. CSRF is exploitable when ALL hold: the
@@ -1261,6 +1318,16 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         for n in normalize_zap(report):
             out.append(Finding(tool="zap", category=n.category, url=n.url, param=n.param,
                                evidence=n.raw.get("name", "")))
+        # Soft-404 guard: on catch-all/SPA-routing apps, ZAP's file-existence checks
+        # (.env/.htaccess/Trace.axd/backup-file leaks) false-positive on the index page. Re-verify
+        # each existence finding against the app's not-found fingerprint and drop the FPs. Findings
+        # carry the container's host.docker.internal host, so map it back to the reachable target.
+        def _hr(u: str) -> str:
+            return u.replace("host.docker.internal", urlsplit(target).hostname or "localhost")
+        out, _dropped = _soft404_filter(out, target, cookie, host_rewrite=_hr)
+        if _dropped:
+            print(f"[zap] soft-404 guard dropped {_dropped} file-existence false positive(s)",
+                  flush=True)
         return out
 
     if mode == "frontier" and frontier:
