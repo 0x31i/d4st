@@ -1084,7 +1084,15 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
     import re
 
     from .scoring.normalize import normalize_zap
-    os.makedirs(out_dir, exist_ok=True)
+    # CRITICAL: docker (colima) bind-mounts only shared host paths. On this host that is /Users
+    # ONLY — not /tmp, /private/tmp, or macOS $TMPDIR (/var/folders). A working dir outside the
+    # shared root mounts EMPTY inside the container ("Cannot access /zap/wrk/plan.yaml") and the
+    # report is written container-side to a path that never appears on the host => run_zap saw no
+    # zap.json and returned 0. THIS was the real ZAP 0-findings cause. Force the working dir under
+    # a shared base (default ~/.dastng/zap, overridable) regardless of the out_dir we were given.
+    _base = os.environ.get("DASTNG_ZAP_WORKDIR", os.path.expanduser("~/.dastng/zap"))
+    os.makedirs(_base, exist_ok=True)
+    out_dir = tempfile.mkdtemp(prefix="zap-", dir=_base)
     report_path = os.path.join(out_dir, "zap.json")
     ck = cookie.replace("; ", ";")
     # Auth cookie replacer + logout exclusion — shared by both modes, passed as ZAP -config.
@@ -1134,6 +1142,11 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
             fh.write("\n".join(feed))
         # Active-scan time budget from the outer timeout, leaving margin for import + passive.
         budget = max(10, timeout // 60 - 15)
+        # Attack strength: 'medium' is right for a huge frontier (WAVSEP); a small target can
+        # afford 'high' for maximum thoroughness. DASTNG_ZAP_STRENGTH overrides.
+        strength = os.environ.get("DASTNG_ZAP_STRENGTH", "medium").lower()
+        if strength not in ("low", "medium", "high", "insane"):
+            strength = "medium"
         scope_re = f"{_p.scheme}://{re.escape(_p.netloc)}.*"
         plan = f"""env:
   contexts:
@@ -1155,7 +1168,7 @@ jobs:
       context: dastng
       maxScanDurationInMins: {budget}
     policyDefinition:
-      defaultStrength: medium
+      defaultStrength: {strength}
       defaultThreshold: low
   - type: report
     parameters:
