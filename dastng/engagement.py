@@ -556,8 +556,16 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
             # IP for a self-hosted OastServer, or a public interactsh host). Without it, rfi_oast
             # falls back to in-band reflection only. Set via DASTNG_OAST_HOST_IP.
             "oast_host_ip": os.environ.get("DASTNG_OAST_HOST_IP", "")}
-    # Per-URL tools get a stratified, per-category-balanced subset; batch tools get everything.
+    # Three frontier tiers under a cap:
+    #  - per-URL subprocess tools (sqlmap/ghauri/commix/lfi_fuzz): small stratified sample.
+    #  - dalfox: runs ONE subprocess per endpoint-GROUP, so on an app with many unique paths
+    #    (WAVSEP: ~3300) "full frontier" = thousands of invocations = hours. It needs a bounded
+    #    (larger) stratified sample too. nuclei-dast already provides the XSS/SQLi breadth at
+    #    true streaming-batch scale, so dalfox is confirmation, not the sole detector.
+    #  - genuinely single-process batch tools (crlfuzz/gitleaks/...) get the full frontier.
     capped_urls = _stratified_sample(safe_urls, per_url_cap) if per_url_cap else safe_urls
+    batch_cap = max(per_url_cap * 8, 240) if per_url_cap else 0
+    dalfox_urls = _stratified_sample(safe_urls, batch_cap) if batch_cap else safe_urls
     out: list[Finding] = []
     for name in _MEGA_ROSTER:
         ad = REGISTRY.get(name)
@@ -569,7 +577,12 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
         # (the halt is surfaced via health.events in the run summary, never silently).
         if health is not None and getattr(ad, "active", False) and health.check() >= 2:
             break
-        tool_urls = capped_urls if name in _PER_URL_TOOLS else safe_urls
+        if name in _PER_URL_TOOLS:
+            tool_urls = capped_urls
+        elif name == "dalfox":
+            tool_urls = dalfox_urls   # bounded: one subprocess per endpoint-group
+        else:
+            tool_urls = safe_urls     # genuinely single-process batch tools
         try:
             res = ad.run(RunContext(target=target, seed_urls=tool_urls, options=opts))
         except Exception:  # noqa: BLE001,S112 - one tool must never sink the mega scan
