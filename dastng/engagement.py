@@ -994,11 +994,12 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             import tempfile as _tf
             try:
                 _zap_to = int(os.environ.get("DASTNG_ZAP_TIMEOUT", "2400") or "2400")
-                # Feed ZAP the fingerprint's link-rich entry seed so its spider populates a real
-                # tree to attack (a link-less landing => 0 findings).
+                # Feed ZAP the CONVERGED FRONTIER (default) so it active/passive-scans the exact
+                # surface the native stack discovered — no reliance on ZAP's own spider/browser.
+                # seed_url is only used by the legacy spider fallback (DASTNG_ZAP_MODE=spider).
                 _zap_seed = (_seeds[0] if _seeds else "")
                 findings += run_zap(target, cookie, _tf.mkdtemp(prefix="dastng-zap-"),
-                                    timeout=_zap_to, seed_url=_zap_seed)
+                                    timeout=_zap_to, seed_url=_zap_seed, frontier=urls)
                 zap_ran = True
                 zap_note = "ran"
             except Exception as exc:  # noqa: BLE001 - ZAP failure must not sink the scan
@@ -1055,66 +1056,133 @@ def zap_available() -> bool:
         return False
 
 
-def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
-            seed_url: str = "") -> list[Finding]:
-    """OWASP ZAP full-scan via docker (authenticated, logout-excluded). Adds the passive
-    categories (CSRF, cookie/session hygiene, CSP, headers) and a generative active scan that
-    corroborates injection classes. Requires a running docker (colima) + the zaproxy image.
+def _zap_host_rewrite(u: str) -> str:
+    """localhost/127.0.0.1 inside the container is the CONTAINER, not the host. Rewrite to
+    host.docker.internal so ZAP reaches the app on the Mac. (LAN IPs pass through unchanged.)"""
+    for lh in ("localhost", "127.0.0.1"):
+        if f"//{lh}" in u:
+            return u.replace(f"//{lh}", "//host.docker.internal")
+    return u
 
-    seed_url: point ZAP at a link-rich entry (the fingerprint's discovered seed) instead of a
-    link-less landing page, so its spider actually populates a tree to attack — the difference
-    between 0 findings and a real scan on WAVSEP's link-less index / an SPA shell."""
+
+def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
+            seed_url: str = "", frontier: list[str] | None = None) -> list[Finding]:
+    """OWASP ZAP as a SECOND ENGINE over the converged frontier. Requires docker + the
+    zaproxy image.
+
+    Default mode ('frontier'): feed ZAP the exact URL set dast-ng already discovered (katana +
+    link-harvester + feroxbuster + JS-extracted routes) via a ZAP Automation Framework plan
+    (import -> passive scan -> active scan -> JSON report). ZAP then attacks the same surface the
+    native stack does, WITHOUT depending on ZAP's own spider or the container's broken headless
+    browser (the AJAX spider fails as 'Failed to configure ZAP extension on browser launch').
+    This is the reliable way to make ZAP process everything the tool found, every scan.
+
+    Set DASTNG_ZAP_MODE=spider to fall back to the legacy zap-full-scan self-crawl (seed_url
+    then points ZAP at a link-rich entry). frontier is the URL list; seed_url is the spider seed.
+    """
     import os
+    import re
 
     from .scoring.normalize import normalize_zap
-    ck = cookie.replace("; ", ";")
-    zopts = (
-        "-config replacer.full_list(0).description=auth "
-        "-config replacer.full_list(0).enabled=true "
-        "-config replacer.full_list(0).matchtype=REQ_HEADER "
-        "-config replacer.full_list(0).matchstr=Cookie "
-        "-config replacer.full_list(0).regex=false "
-        f"-config replacer.full_list(0).replacement={ck} "
-        "-config globalexcludeurl.url_list.url(0).regex=.*logout.* "
-        "-config globalexcludeurl.url_list.url(0).enabled=true "
-        "-config anticsrf.tokens.token(0).name=user_token "
-        "-config anticsrf.tokens.token(0).enabled=true"
-    )
-    # Seed at a link-rich entry when the fingerprint found one (a link-less landing gives ZAP's
-    # spider nothing to follow => 0 findings). Fall back to the raw target.
-    zt = seed_url or target
-    # Docker networking: inside the container, localhost/127.0.0.1 is the CONTAINER, not the
-    # host — so a localhost target silently scans nothing (ZAP's 0-findings bug). Rewrite to
-    # host.docker.internal (Docker Desktop's host alias) so ZAP reaches the app on the Mac.
-    for lh in ("localhost", "127.0.0.1"):
-        if f"//{lh}" in zt or f"//{lh}:" in zt:
-            zt = zt.replace(f"//{lh}", "//host.docker.internal")
-            break
-    # Thoroughness config: the default full-scan spiders for 1 MINUTE and skips alpha rules —
-    # far too shallow, which is why it returned nothing. Give the traditional spider 10 min and
-    # real depth; give the AJAX spider (SPA coverage) a real duration + crawl depth; include the
-    # alpha passive rules. These are read-only crawl/passive levers — no change to attack safety.
-    _spider_min = int(os.environ.get("DASTNG_ZAP_SPIDER_MIN", "10") or "10")
-    zopts += (
-        f" -config spider.maxDuration={_spider_min}"
-        " -config spider.maxDepth=10"
-        " -config spider.maxChildren=0"
-        f" -config ajaxSpider.maxDuration={_spider_min}"
-        " -config ajaxSpider.maxCrawlDepth=10"
-        " -config ajaxSpider.browserId=firefox-headless"
-        # Fragile single-process targets (Juice/Node, many client apps) drop connections under
-        # ZAP's default per-host concurrency (NoHttpResponseException / connect timeouts, which
-        # also stall the run). Throttle so the active scan completes cleanly.
-        " -config scanner.threadPerHost=2"
-        " -config connection.timeoutInSecs=30"
-    )
     os.makedirs(out_dir, exist_ok=True)
-    # -m: traditional spider minutes. -a: alpha passive rules. -T 90: wrapper wait budget (the
-    # outer subprocess timeout is the hard ceiling). -I: don't fail the run on informational alerts.
-    # -j (AJAX spider) is OPT-IN via DASTNG_ZAP_AJAX=1: it needs a working browser, which fails in
-    # zaproxy/zap-stable ("Failed to configure ZAP extension on browser launch") and destabilizes
-    # the run so the report is never written. The traditional spider + active scan (which DO raise
-    # SQLi/redirect/etc. alerts) do not need a browser and stay on by default.
+    report_path = os.path.join(out_dir, "zap.json")
+    ck = cookie.replace("; ", ";")
+    # Auth cookie replacer + logout exclusion — shared by both modes, passed as ZAP -config.
+    auth_cfg = [
+        "-config", "replacer.full_list(0).description=auth",
+        "-config", "replacer.full_list(0).enabled=true",
+        "-config", "replacer.full_list(0).matchtype=REQ_HEADER",
+        "-config", "replacer.full_list(0).matchstr=Cookie",
+        "-config", "replacer.full_list(0).regex=false",
+        "-config", f"replacer.full_list(0).replacement={ck}",
+        "-config", "anticsrf.tokens.token(0).name=user_token",
+        "-config", "anticsrf.tokens.token(0).enabled=true",
+        "-config", "scanner.threadPerHost=2",       # fragile single-process targets
+        "-config", "connection.timeoutInSecs=30",
+    ]
+    mode = os.environ.get("DASTNG_ZAP_MODE", "frontier")
+
+    def _parse() -> list[Finding]:
+        if not os.path.exists(report_path):
+            _tail = "\n".join((_zap_out or "").splitlines()[-20:])
+            print(f"[zap] NO report written — did not complete cleanly. Tail:\n{_tail}", flush=True)
+            return []
+        with open(report_path, encoding="utf-8") as fh:
+            report = json.load(fh)
+        out: list[Finding] = []
+        for n in normalize_zap(report):
+            out.append(Finding(tool="zap", category=n.category, url=n.url, param=n.param,
+                               evidence=n.raw.get("name", "")))
+        return out
+
+    if mode == "frontier" and frontier:
+        # Build the URL feed: in-scope, host-rewritten, deduped, capped (stratified so the cap
+        # spreads across the path tree, not the first N of one directory).
+        zt = _zap_host_rewrite(target)
+        _p = urlsplit(zt)
+        want = (_p.hostname or "").lower()
+        feed = []
+        for u in frontier:
+            ru = _zap_host_rewrite(u)
+            if (urlsplit(ru).hostname or "").lower() in (want, "host.docker.internal"):
+                feed.append(ru)
+        feed = sorted(set(feed)) or [zt]
+        cap = int(os.environ.get("DASTNG_ZAP_URL_CAP", "3000") or "3000")
+        if len(feed) > cap:
+            feed = _stratified_sample(feed, cap)
+        with open(os.path.join(out_dir, "frontier.txt"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(feed))
+        # Active-scan time budget from the outer timeout, leaving margin for import + passive.
+        budget = max(10, timeout // 60 - 15)
+        scope_re = f"{_p.scheme}://{re.escape(_p.netloc)}.*"
+        plan = f"""env:
+  contexts:
+    - name: dastng
+      urls: ['{zt}']
+      includePaths: ['{scope_re}']
+      excludePaths: ['.*logout.*', '.*signout.*', '.*/reset.*']
+  parameters:
+    failOnError: false
+    failOnWarning: false
+    progressToStdout: true
+jobs:
+  - type: import
+    parameters: {{type: url, fileName: /zap/wrk/frontier.txt}}
+  - type: passiveScan-wait
+    parameters: {{maxDuration: 15}}
+  - type: activeScan
+    parameters:
+      context: dastng
+      maxScanDurationInMins: {budget}
+    policyDefinition:
+      defaultStrength: medium
+      defaultThreshold: low
+  - type: report
+    parameters:
+      template: traditional-json
+      reportDir: /zap/wrk/
+      reportFile: zap.json
+"""
+        with open(os.path.join(out_dir, "plan.yaml"), "w", encoding="utf-8") as fh:
+            fh.write(plan)
+        print(f"[zap] frontier mode: feeding {len(feed)} URL(s) to ZAP "
+              f"(active-scan budget {budget} min)", flush=True)
+        args = ["docker", "run", "--rm", "--add-host=host.docker.internal:host-gateway",
+                "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
+                "zaproxy/zap-stable", "zap.sh", "-cmd",
+                "-autorun", "/zap/wrk/plan.yaml", *auth_cfg]
+        _zap_out = _run(args, timeout=timeout)
+        return _parse()
+
+    # ---- legacy fallback: ZAP self-crawls (DASTNG_ZAP_MODE=spider, or no frontier) ----------
+    zt = _zap_host_rewrite(seed_url or target)
+    _spider_min = int(os.environ.get("DASTNG_ZAP_SPIDER_MIN", "10") or "10")
+    zopts = " ".join(auth_cfg) + (
+        " -config globalexcludeurl.url_list.url(0).regex=.*logout.*"
+        " -config globalexcludeurl.url_list.url(0).enabled=true"
+        f" -config spider.maxDuration={_spider_min}"
+        " -config spider.maxDepth=10 -config spider.maxChildren=0"
+    )
     args = ["docker", "run", "--rm", "--add-host=host.docker.internal:host-gateway",
             "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
             "zaproxy/zap-stable", "zap-full-scan.py", "-t", zt,
@@ -1122,18 +1190,4 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
     if os.environ.get("DASTNG_ZAP_AJAX", "0") == "1":
         args.insert(-3, "-j")
     _zap_out = _run(args, timeout=timeout)
-    report_path = os.path.join(out_dir, "zap.json")
-    if not os.path.exists(report_path):
-        # NEVER silently return 0. A missing report means zap-full-scan crashed / timed out before
-        # writing -J (usually the container's browser-based rules). Surface it with the tail so a
-        # broken ZAP is diagnosable instead of masquerading as a clean 0-findings result.
-        _tail = "\n".join((_zap_out or "").splitlines()[-15:])
-        print(f"[zap] NO report written — scan did not complete cleanly. Tail:\n{_tail}", flush=True)
-        return []
-    with open(report_path, encoding="utf-8") as fh:
-        report = json.load(fh)
-    out: list[Finding] = []
-    for n in normalize_zap(report):
-        out.append(Finding(tool="zap", category=n.category, url=n.url, param=n.param,
-                           evidence=n.raw.get("name", "")))
-    return out
+    return _parse()
