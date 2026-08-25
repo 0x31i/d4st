@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from urllib.parse import parse_qs, urlsplit
 
+import time
 import httpx
 
 from ...oast import OAST_BODY_TOKEN, OastServer
@@ -51,6 +52,12 @@ class RfiOastAdapter(ToolAdapter):
         headers = {"Cookie": cookie} if cookie else {}
         findings: list[dict] = []
         timeout = ctx.options.get("http_timeout", 12)
+        settle = float(ctx.options.get("oast_settle", 6))
+        # Two passes so ASYNCHRONOUS callbacks aren't missed: (1) inject every probe and record
+        # in-band reflection immediately, (2) wait `settle` seconds for the target's out-of-band
+        # fetch to land, then confirm each token. Checking saw() right after each request (the old
+        # behaviour) dropped every callback that arrived after the injecting request returned.
+        probes: list[tuple[str, str, str, bool]] = []  # (token, base, param, reflected)
         with OastServer(port=ctx.options.get("oast_port", 0)) as oast:
             for i, url in enumerate(targets):
                 param = _first_param(url)
@@ -59,17 +66,20 @@ class RfiOastAdapter(ToolAdapter):
                 base = url.split("?")[0]
                 token = f"rfi{i}x{abs(hash(base)) % 100000}"
                 probe = oast.probe_url(host_ip, token)
+                reflected = False
                 try:
                     r = httpx.get(f"{base}?{param}={probe}", headers=headers,
                                   timeout=timeout, follow_redirects=True)
                     reflected = OAST_BODY_TOKEN in r.text
                 except Exception:  # noqa: BLE001
-                    reflected = False
+                    pass
+                probes.append((token, base, param, reflected))
+            time.sleep(settle)   # let out-of-band callbacks arrive before we tear the server down
+            for token, base, param, reflected in probes:
                 called_back = oast.saw(token)
                 if called_back or reflected:
-                    channel = ("oast-callback" if called_back else "") + \
-                              (("+" if called_back and reflected else "") if reflected else "") + \
-                              ("in-band-include" if reflected else "")
+                    channel = "+".join(c for c in ("oast-callback" if called_back else "",
+                                                   "in-band-include" if reflected else "") if c)
                     findings.append({
                         "type": "rfi", "url": base, "param": param, "matched-at": base,
                         "channel": channel,
@@ -77,4 +87,4 @@ class RfiOastAdapter(ToolAdapter):
                                     + (" and reflected it" if reflected else ""),
                     })
         return AdapterResult(tool=self.name, ok=True, findings=findings, command=cmd,
-                             note=f"{len(findings)} confirmed RFI")
+                             note=f"{len(findings)} confirmed RFI over {len(probes)} probe(s)")

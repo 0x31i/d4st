@@ -717,6 +717,7 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
         out.append(Finding(tool="verify", category=cat, url=url, param=param,
                            method=method, evidence=note, verified=True))
 
+    _csrf_hits: list[tuple[str, str, str]] = []   # collected, then grouped after the loop
     for t in targets:
         if is_auth_endpoint(t.url):   # never inject auth endpoints
             continue
@@ -724,11 +725,13 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
             politeness.wait()
         # Per-endpoint CSRF (SPA/API heuristic). Passive (no mutation) always; the active
         # forged-Origin confirmation SENDS a benign state-changing request, so it is gated behind
-        # fuzz_forms exactly like stored-XSS (production-safe never mutates).
+        # fuzz_forms exactly like stored-XSS (production-safe never mutates). Collect hits and
+        # group them after the loop (see below) so a no-CSRF-framework app doesn't emit one
+        # finding per endpoint.
         try:
             ok, note = verify_csrf(t, cookie, active=fuzz_forms)
             if ok:
-                add("csrf", t.url, None, t.method, note)
+                _csrf_hits.append((t.url, t.method, note))
         except Exception:  # noqa: BLE001,S110 - never let CSRF probing sink the roster
             pass
         for param in t.params:
@@ -753,6 +756,27 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
                 ok, note = verify_stored_xss(t, param, cookie)
                 if ok:
                     add("xss", t.url, param, t.method, f"stored: {note}")
+
+    # CSRF grouping: an app with no CSRF framework flags EVERY state-changing endpoint — that's
+    # ONE systemic weakness, not N vulnerabilities. Above a threshold, collapse to a single
+    # systemic finding (with a sample + the full endpoint list in evidence); below it, report the
+    # handful individually as a targeted gap. Prevents the 1298-finding flood on WAVSEP.
+    if _csrf_hits:
+        _CSRF_GROUP_THRESHOLD = 8
+        if len(_csrf_hits) >= _CSRF_GROUP_THRESHOLD:
+            _paths = [urlsplit(u).path for u, _m, _n in _csrf_hits]
+            _sample = ", ".join(_paths[:5]) + (" ..." if len(_paths) > 5 else "")
+            out.append(Finding(
+                tool="verify", category="csrf", url=_csrf_hits[0][0], param=None, method="*",
+                evidence=(f"Systemic: {len(_csrf_hits)} state-changing endpoints lack CSRF "
+                          f"protection (no anti-CSRF token, session cookie without SameSite, "
+                          f"Origin/Referer not validated) — the app has no CSRF framework. "
+                          f"Sample: {_sample}"),
+                verified=True))
+        else:
+            for u, m, n in _csrf_hits:
+                out.append(Finding(tool="verify", category="csrf", url=u, param=None,
+                                   method=m, evidence=n, verified=True))
     return out
 
 
@@ -777,7 +801,10 @@ _MEGA_ROSTER = ["dalfox", "ghauri", "lfi_fuzz", "commix", "crlfuzz", "sstimap", 
 # primary breadth detectors — dalfox for XSS especially); per-URL tools get a stratified,
 # per-category-balanced cap so they cover a SPREAD of the surface instead of the first N of a
 # sorted list (the bug that fed dalfox 40 LFI URLs and zero XSS on the first WAVSEP benchmark).
-_PER_URL_TOOLS = {"ghauri", "commix", "lfi_fuzz", "sstimap", "rfi_oast", "dotdotpwn"}
+# rfi_oast is NOT here on purpose: it's fast in-process httpx (one GET per URL + an OAST check),
+# not a slow subprocess-per-URL tool, so it takes the FULL frontier — capping it at the stratified
+# per-URL sample is what limited RFI recall (it only tested ~30 of thousands of params).
+_PER_URL_TOOLS = {"ghauri", "commix", "lfi_fuzz", "sstimap", "dotdotpwn"}
 
 
 def _stratified_sample(urls: list[str], cap: int) -> list[str]:
