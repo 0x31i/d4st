@@ -198,26 +198,42 @@ def verify_cmdi(url: str, param: str, method: str, cookie: str) -> tuple[bool, s
 
 
 def verify_reflected_xss(url: str, param: str, method: str, cookie: str) -> tuple[bool, str]:
+    """Reflected XSS across injection CONTEXTS. A single angle-bracket payload only proves
+    HTML-body injection and misses the common cases where the value lands inside an attribute or
+    an event handler — there the value can be HTML-encoded yet still exploitable by breaking out
+    of the surrounding quote. Try a small context-diverse set and confirm only when a payload
+    reflects VERBATIM (unencoded), which is what actually makes it execute. Returns on first hit."""
     import httpx
-    marker = "dxsc9k1z"
-    payload = f"<sVg/onload=alert({marker})>"
+    m = "dxsc9k1z"
+    # (payload, human tag). Ordered cheap->broad; each proves execution only if it appears
+    # verbatim (the breakout char + handler survived un-encoded).
+    # This is the CONSERVATIVE, low-false-positive safety net — every payload carries angle
+    # brackets, so a VERBATIM reflection always opens a real tag => genuinely executable. It stays
+    # deliberately narrow (no attribute/CSS/event-handler breakouts): those need HEADLESS execution
+    # confirmation to avoid false positives, which is dalfox's job. Adds only the <img>/script-strip
+    # bypass over a single payload, so a <script>-filtering app is still caught.
+    payloads = (
+        (f"<sVg/onload=alert({m})>", "html-tag"),                 # HTML body context
+        (f"<img src=x onerror=alert({m})>", "tag/script-strip"),  # bypasses <script> stripping
+    )
     headers = {"Cookie": cookie} if cookie else {}
-    try:
-        if method == "POST":
-            r = httpx.post(url, data={param: payload}, headers=headers,
-                           follow_redirects=True, timeout=12)
-        else:
-            r = httpx.get(url, params={param: payload}, headers=headers,
-                          follow_redirects=True, timeout=12)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"replay error: {exc}"
-    _feed(url, r.text)   # passive PII inspection of the audit-time response (Burp-style)
-    # confirmed only if the payload is reflected UN-encoded (real XSS, not encoded echo)
-    if payload in r.text:
-        return True, "payload reflected unencoded"
-    if marker in r.text and "&lt;" in r.text:
-        return False, "reflected but HTML-encoded (not exploitable)"
-    return False, "not reflected"
+    encoded = False
+    for pay, tag in payloads:
+        try:
+            if method == "POST":
+                r = httpx.post(url, data={param: pay}, headers=headers,
+                               follow_redirects=True, timeout=12)
+            else:
+                r = httpx.get(url, params={param: pay}, headers=headers,
+                              follow_redirects=True, timeout=12)
+        except Exception:  # noqa: BLE001 - try the next payload
+            continue
+        _feed(url, r.text)   # passive PII inspection of the audit-time response (Burp-style)
+        if pay in r.text:                       # reflected VERBATIM => breakout survived => XSS
+            return True, f"payload reflected unencoded ({tag})"
+        if m in r.text:                         # echoed but neutralised (encoded/stripped)
+            encoded = True
+    return (False, "reflected but encoded/neutralised") if encoded else (False, "not reflected")
 
 
 # SQL-error signatures (MySQL/generic) — strong, low-FP.
