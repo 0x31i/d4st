@@ -65,14 +65,24 @@ class RfiOastAdapter(ToolAdapter):
                     continue
                 base = url.split("?")[0]
                 token = f"rfi{i}x{abs(hash(base)) % 100000}"
-                probe = oast.probe_url(host_ip, token)
+                probe = oast.probe_url(host_ip, token)   # http://host:port/token
+                # Try several probe FORMS (same token) so http-removal / scheme-validation filters
+                # are bypassed: protocol-relative (//host, fetched as http by the server) and mixed
+                # case (HtTp://). This recovers the WAVSEP httpinputremoval/validation RFI cases.
+                forms = [
+                    probe,
+                    "//" + probe.split("//", 1)[1],           # //host:port/token
+                    probe.replace("http://", "HtTp://", 1),   # case-variant scheme
+                ]
                 reflected = False
-                try:
-                    r = httpx.get(f"{base}?{param}={probe}", headers=headers,
-                                  timeout=timeout, follow_redirects=True)
-                    reflected = OAST_BODY_TOKEN in r.text
-                except Exception:  # noqa: BLE001
-                    pass
+                for form in forms:
+                    try:
+                        r = httpx.get(f"{base}?{param}={form}", headers=headers,
+                                      timeout=timeout, follow_redirects=True)
+                        if OAST_BODY_TOKEN in r.text:
+                            reflected = True
+                    except Exception:  # noqa: BLE001
+                        continue
                 probes.append((token, base, param, reflected))
             time.sleep(settle)   # let out-of-band callbacks arrive before we tear the server down
             for token, base, param, reflected in probes:
