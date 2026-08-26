@@ -20,11 +20,12 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter as _Counter
 import tempfile
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 
 def _bootstrap_tool_path() -> None:
@@ -52,6 +53,12 @@ class Target:
     values: dict = field(default_factory=dict)
     csrf_field: str | None = None
     csrf_url: str = ""
+    # API-injection shape (set by the OpenAPI seeder): which params live in the URL PATH vs the
+    # body, and whether the body is JSON. Lets the probes inject into /users/v1/{id} (BOLA/path
+    # SQLi) and into JSON request bodies, not just query/form params.
+    body_type: str = "form"            # "form" | "json"
+    path_params: list[str] = field(default_factory=list)
+    template: str = ""                 # URL with {param} placeholders for path injection
 
     def data_string(self, mark: str = "1") -> str:
         return "&".join(f"{p}={self.values.get(p) or mark}" for p in self.params)
@@ -214,35 +221,41 @@ def seed_targets_from_openapi(schema_url: str, cookie: str) -> tuple[list[Target
     for path, ops in (spec.get("paths") or {}).items():
         if not isinstance(ops, dict):
             continue
-        concrete = re.sub(r'\{[^}]+\}', '1', str(path))          # fill path params with a test value
-        full = base + "/" + concrete.lstrip("/")
+        raw = str(path)
+        template = base + "/" + raw.lstrip("/")                   # keeps {param} placeholders
+        full = base + "/" + re.sub(r'\{[^}]+\}', '1', raw).lstrip("/")   # path params -> test value
         urls.append(full)
         for method, op in ops.items():
             if method.lower() not in ("get", "post", "put", "patch", "delete") \
                     or not isinstance(op, dict):
                 continue
-            qparams, bparams = [], []
+            qparams, pparams, bparams, is_json = [], [], [], False
             for p in op.get("parameters", []) or []:
-                if isinstance(p, dict) and p.get("name") and p.get("in") in ("query", "path"):
-                    qparams.append(p["name"])
-            rb = op.get("requestBody", {})
-            for ct in ("application/json", "application/x-www-form-urlencoded", "*/*"):
-                try:
-                    props = rb["content"][ct]["schema"]["properties"]
-                    bparams += [k for k in props]
-                    break
-                except Exception:  # noqa: BLE001,S112
+                if not isinstance(p, dict) or not p.get("name"):
                     continue
-            # swagger 2.0 body/formData params live in `parameters`
-            for p in op.get("parameters", []) or []:
-                if isinstance(p, dict) and p.get("in") in ("body", "formData") and p.get("name"):
+                loc = p.get("in")
+                if loc == "query":
+                    qparams.append(p["name"])
+                elif loc == "path":
+                    pparams.append(p["name"])
+                elif loc in ("body", "formData"):     # swagger 2.0
                     bparams.append(p["name"])
+            content = (op.get("requestBody", {}) or {}).get("content", {})
+            for ct in ("application/json", "application/x-www-form-urlencoded", "*/*"):
+                props = (content.get(ct, {}) or {}).get("schema", {}).get("properties")
+                if isinstance(props, dict):
+                    bparams += list(props.keys())
+                    is_json = ct == "application/json"
+                    break
             M = method.upper()
-            allp = sorted(set(qparams + bparams))
+            allp = sorted(set(qparams + pparams + bparams))
             if not allp:
                 continue
-            # GET -> query injection; body-bearing verbs -> POST-style body injection.
-            targets.append(Target(url=full, method="GET" if M == "GET" else "POST", params=allp))
+            targets.append(Target(
+                url=full, method="GET" if M == "GET" else "POST", params=allp,
+                path_params=sorted(set(pparams)),
+                body_type="json" if is_json else "form",
+                template=template))
     return targets, sorted(set(urls))
 
 
@@ -521,11 +534,46 @@ def _base_headers(cookie: str) -> dict:
     return h
 
 
+# Per-target injection shape, set by the probe worker before calling the verify_* checks (which
+# only know url+param). A thread-local because the probe stage runs workers concurrently — each
+# worker sets its own target's shape. Absent => classic query/form injection (unchanged).
+_INJ = threading.local()
+
+
+def _set_inject_ctx(target) -> None:
+    if target is None or (target.body_type == "form" and not target.path_params):
+        _INJ.ctx = None
+        return
+    _INJ.ctx = {"path_params": set(target.path_params or []),
+                "body_type": target.body_type,
+                "template": target.template or target.url,
+                "all_params": list(target.params or [])}
+
+
 def _req(method, url, param, value, cookie, follow=True):
     import httpx
     headers = _base_headers(cookie)
-    # Include Submit=Submit: DVWA-style forms only process the input when the submit button
-    # is present. Harmless extra param elsewhere.
+    ctx = getattr(_INJ, "ctx", None)
+    # (a) PATH-parameter injection: substitute the payload into the {param} path segment (other
+    # path params filled with a benign value). This is how BOLA / path-based SQLi get tested.
+    if ctx and param in ctx["path_params"]:
+        u = ctx["template"]
+        for pp in ctx["path_params"]:
+            u = u.replace("{" + pp + "}", quote(str(value), safe="") if pp == param else "1")
+        resp = httpx.request(method if method in ("GET", "POST", "PUT", "DELETE") else "GET",
+                             u, headers=headers, follow_redirects=follow, timeout=12)
+        _feed(u, resp.text)
+        return resp
+    # (b) JSON request-body injection: APIs reject form-encoded bodies, so send the payload in a
+    # JSON object with the other body params filled — the probe now actually reaches the sink.
+    if ctx and ctx["body_type"] == "json" and method in ("POST", "PUT", "PATCH"):
+        body = {p: (value if p == param else "1") for p in (ctx["all_params"] or [param])}
+        resp = httpx.request(method, url.replace("{" + param + "}", "1"), json=body,
+                             headers=headers, follow_redirects=follow, timeout=12)
+        _feed(url, resp.text)
+        return resp
+    # (c) classic query / form injection (unchanged). Submit=Submit: DVWA-style forms only process
+    # the input when the submit button is present; a harmless extra param elsewhere.
     if method == "POST":
         resp = httpx.post(url, data={param: value, "Submit": "Submit"}, headers=headers,
                           follow_redirects=follow, timeout=12)
@@ -1051,6 +1099,7 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
                 add("xss", None, f"dom: {note}")
         except Exception:  # noqa: BLE001,S110
             pass
+        _set_inject_ctx(t)   # tell _req this target's injection shape (path-param / JSON body)
         for param in t.params:
             try:
                 ok, note = verify_cmdi(t.url, param, t.method, cookie)
