@@ -259,6 +259,223 @@ def seed_targets_from_openapi(schema_url: str, cookie: str) -> tuple[list[Target
     return targets, sorted(set(urls))
 
 
+# Privileged fields an app must never let a client set on itself (mass assignment / BOLA-write =
+# privilege escalation). Injected into request bodies; if they take effect, that is the finding.
+_MASS_ASSIGN_FIELDS = {
+    "admin": True, "is_admin": True, "isAdmin": True, "role": "admin", "roles": ["admin"],
+    "is_staff": True, "staff": True, "superuser": True, "is_superuser": True,
+    "verified": True, "email_verified": True, "is_active": True, "approved": True,
+    "account_balance": 999999, "credit": 999999,
+}
+
+
+def _json_body_props(op: dict) -> list[str]:
+    """Documented JSON request-body property names for an OpenAPI operation (v3 + swagger 2.0)."""
+    props: list[str] = []
+    content = (op.get("requestBody", {}) or {}).get("content", {})
+    for ct in ("application/json", "*/*"):
+        sch = (content.get(ct, {}) or {}).get("schema", {})
+        if isinstance(sch.get("properties"), dict):
+            props += list(sch["properties"].keys())
+            break
+    for p in op.get("parameters", []) or []:      # swagger 2.0 body/formData
+        if isinstance(p, dict) and p.get("in") in ("body", "formData") and p.get("name"):
+            props.append(p["name"])
+    return props
+
+
+def _sample_value(name: str, tag: str = "dastng") -> str:
+    n = name.lower()
+    if "email" in n:
+        return f"{tag}@example.com"
+    if "pass" in n:
+        return "Passw0rd!23"
+    if "user" in n or "name" in n or "login" in n:
+        return tag
+    if "id" in n or "count" in n or "qty" in n or "num" in n:
+        return "1"
+    return tag
+
+
+def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[Finding]:
+    """Broken-authorization tests on an API: MASS ASSIGNMENT (client sets a privileged field the
+    server should ignore) and BOLA/IDOR (one identity reads/writes another object). These are the
+    OWASP API Top-10 leaders and the top healthcare-API risk (one patient reaching another's
+    record). They CREATE and MODIFY objects, so they run ONLY under fuzz_forms (owned/authorized
+    targets), never production-safe. Uses the current auth header (set_auth_header) as the acting
+    identity. Best-effort + isolated: any failure yields fewer findings, never a crash."""
+    import httpx
+    out: list[Finding] = []
+    if not fuzz_forms:
+        return out
+    try:
+        spec = httpx.get(schema_url, headers=_base_headers(cookie), timeout=12,
+                         follow_redirects=True).json()
+    except Exception:  # noqa: BLE001
+        return out
+    if not isinstance(spec, dict):
+        return out
+    paths = spec.get("paths") or {}
+    # resolve base (servers / basePath / schema root), same as the OpenAPI seeder.
+    root = f"{urlsplit(schema_url).scheme}://{urlsplit(schema_url).netloc}"
+    base = root
+    servers = spec.get("servers")
+    if isinstance(servers, list) and servers and isinstance(servers[0], dict):
+        su = servers[0].get("url", "")
+        base = su if su.startswith("http") else (root + "/" + su.lstrip("/")).rstrip("/")
+    elif spec.get("basePath"):
+        base = root + "/" + str(spec["basePath"]).lstrip("/")
+    base = base.rstrip("/")
+
+    def _url(path: str) -> str:
+        return base + "/" + re.sub(r'\{[^}]+\}', '1', str(path)).lstrip("/")
+
+    # ---- (1) MASS ASSIGNMENT: inject privileged fields into every JSON-body write ----
+    for path, ops in paths.items():
+        if not isinstance(ops, dict):
+            continue
+        for method, op in ops.items():
+            if method.lower() not in ("post", "put", "patch") or not isinstance(op, dict):
+                continue
+            props = _json_body_props(op)
+            if not props:
+                continue
+            url = _url(path)
+            body = {p: _sample_value(p) for p in props}
+            body.update(_MASS_ASSIGN_FIELDS)          # the privileged extras
+            try:
+                r = httpx.request(method.upper(), url, json=body, headers=_base_headers(cookie),
+                                  timeout=12, follow_redirects=True)
+            except Exception:  # noqa: BLE001,S112
+                continue
+            if r.status_code >= 300:
+                continue
+            low = r.text.lower()
+            # confirmed if the server ECHOES a privileged field we set with our value
+            reflected = [k for k in _MASS_ASSIGN_FIELDS
+                         if f'"{k}"' in low and ("true" in low or "admin" in low)]
+            if reflected:
+                out.append(Finding(
+                    tool="verify", category="mass-assignment", url=url, param=reflected[0],
+                    method=method.upper(),
+                    evidence=(f"privileged field {reflected[0]!r} accepted + reflected on "
+                              f"{method.upper()} {urlsplit(url).path} (mass assignment / privilege "
+                              f"escalation)"), verified=True))
+
+    # ---- (1b) MASS ASSIGNMENT via READ-BACK: create-user endpoints rarely echo the object, so
+    # register a user WITH admin:true, then read it back (via any GET endpoint, incl. a collection
+    # / debug listing) and confirm the flag actually stuck on OUR object. ----
+    def _priv_stuck(data, uname: str) -> bool:
+        """Recursively find an object with our username where a privileged field is truthy."""
+        if isinstance(data, dict):
+            uname_here = any(str(data.get(k, "")).lower() == uname.lower()
+                             for k in ("username", "user", "name", "login"))
+            priv_here = any(str(data.get(k, "")).lower() in ("true", "1", "admin")
+                            for k in ("admin", "is_admin", "isadmin", "role", "is_staff",
+                                      "superuser", "is_superuser"))
+            if uname_here and priv_here:
+                return True
+            return any(_priv_stuck(v, uname) for v in data.values())
+        if isinstance(data, list):
+            return any(_priv_stuck(v, uname) for v in data)
+        return False
+
+    _get_eps = [str(p) for p, ops in paths.items()
+                if isinstance(ops, dict) and "get" in {m.lower() for m in ops}]
+    # A create endpoint's object often only exposes privileged fields via a debug/admin listing
+    # that is NOT in the spec (e.g. VAmPI's /users/v1/_debug). Probe a few conventional ones so
+    # the read-back can still confirm; relative to each documented collection path too.
+    _colls = {re.sub(r'/\{[^}]+\}.*$', '', str(p)).rstrip('/') for p in paths}
+    for c in list(_colls) + [""]:
+        for dbg in ("_debug", "debug", "all", "list"):
+            _get_eps.append((c + "/" + dbg).lstrip("/"))
+    for path, ops in paths.items():
+        if not isinstance(ops, dict):
+            continue
+        op = ops.get("post")
+        if not isinstance(op, dict):
+            continue
+        props = _json_body_props(op)
+        pl = " ".join(props).lower()
+        # a user-CREATION endpoint (register/signup/users), not login — login also has user+pass
+        # but creates nothing, so registering there just adds noise.
+        if not (("user" in pl or "name" in pl) and "pass" in pl):
+            continue
+        if any(w in str(path).lower() for w in ("login", "signin", "sign-in", "authenticate", "token")):
+            continue
+        uname = f"dastngma{int(time.time()) % 100000}{len(out)}"
+        body = {p: (uname if ("user" in p.lower() or "name" in p.lower()) else _sample_value(p, uname))
+                for p in props}
+        body.update({"admin": True, "is_admin": True, "role": "admin"})
+        try:
+            httpx.request("POST", _url(path), json=body, headers=_base_headers(cookie), timeout=12)
+        except Exception:  # noqa: BLE001,S112
+            continue
+        confirmed_at = None
+        for gp in _get_eps:                           # read back via {id} or collection/debug GETs
+            gurl = base + "/" + re.sub(r'\{[^}]+\}', uname, gp).lstrip("/")
+            try:
+                rr = httpx.get(gurl, headers=_base_headers(cookie), timeout=12, follow_redirects=True)
+                data = rr.json()
+            except Exception:  # noqa: BLE001,S112
+                continue
+            if rr.status_code < 300 and _priv_stuck(data, uname):
+                confirmed_at = urlsplit(gurl).path
+                break
+        if confirmed_at:
+            out.append(Finding(
+                tool="verify", category="mass-assignment", url=_url(path), param="admin",
+                method="POST",
+                evidence=(f"registered a user with admin=true and it PERSISTED (read back as "
+                          f"privileged at {confirmed_at}) — privilege escalation via mass "
+                          f"assignment"), verified=True))
+
+    # ---- (2) BOLA / IDOR: enumerate objects via a collection endpoint, then modify ANOTHER
+    # object with the current identity. A 2xx write on an object we do not own = broken
+    # object-level authorization (the top healthcare-API risk: cross-record access). ----
+    others: list[str] = []
+    for path, ops in paths.items():
+        if "{" in str(path) or not isinstance(ops, dict) or "get" not in {m.lower() for m in ops}:
+            continue
+        try:
+            r = httpx.get(_url(path), headers=_base_headers(cookie), timeout=12, follow_redirects=True)
+            data = r.json()
+        except Exception:  # noqa: BLE001,S112
+            continue
+        for m in re.finditer(r'"(?:username|user|name|login|id|email)"\s*:\s*"([^"]{1,64})"',
+                             json.dumps(data) if not isinstance(data, str) else data):
+            others.append(m.group(1))
+    others = [o for o in dict.fromkeys(others) if "dastng" not in o.lower()][:4]
+    _bola_done = set()
+    for path, ops in paths.items():
+        if "{" not in str(path) or not isinstance(ops, dict):
+            continue
+        for method, op in ops.items():
+            if method.lower() not in ("put", "patch") or urlsplit(_url(path)).path in _bola_done:
+                continue
+            props = _json_body_props(op)
+            body = {p: _sample_value(p) for p in props} if props else None
+            for oid in others:
+                target_url = base + "/" + re.sub(r'\{[^}]+\}', str(oid), str(path)).lstrip("/")
+                try:
+                    r = httpx.request(method.upper(), target_url, json=body,
+                                      headers=_base_headers(cookie), timeout=12,
+                                      follow_redirects=True)
+                except Exception:  # noqa: BLE001,S112
+                    continue
+                if r.status_code < 300:
+                    _bola_done.add(urlsplit(_url(path)).path)
+                    out.append(Finding(
+                        tool="verify", category="bola", url=target_url, param=None,
+                        method=method.upper(),
+                        evidence=(f"{method.upper()} on another object ({oid!r}) at "
+                                  f"{urlsplit(target_url).path} returned {r.status_code} with the "
+                                  f"current identity — broken object-level authorization (IDOR)"),
+                        verified=True))
+                    break
+    return out
+
+
 def discover_targets(urls: list[str], cookie: str, host: str) -> list[Target]:
     """Turn crawled URLs into injection targets: GET URLs with query params, and every
     discovered form (POST/GET) with its CSRF token."""
@@ -1674,6 +1891,16 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             findings += probe_targets(active_targets, cookie, politeness=pol,
                                       fuzz_forms=policy.fuzz_forms)
         _prog.update("probes", findings, urls=len(urls), targets=len(targets))
+        # API authorization tests (BOLA/IDOR + mass assignment) — OWASP API Top-10 leaders, the
+        # top healthcare-API risk. Stateful/multi-request + object-mutating, so gated on fuzz_forms
+        # (owned/authorized). Uses the current bearer identity (set via _apply_jwt).
+        if _api.get("openapi_schema") and policy.fuzz_forms:
+            _refresh_jwt("api-authz")
+            _authz = run_api_authz_tests(_api["openapi_schema"], cookie, policy.fuzz_forms)
+            if _authz:
+                findings += _authz
+                print(f"[api-authz] {len(_authz)} BOLA/mass-assignment finding(s)", flush=True)
+            _prog.update("api-authz", findings, urls=len(urls), targets=len(targets))
         # verify (deterministic replay) the fast-detector findings now, while the target is
         # still healthy — sqlmap (section 5) may stress it afterward.
         findings = [verify_finding(f, cookie) for f in findings]
