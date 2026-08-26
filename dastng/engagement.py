@@ -1267,7 +1267,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # landing page is link-poor, auto-discover real entry seeds (robots/sitemap/text-hints/
     # conventional index files). This is what lets an unattended engagement adapt instead of
     # crawling one URL off a link-less landing page.
-    from .fingerprint import fingerprint_target
+    from .fingerprint import build_attack_profile, fingerprint_target
     try:
         appprof = fingerprint_target(target, host, cookie)
         print(f"[fingerprint] {appprof.summary()}", flush=True)
@@ -1276,6 +1276,11 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     except Exception as _fe:  # noqa: BLE001 - fingerprint must never sink the scan
         print(f"[fingerprint] failed ({_fe}); conservative plain crawl from seed only")
         appprof = None
+    # Fingerprint -> PROBE strategy: which app-appropriate deep techniques to ADD on top of the
+    # full baseline (dialect-aware SQLi keys off live error signatures; DOM-XSS + stack-specific
+    # payloads + API-tool emphasis key off this profile). Never removes coverage.
+    _atk = build_attack_profile(appprof)
+    print(f"[fingerprint] {_atk.summary()}", flush=True)
 
     _headless = appprof.headless if appprof else None
     _seeds = appprof.entry_seeds if appprof else []
