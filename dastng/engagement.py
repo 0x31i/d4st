@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -246,6 +247,46 @@ def verify_reflected_xss(url: str, param: str, method: str, cookie: str) -> tupl
     if suspected:
         return True, suspected
     return (False, "reflected but encoded/neutralised") if encoded else (False, "not reflected")
+
+
+# DOM-XSS source->sink flow: a client-side DOM XSS (DVWA xss_d, and most SPA XSS) never reflects
+# server-side — the param is read from the URL BY JAVASCRIPT (document.location/hash/name) and
+# written to a dangerous sink (document.write/innerHTML/eval) in the browser, so no server response
+# ever contains the payload. A native scanner can still flag it from the STATIC source->sink flow
+# in the page's inline JS; execution needs a browser, so it is reported SUSPECTED (headless-confirm
+# recommended) rather than confirmed. This is the additive native complement to headless dalfox.
+_DOM_SOURCES = re.compile(
+    r'\b(document\.(?:location|URL|documentURI|referrer|cookie|baseURI)'
+    r'|location\.(?:href|search|hash|pathname)|window\.name|history\.(?:pushState|replaceState)'
+    r'|decodeURI(?:Component)?\s*\(\s*(?:document\.|location|window\.name))', re.I)
+_DOM_SINKS = re.compile(
+    r'\b(document\.write(?:ln)?\s*\(|\.innerHTML\s*=|\.outerHTML\s*=|\.insertAdjacentHTML\s*\('
+    r'|eval\s*\(|setTimeout\s*\(\s*[\'"]?[a-z_$]|setInterval\s*\(\s*[\'"]|\.setAttribute\s*\(\s*'
+    r'[\'"]?(?:src|href)|\$\s*\(\s*(?:document\.|location)|jquery\.globalEval)', re.I)
+_SCRIPT_BLOCK = re.compile(r'<script\b[^>]*>(.*?)</script>', re.I | re.S)
+
+
+def verify_dom_xss(url: str, cookie: str) -> tuple[bool, str]:
+    """Page-level DOM-XSS heuristic: the page's inline JS reads a URL-controlled SOURCE
+    (location/hash/name/referrer) AND passes data to a dangerous SINK (document.write/innerHTML/
+    eval). Reported SUSPECTED — a browser is needed to confirm execution — but this is exactly the
+    class that reflects nowhere server-side (DVWA xss_d, SPA router XSS) and would otherwise be a
+    silent miss. High-signal: requires BOTH a source and a sink in the same page."""
+    import httpx
+    headers = {"Cookie": cookie} if cookie else {}
+    try:
+        r = httpx.get(url, headers=headers, follow_redirects=True, timeout=12)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"fetch error: {exc}"
+    js = "\n".join(_SCRIPT_BLOCK.findall(r.text or ""))
+    if not js:
+        return False, "no inline script"
+    src = _DOM_SOURCES.search(js)
+    snk = _DOM_SINKS.search(js)
+    if src and snk:
+        return True, (f"DOM-XSS source->sink flow — SUSPECTED (headless-confirm): "
+                      f"source {src.group(1)[:32]!r} -> sink {snk.group(1)[:24]!r}")
+    return False, "no DOM source->sink flow"
 
 
 # SQL-error signatures (MySQL/generic) — strong, low-FP.
@@ -855,6 +896,13 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
             ok, note = verify_csrf(t, cookie, active=fuzz_forms)
             if ok:
                 csrf_hit = (t.url, t.method, note)
+        except Exception:  # noqa: BLE001,S110
+            pass
+        # DOM-XSS is page-level (source->sink in the page JS), not per-param — check the page once.
+        try:
+            ok, note = verify_dom_xss(t.url, cookie)
+            if ok:
+                add("xss", None, f"dom: {note}")
         except Exception:  # noqa: BLE001,S110
             pass
         for param in t.params:
