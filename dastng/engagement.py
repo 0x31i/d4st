@@ -185,6 +185,67 @@ def discover_api_surface(target: str, urls: list[str], cookie: str) -> dict:
     return surface
 
 
+def seed_targets_from_openapi(schema_url: str, cookie: str) -> tuple[list[Target], list[str]]:
+    """Turn an OpenAPI/Swagger spec into injection targets + frontier URLs. An API has no HTML
+    links, so the crawler reaches ~1 URL and the injection probes get NOTHING to test — the spec
+    IS the sitemap. Extract every path+method with its query/body params so the native probes
+    (SQLi/XSS/cmdi) fuzz real endpoints, and add every concrete endpoint URL so nuclei-dast /
+    schemathesis / passive cover the full documented surface. Returns (targets, urls)."""
+    import httpx
+    try:
+        r = httpx.get(schema_url, headers=_base_headers(cookie), timeout=12, follow_redirects=True)
+        spec = r.json()
+    except Exception:  # noqa: BLE001
+        return [], []
+    if not isinstance(spec, dict):
+        return [], []
+    root = f"{urlsplit(schema_url).scheme}://{urlsplit(schema_url).netloc}"
+    base = root
+    servers = spec.get("servers")
+    if isinstance(servers, list) and servers and isinstance(servers[0], dict):
+        su = servers[0].get("url", "")
+        base = su if su.startswith("http") else (root + "/" + su.lstrip("/")).rstrip("/")
+    elif spec.get("basePath"):   # swagger 2.0
+        base = root + "/" + str(spec["basePath"]).lstrip("/")
+    base = base.rstrip("/")
+
+    targets: list[Target] = []
+    urls: list[str] = []
+    for path, ops in (spec.get("paths") or {}).items():
+        if not isinstance(ops, dict):
+            continue
+        concrete = re.sub(r'\{[^}]+\}', '1', str(path))          # fill path params with a test value
+        full = base + "/" + concrete.lstrip("/")
+        urls.append(full)
+        for method, op in ops.items():
+            if method.lower() not in ("get", "post", "put", "patch", "delete") \
+                    or not isinstance(op, dict):
+                continue
+            qparams, bparams = [], []
+            for p in op.get("parameters", []) or []:
+                if isinstance(p, dict) and p.get("name") and p.get("in") in ("query", "path"):
+                    qparams.append(p["name"])
+            rb = op.get("requestBody", {})
+            for ct in ("application/json", "application/x-www-form-urlencoded", "*/*"):
+                try:
+                    props = rb["content"][ct]["schema"]["properties"]
+                    bparams += [k for k in props]
+                    break
+                except Exception:  # noqa: BLE001,S112
+                    continue
+            # swagger 2.0 body/formData params live in `parameters`
+            for p in op.get("parameters", []) or []:
+                if isinstance(p, dict) and p.get("in") in ("body", "formData") and p.get("name"):
+                    bparams.append(p["name"])
+            M = method.upper()
+            allp = sorted(set(qparams + bparams))
+            if not allp:
+                continue
+            # GET -> query injection; body-bearing verbs -> POST-style body injection.
+            targets.append(Target(url=full, method="GET" if M == "GET" else "POST", params=allp))
+    return targets, sorted(set(urls))
+
+
 def discover_targets(urls: list[str], cookie: str, host: str) -> list[Target]:
     """Turn crawled URLs into injection targets: GET URLs with query params, and every
     discovered form (POST/GET) with its CSRF token."""
@@ -248,7 +309,7 @@ def verify_cmdi(url: str, param: str, method: str, cookie: str) -> tuple[bool, s
     bypass that DVWA-high allows). Confirms by the `id` command output signature."""
     import httpx
     seps = [";id", "|id", "| id", "&&id", "%0aid", "`id`", "$(id)"]
-    headers = {"Cookie": cookie} if cookie else {}
+    headers = _base_headers(cookie)
     for sep in seps:
         payload = f"127.0.0.1{sep}"
         try:
@@ -291,7 +352,7 @@ def verify_reflected_xss(url: str, param: str, method: str, cookie: str) -> tupl
         (f"' onmouseover='alert({m})//", "sq-event-handler", "suspected"),
         (f"javascript:alert({m})//", "js-uri", "suspected"),     # href/src sink context
     )
-    headers = {"Cookie": cookie} if cookie else {}
+    headers = _base_headers(cookie)
     encoded = False
     suspected = None
     for pay, tag, conf in payloads:
@@ -341,7 +402,7 @@ def verify_dom_xss(url: str, cookie: str) -> tuple[bool, str]:
     class that reflects nowhere server-side (DVWA xss_d, SPA router XSS) and would otherwise be a
     silent miss. High-signal: requires BOTH a source and a sink in the same page."""
     import httpx
-    headers = {"Cookie": cookie} if cookie else {}
+    headers = _base_headers(cookie)
     try:
         r = httpx.get(url, headers=headers, follow_redirects=True, timeout=12)
     except Exception as exc:  # noqa: BLE001
@@ -443,9 +504,26 @@ _OR_PAYLOADS = (
 )
 
 
+# Optional auth header (e.g. Authorization: Bearer <jwt>) applied to EVERY probe request. API
+# endpoints authenticate by header, not cookie, so without this the injection probes get 401 on
+# an authenticated API and test nothing. Set once per scan (refreshed by the JWT-refresh hook).
+_AUTH_HEADER: dict = {}
+
+
+def set_auth_header(headers: dict | None) -> None:
+    global _AUTH_HEADER
+    _AUTH_HEADER = dict(headers or {})
+
+
+def _base_headers(cookie: str) -> dict:
+    h = {"Cookie": cookie} if cookie else {}
+    h.update(_AUTH_HEADER)
+    return h
+
+
 def _req(method, url, param, value, cookie, follow=True):
     import httpx
-    headers = {"Cookie": cookie} if cookie else {}
+    headers = _base_headers(cookie)
     # Include Submit=Submit: DVWA-style forms only process the input when the submit button
     # is present. Harmless extra param elsewhere.
     if method == "POST":
@@ -620,7 +698,7 @@ def verify_stored_xss(target: Target, param: str, cookie: str) -> tuple[bool, st
     import httpx
     marker = "stx7q2z"
     payload = f"<sVg/onload=alert({marker})>"
-    headers = {"Cookie": cookie} if cookie else {}
+    headers = _base_headers(cookie)
     data = {p: (target.values.get(p) or "x") for p in target.params}
     data[param] = payload
     data.setdefault("Submit", "Submit")
@@ -1293,7 +1371,7 @@ def _env_reauth():
 def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                    dom: bool = True, tools: bool = True, profile: str = "safe-deep",
                    zap: bool = True, reauth=None, session_probe: str = "",
-                   session_marker: str = "") -> dict:
+                   session_marker: str = "", jwt_refresh=None) -> dict:
     """Full blind flow covering BOTH profiles: blatant injection (DVWA-style) AND the
     hardened-app profile (config/passive + vulnerable JS + API + DOM-based). Returns
     {urls, targets, findings} with findings verified.
@@ -1469,12 +1547,52 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         # API adapters need but nothing else populates — the reason schemathesis/jwt_tool/graphw00f
         # never fired. Runs on every app; a classic app simply yields nothing and they no-op.
         _api = discover_api_surface(target, urls, cookie)
+
+        def _apply_jwt(tok: str) -> None:
+            """Set bearer auth on every probe + carry the token to the API tools."""
+            if tok:
+                _api["jwt"] = tok
+                set_auth_header({"Authorization": f"Bearer {tok}"})
+
+        # JWT refresh: short-lived API tokens (VAmPI = 60s) expire mid-scan, silently 401-ing every
+        # later request. A refresh hook re-mints one; called before each heavy stage below.
+        def _refresh_jwt(stage: str) -> None:
+            if not jwt_refresh:
+                return
+            try:
+                tok = jwt_refresh()
+            except Exception as e:  # noqa: BLE001
+                print(f"[jwt] refresh failed before '{stage}': {e}", flush=True)
+                return
+            if tok:
+                _apply_jwt(tok)
+                print(f"[jwt] refreshed before '{stage}'", flush=True)
+
+        _apply_jwt(_api.get("jwt", ""))
         if _api:
             print(f"[api-surface] {', '.join(f'{k}={str(v)[:60]}' for k, v in _api.items())}",
                   flush=True)
         elif _atk.api_mode:
             print("[api-surface] app fingerprinted as API but no schema/endpoint/JWT found",
                   flush=True)
+        # OpenAPI -> frontier: the spec is the API's sitemap. Seed every documented endpoint as a
+        # target so the injection probes + nuclei fuzz real endpoints (an API has no HTML links, so
+        # the crawler alone leaves targets=0).
+        if _api.get("openapi_schema"):
+            _oa_t, _oa_u = seed_targets_from_openapi(_api["openapi_schema"], cookie)
+            _seed = [t for t in _oa_t if not is_auth_endpoint(t.url)]
+            if policy.skip_state_changing:
+                _seed = [t for t in _seed if not is_state_changing(t.url)]
+            if not policy.fuzz_forms:
+                _seed = [t for t in _seed if t.method != "POST"]
+            _known = {(t.url, t.method, tuple(t.params)) for t in active_targets}
+            _new = [t for t in _seed if (t.url, t.method, tuple(t.params)) not in _known]
+            active_targets.extend(_new)
+            targets = list(targets) + _new
+            urls = sorted(set(urls) | set(_oa_u))
+            _prog.update("openapi-seed", findings, urls=len(urls), targets=len(targets))
+            print(f"[api-surface] OpenAPI seeded {len(_new)} injection target(s) + "
+                  f"{len(_oa_u)} endpoint URL(s)", flush=True)
         # nuclei-dast is a subprocess detector too: at WAVSEP scale (~1800 targets) it can't
         # finish at any safe rate and, running FIRST, it blocks everything (the recurring stall).
         # Cap it to a stratified per-category sample like the other active tools when a cap is
@@ -1503,6 +1621,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         # completeness probes only while the target is alive (they replay payloads = more load)
         if not health.halted:
             cookie = _session.ensure("probes")   # roster is long; re-auth before native probes
+            _refresh_jwt("probes")
             findings += probe_targets(active_targets, cookie, politeness=pol,
                                       fuzz_forms=policy.fuzz_forms)
         _prog.update("probes", findings, urls=len(urls), targets=len(targets))
@@ -1583,6 +1702,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     #    Health-gated per target: reduced depth under stress, halt on target death.
     if tools and policy.active_scan:
         cookie = _session.ensure("sqlmap")   # the slowest stage; re-auth so it runs authenticated
+        _refresh_jwt("sqlmap")
         _sql_targets = [t for t in active_targets if t.params]
         if _inject_cap:
             # stratified per-category spread (not the first N of a sorted, LFI-dominated list)
