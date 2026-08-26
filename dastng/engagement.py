@@ -769,52 +769,69 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
     Deterministic, strong-signature checks only (low false-positive). Throttled when a
     politeness profile is given (avoids tripping rate limits/WAF on production targets).
     When fuzz_forms is False (production-safe), stored-XSS (which WRITES data) is skipped."""
+    from concurrent.futures import ThreadPoolExecutor
+
     from .safety import is_auth_endpoint
-    out: list[Finding] = []
 
-    def add(cat, url, param, method, note):
-        out.append(Finding(tool="verify", category=cat, url=url, param=param,
-                           method=method, evidence=note, verified=True))
-
-    _csrf_hits: list[tuple[str, str, str]] = []   # collected, then grouped after the loop
-    for t in targets:
+    def _probe_one(t: Target):
+        """All checks for ONE target. Returns (findings, csrf_hit|None). Self-contained so it runs
+        safely in a worker thread and never raises into the pool."""
+        found: list[Finding] = []
         if is_auth_endpoint(t.url):   # never inject auth endpoints
-            continue
-        if politeness:
-            politeness.wait()
-        # Per-endpoint CSRF (SPA/API heuristic). Passive (no mutation) always; the active
-        # forged-Origin confirmation SENDS a benign state-changing request, so it is gated behind
-        # fuzz_forms exactly like stored-XSS (production-safe never mutates). Collect hits and
-        # group them after the loop (see below) so a no-CSRF-framework app doesn't emit one
-        # finding per endpoint.
+            return found, None
+
+        def add(cat, param, note):
+            found.append(Finding(tool="verify", category=cat, url=t.url, param=param,
+                                 method=t.method, evidence=note, verified=True))
+
+        csrf_hit = None
         try:
             ok, note = verify_csrf(t, cookie, active=fuzz_forms)
             if ok:
-                _csrf_hits.append((t.url, t.method, note))
-        except Exception:  # noqa: BLE001,S110 - never let CSRF probing sink the roster
+                csrf_hit = (t.url, t.method, note)
+        except Exception:  # noqa: BLE001,S110
             pass
         for param in t.params:
-            ok, note = verify_cmdi(t.url, param, t.method, cookie)
-            if ok:
-                add("command-injection", t.url, param, t.method, note)
-            ok, note = verify_reflected_xss(t.url, param, t.method, cookie)
-            if ok:
-                add("xss", t.url, param, t.method, note)
-            ok, note = verify_sqli(t.url, param, t.method, cookie)
-            if ok:
-                add("sql-injection", t.url, param, t.method, note)
-            ok, note = verify_lfi(t.url, param, t.method, cookie)
-            if ok:
-                add("file-inclusion", t.url, param, t.method, note)
-            ok, note = verify_open_redirect(t.url, param, t.method, cookie)
-            if ok:
-                add("open-redirect", t.url, param, t.method, note)
-            # stored XSS only makes sense on POST forms (inject then re-view the page).
-            # It WRITES data, so it is skipped under production-safe (fuzz_forms=False).
-            if t.method == "POST" and fuzz_forms:
-                ok, note = verify_stored_xss(t, param, cookie)
+            try:
+                ok, note = verify_cmdi(t.url, param, t.method, cookie)
                 if ok:
-                    add("xss", t.url, param, t.method, f"stored: {note}")
+                    add("command-injection", param, note)
+                ok, note = verify_reflected_xss(t.url, param, t.method, cookie)
+                if ok:
+                    add("xss", param, note)
+                ok, note = verify_sqli(t.url, param, t.method, cookie)
+                if ok:
+                    add("sql-injection", param, note)
+                ok, note = verify_lfi(t.url, param, t.method, cookie)
+                if ok:
+                    add("file-inclusion", param, note)
+                ok, note = verify_open_redirect(t.url, param, t.method, cookie)
+                if ok:
+                    add("open-redirect", param, note)
+                # stored XSS only makes sense on POST forms; it WRITES data, so production-safe
+                # (fuzz_forms=False) skips it.
+                if t.method == "POST" and fuzz_forms:
+                    ok, note = verify_stored_xss(t, param, cookie)
+                    if ok:
+                        add("xss", param, f"stored: {note}")
+            except Exception:  # noqa: BLE001,S112 - one param must never sink the target
+                continue
+        return found, csrf_hit
+
+    # Parallelise across targets: the checks are network-I/O-bound, so a thread pool turns the
+    # (formerly sequential, rate-limited) probe stage from hours into minutes at benchmark scale.
+    # Concurrency is bounded by the policy (production-safe stays low, so fragile targets are not
+    # hammered), overridable via DASTNG_PROBE_WORKERS. Results are collected lock-free from each
+    # worker's return value.
+    _workers = int(os.environ.get("DASTNG_PROBE_WORKERS", "0") or "0") or \
+        (max(4, getattr(politeness, "concurrency", 10)) if politeness else 10)
+    out: list[Finding] = []
+    _csrf_hits: list[tuple[str, str, str]] = []
+    with ThreadPoolExecutor(max_workers=_workers) as _ex:
+        for _found, _csrf in _ex.map(_probe_one, targets):
+            out.extend(_found)
+            if _csrf:
+                _csrf_hits.append(_csrf)
 
     # CSRF grouping: an app with no CSRF framework flags EVERY state-changing endpoint — that's
     # ONE systemic weakness, not N vulnerabilities. Above a threshold, collapse to a single
@@ -1005,9 +1022,90 @@ class _Progress:
             pass
 
 
+class SessionKeeper:
+    """Keeps an authenticated session alive across a long unattended engagement.
+
+    A static captured cookie silently dies mid-scan on any real app — idle timeout, session
+    rotation, or a stray logout link — and the scan then degrades to hammering the login page and
+    reporting nothing, with nobody watching. This probes session validity at each stage boundary
+    and RE-AUTHENTICATES on loss, refreshing the cookie for every downstream tool (katana -H,
+    sqlmap, nuclei, the native probes). Without a probe+reauth it is inert (back-compat).
+
+    - probe_url: an in-app URL that REQUIRES auth (redirects to / renders login when logged out).
+    - ok_marker: a substring present ONLY when authenticated (e.g. 'Logout'). If empty, a
+      login-redirect / login-form heuristic decides.
+    - reauth:    callable() -> fresh cookie string (a form-login, or the Playwright MFA module).
+    """
+
+    def __init__(self, cookie: str, probe_url: str = "", ok_marker: str = "", reauth=None):
+        self.cookie = cookie or ""
+        self.probe_url = probe_url or ""
+        self.ok_marker = ok_marker or ""
+        self.reauth = reauth
+        self.reauths = 0
+        self.enabled = bool(self.probe_url and reauth)
+
+    def alive(self) -> bool:
+        """True if the current cookie still authenticates. Inconclusive/error => True (never
+        thrash a re-auth on a transient network blip)."""
+        if not self.probe_url:
+            return True
+        import httpx
+        hdr = {"Cookie": self.cookie} if self.cookie else {}
+        try:
+            r = httpx.get(self.probe_url, headers=hdr, follow_redirects=False, timeout=10)
+            if r.status_code in (301, 302, 303, 307, 308):
+                loc = (r.headers.get("location") or "").lower()
+                return not any(w in loc for w in ("login", "signin", "sign-in", "auth", "sso"))
+            body = r.text.lower()
+            if self.ok_marker:
+                return self.ok_marker.lower() in body
+            # heuristic: a login form on a page that should be authed => logged out
+            looks_login = "password" in body and any(
+                m in body for m in ('name="username"', 'name="user"', "user_token",
+                                    "sign in", "log in", "login"))
+            return not looks_login
+        except Exception:  # noqa: BLE001 - inconclusive: assume alive, don't false-reauth
+            return True
+
+    def ensure(self, stage: str = "") -> str:
+        """Probe; re-authenticate on loss. Returns the current (possibly refreshed) cookie so the
+        caller threads it into the next stage's tools."""
+        if not self.enabled or self.alive():
+            return self.cookie
+        print(f"[session] auth lost before '{stage}' — re-authenticating", flush=True)
+        try:
+            fresh = self.reauth()
+        except Exception as e:  # noqa: BLE001
+            print(f"[session] re-auth FAILED: {e}", flush=True)
+            return self.cookie
+        if fresh and fresh != self.cookie:
+            self.cookie = fresh
+            self.reauths += 1
+            print(f"[session] re-auth {'restored' if self.alive() else 'did NOT restore'} "
+                  f"session (#{self.reauths})", flush=True)
+        return self.cookie
+
+
+def _env_reauth():
+    """Build a reauth callable from DASTNG_REAUTH_CMD: a shell command that (re)authenticates and
+    prints a fresh 'name=value; ...' cookie string as its LAST stdout line. Decouples re-auth from
+    the engagement — the operator supplies any login flow (form login, script, Playwright)."""
+    cmd = os.environ.get("DASTNG_REAUTH_CMD")
+    if not cmd:
+        return None
+
+    def _do() -> str:
+        out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
+        lines = [ln.strip() for ln in out.stdout.splitlines() if "=" in ln and ln.strip()]
+        return lines[-1] if lines else ""
+    return _do
+
+
 def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                    dom: bool = True, tools: bool = True, profile: str = "safe-deep",
-                   zap: bool = True) -> dict:
+                   zap: bool = True, reauth=None, session_probe: str = "",
+                   session_marker: str = "") -> dict:
     """Full blind flow covering BOTH profiles: blatant injection (DVWA-style) AND the
     hardened-app profile (config/passive + vulnerable JS + API + DOM-based). Returns
     {urls, targets, findings} with findings verified.
@@ -1024,6 +1122,19 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
 
     policy = get_policy(profile)
     pol = policy.politeness
+
+    # Session keeper: a long unattended scan MUST survive session loss (idle timeout / rotation /
+    # stray logout) or it silently degrades to scanning the login page. Probe validity at each
+    # stage boundary and re-auth on loss, refreshing the cookie for every downstream tool. Inert
+    # unless a probe URL + reauth are supplied (params or env), so back-compat is preserved.
+    _session = SessionKeeper(
+        cookie,
+        probe_url=session_probe or os.environ.get("DASTNG_SESSION_PROBE_URL", ""),
+        ok_marker=session_marker or os.environ.get("DASTNG_SESSION_MARKER", ""),
+        reauth=reauth or _env_reauth())
+    if _session.enabled:
+        print(f"[session] keeper armed (probe={_session.probe_url})", flush=True)
+        cookie = _session.ensure("preflight")
     # Rate override for robust targets (owned labs / benchmark apps with thousands of cases):
     # safe-deep's 2-rps throttle is right for fragile client prod, but it makes the active
     # detectors (nuclei-dast/dalfox) time out over a huge frontier. DASTNG_RPS / DASTNG_CONCURRENCY
@@ -1106,6 +1217,10 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     api_eps, vuln_libs = analyze_js(js_urls, cookie, host)
     urls = sorted(set(urls) | set(api_eps))
 
+    # The crawl can outlive the session (a long headless crawl, a stray logout). Re-auth before
+    # form discovery so fetch_forms parses the REAL authenticated forms, not the login page (the
+    # exact failure DVWA exposed: dead session => every form looked like the login form).
+    cookie = _session.ensure("discover-targets")
     targets = discover_targets(urls, cookie, host)
     # SAFETY: never actively test auth endpoints (submitting payloads/failed logins there
     # locks accounts and logs the scanner out). Passive checks still cover them read-only.
@@ -1156,6 +1271,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     #    runs LAST; a fragile target that dies under it has already yielded everything else.
     #    Skipped entirely under passive-only (active_scan=False): read-only recon.
     if tools and policy.active_scan:
+        cookie = _session.ensure("active-scan")   # authed before the whole detection roster
         # nuclei-dast is a subprocess detector too: at WAVSEP scale (~1800 targets) it can't
         # finish at any safe rate and, running FIRST, it blocks everything (the recurring stall).
         # Cap it to a stratified per-category sample like the other active tools when a cap is
@@ -1183,6 +1299,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         _prog.update("roster", findings, urls=len(urls), targets=len(targets))
         # completeness probes only while the target is alive (they replay payloads = more load)
         if not health.halted:
+            cookie = _session.ensure("probes")   # roster is long; re-auth before native probes
             findings += probe_targets(active_targets, cookie, politeness=pol,
                                       fuzz_forms=policy.fuzz_forms)
         _prog.update("probes", findings, urls=len(urls), targets=len(targets))
@@ -1262,6 +1379,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     #    if sqlmap stresses or kills a fragile target the rest of the results still stand.
     #    Health-gated per target: reduced depth under stress, halt on target death.
     if tools and policy.active_scan:
+        cookie = _session.ensure("sqlmap")   # the slowest stage; re-auth so it runs authenticated
         _sql_targets = [t for t in active_targets if t.params]
         if _inject_cap:
             # stratified per-category spread (not the first N of a sorted, LFI-dominated list)
@@ -1336,6 +1454,11 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         # ZAP cross-check: whether the second engine ran, so the corroboration is auditable
         "zap": {"ran": zap_ran, "note": zap_note,
                 "findings": sum(1 for f in uniq if f.tool == "zap")},
+        # session robustness: how many times the scan re-authenticated mid-run (0 = session held;
+        # >0 = the keeper caught + recovered a session loss that would otherwise have silently
+        # zeroed the scan). Surfaced so session health is auditable, never a silent degradation.
+        "session": {"keeper": _session.enabled, "reauths": _session.reauths,
+                    "authed_at_end": _session.alive() if _session.enabled else None},
     }
 
 
