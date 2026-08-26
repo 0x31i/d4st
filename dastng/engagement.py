@@ -24,7 +24,7 @@ import time
 from collections import Counter as _Counter
 import tempfile
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 
 def _bootstrap_tool_path() -> None:
@@ -115,6 +115,74 @@ def blind_crawl(target: str, cookie: str, depth: int = 3, duration: str = "3m",
         out = _run(args, timeout=1800)           # generous budget (headless is slow)
         urls |= {ln.strip() for ln in out.splitlines() if ln.strip().startswith("http")}
     return sorted(urls)
+
+
+_OPENAPI_PATHS = (
+    "openapi.json", "swagger.json", "api-docs", "v2/api-docs", "v3/api-docs",
+    "swagger/v1/swagger.json", "api/swagger.json", "api/openapi.json", "api/v1/openapi.json",
+    "openapi.yaml", "swagger.yaml", "api-docs/swagger.json", "docs/openapi.json",
+    "swagger-ui/swagger.json", "api/swagger/index.html", "openapi", "swagger",
+)
+_GRAPHQL_PATHS = ("graphql", "api/graphql", "v1/graphql", "graphql/v1", "query", "gql",
+                  "api/gql", "graphql/console", "index.php?graphql")
+_JWT_RE = re.compile(r'eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}')
+
+
+def discover_api_surface(target: str, urls: list[str], cookie: str) -> dict:
+    """Find the API surface the API adapters need but nothing else populates: an OpenAPI/Swagger
+    schema (schemathesis), a GraphQL endpoint (graphw00f), and a JWT (jwt_tool). Without this the
+    API roster ALWAYS no-ops 'not applicable', however API-heavy the app is — the reason those
+    tools never fired on any benchmark. Cheap read-only probing of conventional paths + the
+    crawled frontier; returns only what actually responds like an API. Runs on every app (a
+    hybrid MPA+API still gets API testing), keyed off real surface, not just the fingerprint."""
+    import httpx
+    root = f"{urlsplit(target).scheme}://{urlsplit(target).netloc}/"
+    hdr = {"Cookie": cookie} if cookie else {}
+    surface: dict = {}
+
+    # (1) OpenAPI/Swagger schema: conventional paths + any spec-looking crawled URL.
+    cand = [urljoin(root, p) for p in _OPENAPI_PATHS]
+    cand += [u for u in urls if re.search(r'(openapi|swagger|api-docs)', u, re.I)]
+    seen = set()
+    for u in cand:
+        if u in seen:
+            continue
+        seen.add(u)
+        try:
+            r = httpx.get(u, headers=hdr, timeout=8, follow_redirects=True)
+        except Exception:  # noqa: BLE001,S112
+            continue
+        head = r.text[:4000] if r.status_code == 200 else ""
+        if r.status_code == 200 and ('"openapi"' in head or '"swagger"' in head
+                                     or ('"paths"' in head and '{' in head)):
+            surface["openapi_schema"] = str(r.url)
+            break
+
+    # (2) GraphQL endpoint: a minimal query that only a GraphQL server answers coherently.
+    for p in _GRAPHQL_PATHS:
+        u = urljoin(root, p)
+        try:
+            r = httpx.post(u, headers={**hdr, "Content-Type": "application/json"},
+                           json={"query": "{__typename}"}, timeout=8)
+        except Exception:  # noqa: BLE001,S112
+            continue
+        low = r.text.lower()
+        if r.status_code < 500 and ("__typename" in r.text or '"data"' in low
+                                    or "graphql" in low or '"errors"' in low):
+            surface["graphql_endpoint"] = u
+            break
+
+    # (3) JWT: from the session cookie we hold, an operator-supplied env token, or a crawled URL.
+    jwt = None
+    for hay in (cookie or "", " ".join(urls[:200])):
+        m = _JWT_RE.search(hay)
+        if m:
+            jwt = m.group(0)
+            break
+    jwt = jwt or os.environ.get("DASTNG_JWT")
+    if jwt:
+        surface["jwt"] = jwt
+    return surface
 
 
 def discover_targets(urls: list[str], cookie: str, host: str) -> list[Target]:
@@ -1019,7 +1087,8 @@ def _stratified_sample(urls: list[str], cap: int) -> list[str]:
 
 def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
                js_dir: str = "", level_override: int | None = None, health=None,
-               per_url_cap: int = 0, progress=None, base_findings=None) -> list[Finding]:
+               per_url_cap: int = 0, progress=None, base_findings=None,
+               api_surface: dict | None = None) -> list[Finding]:
     """Run the full detection roster over the SAFE, converged frontier and normalize each
     adapter's findings to Finding. Tools whose surface is absent (GraphQL/OpenAPI/JWT/JS)
     cleanly no-op. Every tool is isolated so one failure never sinks the scan.
@@ -1051,6 +1120,11 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
             # IP for a self-hosted OastServer, or a public interactsh host). Without it, rfi_oast
             # falls back to in-band reflection only. Set via DASTNG_OAST_HOST_IP.
             "oast_host_ip": os.environ.get("DASTNG_OAST_HOST_IP", "")}
+    # Feed the discovered API surface to the API adapters (schemathesis/jwt_tool/graphw00f) — the
+    # inputs they need but nothing else populates, which is why they always no-opped. Only present
+    # keys are set, so a classic app still cleanly reports "not applicable".
+    if api_surface:
+        opts.update({k: v for k, v in api_surface.items() if v})
     # Three frontier tiers under a cap:
     #  - per-URL subprocess tools (sqlmap/ghauri/commix/lfi_fuzz): small stratified sample.
     #  - dalfox: runs ONE subprocess per endpoint-GROUP, so on an app with many unique paths
@@ -1391,6 +1465,16 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     #    Skipped entirely under passive-only (active_scan=False): read-only recon.
     if tools and policy.active_scan:
         cookie = _session.ensure("active-scan")   # authed before the whole detection roster
+        # API-surface discovery (adaptive): find the OpenAPI schema / GraphQL endpoint / JWT the
+        # API adapters need but nothing else populates — the reason schemathesis/jwt_tool/graphw00f
+        # never fired. Runs on every app; a classic app simply yields nothing and they no-op.
+        _api = discover_api_surface(target, urls, cookie)
+        if _api:
+            print(f"[api-surface] {', '.join(f'{k}={str(v)[:60]}' for k, v in _api.items())}",
+                  flush=True)
+        elif _atk.api_mode:
+            print("[api-surface] app fingerprinted as API but no schema/endpoint/JWT found",
+                  flush=True)
         # nuclei-dast is a subprocess detector too: at WAVSEP scale (~1800 targets) it can't
         # finish at any safe rate and, running FIRST, it blocks everything (the recurring stall).
         # Cap it to a stratified per-category sample like the other active tools when a cap is
@@ -1414,7 +1498,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                                    js_dir=os.environ.get("DASTNG_JS_DIR", ""),
                                    level_override=health.sqlmap_level(policy.sqlmap_level),
                                    health=health, per_url_cap=_inject_cap, progress=_prog,
-                                   base_findings=list(findings))
+                                   base_findings=list(findings), api_surface=_api)
         _prog.update("roster", findings, urls=len(urls), targets=len(targets))
         # completeness probes only while the target is alive (they replay payloads = more load)
         if not health.halted:
