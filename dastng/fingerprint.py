@@ -105,6 +105,53 @@ class AppProfile:
                 f"{tech} links={self.seed_link_count}{seeds}")
 
 
+@dataclass
+class AttackProfile:
+    """Fingerprint -> PROBE strategy. Derived from an AppProfile, consumed by the engagement to
+    ADD app-appropriate deep techniques on top of the full baseline roster (never to remove
+    coverage — thoroughness only goes up). This is the object that lets the scanner 'detect the
+    type of web app and adjust how it probes'.
+
+    - is_php/java/aspnet/node: stack-specific payload emphasis (php:// wrappers, EL/OGNL, web.config).
+    - dom_xss: run the DOM source->sink check (cheap + high-value; on for every app).
+    - api_mode: emphasise the API/GraphQL/JWT tools (schemathesis/jwt_tool/graphw00f) that are
+      pointless on a form app but essential on a JSON/OpenAPI backend.
+    """
+    app_type: str = 'unknown'
+    tech: list[str] = field(default_factory=list)
+    is_php: bool = False
+    is_java: bool = False
+    is_aspnet: bool = False
+    is_node: bool = False
+    dom_xss: bool = True
+    api_mode: bool = False
+
+    def summary(self) -> str:
+        stacks = [n for n, on in (('php', self.is_php), ('java', self.is_java),
+                                  ('aspnet', self.is_aspnet), ('node', self.is_node)) if on]
+        extras = [n for n, on in (('dom-xss', self.dom_xss), ('api-tools', self.api_mode)) if on]
+        return (f"attack-profile: stack={'/'.join(stacks) or 'generic'} "
+                f"emphasis={'+'.join(extras) or 'baseline'}")
+
+
+def build_attack_profile(appprof: 'AppProfile | None') -> AttackProfile:
+    """Map a crawl-time AppProfile into a probe-time AttackProfile. Fail-safe: a missing profile
+    yields a generic profile that still runs the full baseline (DOM-XSS on, no API emphasis)."""
+    if appprof is None:
+        return AttackProfile()
+    tech = ' '.join(appprof.tech).lower()
+    return AttackProfile(
+        app_type=appprof.app_type,
+        tech=list(appprof.tech),
+        is_php='php' in tech or 'laravel' in tech or 'codeigniter' in tech,
+        is_java='java' in tech or 'jsp' in tech or 'servlet' in tech,
+        is_aspnet='asp' in tech or 'iis' in tech,
+        is_node='node' in tech or 'express' in tech,
+        dom_xss=True,   # the DOM source->sink check is cheap and catches what nothing else does
+        api_mode=(appprof.app_type == 'api'),
+    )
+
+
 def _get(url: str, cookie: str, timeout: int = 12):
     if requests is None:
         return None
@@ -212,10 +259,21 @@ def fingerprint_target(target: str, host: str, cookie: str = '') -> AppProfile:
             val = next(v for k, v in r.headers.items() if k.lower() == h)
             if val:
                 prof.tech.append(fn(val))
-    # tech from cookies
+    # tech from cookies — response Set-Cookie AND the session cookie WE ALREADY HOLD. An
+    # authenticated scan does not get a fresh Set-Cookie (the session already exists), so keying
+    # only off the response misses the stack; the cookie we send (PHPSESSID/JSESSIONID/...) names
+    # it just as reliably.
     for ck, label in _COOKIE_TECH.items():
-        if ck in r.cookies or re.search(rf'\b{re.escape(ck)}\b', r.headers.get('set-cookie', '')):
+        if (ck in r.cookies or re.search(rf'\b{re.escape(ck)}\b', r.headers.get('set-cookie', ''))
+                or re.search(rf'\b{re.escape(ck)}\b', cookie or '')):
             prof.tech.append(label)
+    # tech from server-rendered link extensions (.php/.jsp/.aspx in the body) — the stack a page
+    # tree advertises even when headers/cookies are stripped.
+    _ext_tech = {'php': 'PHP', 'jsp': 'Java/JSP (servlet container)', 'jspx': 'Java/JSP',
+                 'aspx': 'ASP.NET', 'asp': 'Classic ASP', 'cfm': 'ColdFusion',
+                 'do': 'Java (Struts)', 'action': 'Java (Struts)'}
+    for _m in re.findall(r'\.(php|jsp|jspx|aspx?|cfm|do|action)\b', body, re.I):
+        prof.tech.append(_ext_tech.get(_m.lower(), _m))
 
     n_links, _ = _count_anchors(body, target, want_host)
     prof.seed_link_count = n_links
