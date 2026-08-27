@@ -299,6 +299,16 @@ details.raw pre{margin:0;padding:0 13px 13px;font-size:11px;line-height:1.5;colo
   display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px}
 .toolrow{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .toolrow .t{font-size:10.5px;color:var(--ink2);border:1px solid var(--line);border-radius:4px;padding:2px 8px}
+.chainrow{display:flex;flex-wrap:wrap;gap:8px}
+.eng{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:8px;
+  padding:8px 12px;background:var(--panel);font-size:12px;color:var(--ink)}
+.eng .d{width:9px;height:9px;border-radius:50%;flex:none}
+.eng.ok .d{background:var(--green);box-shadow:0 0 7px #7fd96288}.eng.ok{color:var(--ink)}
+.eng.bad .d{background:var(--crit);box-shadow:0 0 8px #ff537099}
+.eng.bad{color:var(--crit);border-color:#ff537066;background:#ff53700f}
+.eng .en{color:var(--ink3);font-size:10.5px}
+.warnbar{background:#ff53701a;border:1px solid var(--crit);color:var(--crit);border-radius:9px;
+  padding:11px 15px;margin-bottom:12px;font-size:12.5px;font-weight:600}
 """
 
 _JS = r"""
@@ -439,6 +449,20 @@ def build_report(result: dict, target: str = "", meta: dict | None = None) -> st
     statcards = "".join(f"<div class='stat'><div class='n'>{_esc(v)}</div><div class='k'>{k}</div></div>"
                         for k, v in stats)
 
+    # engine health: every scan engine + whether it fired (a non-firing engine is an alarm)
+    chain = result.get("chain") or []
+    warnings = result.get("warnings") or []
+    chainrow = "".join(
+        f"<span class='eng {'ok' if c.get('ran') else 'bad'}'>"
+        f"<span class='d'></span>{_esc(c.get('engine'))}<span class='en'>{_esc(c.get('note'))}</span></span>"
+        for c in chain)
+    warnbar = ""
+    if warnings:
+        warnbar = ("<div class='warnbar'>⚠ ENGINES THAT DID NOT FIRE — this scan is INCOMPLETE: "
+                   + _esc(" · ".join(warnings)) + "</div>")
+    chain_html = ("<div class='sec'>engine health<span class='rule'></span></div>"
+                  + warnbar + f"<div class='chainrow'>{chainrow}</div>") if chain else ""
+
     findings_html = "".join(_render_finding(f, i) for i, f in enumerate(findings)) or \
         "<div class='lead'>No findings — clean scan for the classes tested.</div>"
 
@@ -478,6 +502,7 @@ def build_report(result: dict, target: str = "", meta: dict | None = None) -> st
   <div class="sec">scan coverage<span class="rule"></span></div>
   <div class="stats">{statcards}</div>
   <div class="toolrow">{toolrow}</div>
+  {chain_html}
 
   <div class="sec">findings · {len(findings)}<span class="rule"></span></div>
   {findings_html}
