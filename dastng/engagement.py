@@ -2312,22 +2312,31 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                    for t in getattr(_prog, "timeline", [])}
     _bt = _Counter(f.tool for f in uniq)
     _active = bool(tools and policy.active_scan)
+
+    def _fired(stage: str, tool: str = "") -> bool:
+        # an engine ran if its stage is in the timeline OR it produced findings (findings are
+        # irrefutable proof it executed — robust even without a progress file).
+        return stage in _stages_ran or bool(tool and _bt.get(tool, 0) > 0)
+
+    # (engine, did-it-run, note, expected?) — `expected` gates whether NOT running is an ALARM.
+    # Active-scan engines are expected only when active scanning is on; ZAP only when enabled.
     _engine_spec = [
-        ("fingerprint", appprof is not None, appprof.summary() if appprof else "FAILED to fingerprint"),
-        ("crawl+discovery", len(urls) > 0, f"{len(urls)} urls, {len(targets)} targets"),
-        ("nuclei-dast", (not _active) or "nuclei-dast" in _stages_ran, f"{_bt.get('nuclei', 0)} findings"),
-        ("roster", (not _active) or "roster" in _stages_ran, f"{sum(_bt.get(t, 0) for t in _MEGA_ROSTER)} findings"),
-        ("native-probes", (not _active) or "probes" in _stages_ran, f"{_bt.get('verify', 0)} findings"),
-        ("passive", "passive" in _stages_ran, f"{_bt.get('passive', 0)} findings"),
-        ("pii", "pii" in _stages_ran, f"{_bt.get('pii', 0)} findings"),
-        ("sqlmap", (not _active) or "sqlmap" in _stages_ran, "ran"),
-        ("zap", zap_ran, zap_note),
+        ("fingerprint", appprof is not None, appprof.summary() if appprof else "FAILED", True),
+        ("crawl+discovery", len(urls) > 0, f"{len(urls)} urls, {len(targets)} targets", True),
+        ("nuclei-dast", _fired("nuclei-dast", "nuclei"), f"{_bt.get('nuclei', 0)} findings", _active),
+        ("roster", _fired("roster") or any(_bt.get(t, 0) for t in _MEGA_ROSTER),
+         f"{sum(_bt.get(t, 0) for t in _MEGA_ROSTER)} findings", _active),
+        ("native-probes", _fired("probes", "verify"), f"{_bt.get('verify', 0)} findings", _active),
+        ("passive", _fired("passive", "passive"), f"{_bt.get('passive', 0)} findings", True),
+        ("pii", _fired("pii", "pii"), f"{_bt.get('pii', 0)} findings", True),
+        ("sqlmap", _fired("sqlmap"), "ran", _active),
+        ("zap", zap_ran, zap_note, bool(zap and _active)),
     ]
     chain = []
     warnings = []
-    for name, ran, note in _engine_spec:
-        chain.append({"engine": name, "ran": bool(ran), "note": note})
-        if not ran:
+    for name, ran, note, expected in _engine_spec:
+        chain.append({"engine": name, "ran": bool(ran), "note": note, "expected": bool(expected)})
+        if expected and not ran:      # only alarm on an engine that SHOULD have fired but did not
             warnings.append(f"{name}: {note}")
     if warnings:
         print("[chain] ⚠ ENGINES THAT DID NOT FIRE: " + " | ".join(warnings), flush=True)
