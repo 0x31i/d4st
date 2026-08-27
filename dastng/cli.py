@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import click
 from rich.console import Console
@@ -362,12 +363,36 @@ def update(status: bool, components: tuple) -> None:
 
 
 @main.command()
+@click.argument("result_json")
+@click.option("--out", "-o", default="dastng_report.html", help="Output HTML report path.")
+@click.option("--target", "-t", default="", help="Target label for the report header.")
+@click.option("--open", "open_it", is_flag=True, default=False, help="Open the report after writing.")
+def report(result_json: str, out: str, target: str, open_it: bool) -> None:
+    """Render a scan result JSON into a gorgeous self-contained HTML report (with request/response
+    proof, reasoning, and remediation per finding)."""
+    import json as _json
+
+    from .report import build_report
+    with open(result_json) as fh:
+        result = _json.load(fh)
+    html = build_report(result, target=target)
+    with open(out, "w") as fh:
+        fh.write(html)
+    n = len(result.get("findings", []))
+    console.print(f"[green]report[/green] -> {out}  ({n} findings)")
+    if open_it:
+        import webbrowser
+        webbrowser.open(f"file://{os.path.abspath(out)}")
+
+
+@main.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8810, type=int)
-def serve(host: str, port: int) -> None:
-    """Start the REST API (Phase 6). Placeholder until the backend lands."""
-    console.print("[yellow]serve[/yellow]: REST API arrives in Phase 6 (own backend + UI).")
-    console.print(f"would bind {host}:{port}")
+@click.option("--scans-dir", default="", help="Directory of scan result JSON files to serve.")
+def serve(host: str, port: int, scans_dir: str) -> None:
+    """Start the dast-ng web console (findings dashboard + report viewer)."""
+    from .server import run_server
+    run_server(host=host, port=port, scans_dir=scans_dir or None)
 
 
 if __name__ == "__main__":
