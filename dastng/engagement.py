@@ -74,10 +74,14 @@ class Finding:
     evidence: str = ""
     verified: bool | None = None       # None=unverified, True=confirmed, False=refuted
     verify_note: str = ""
-    # Full proof: the HTTP request/response exchange(s) that triggered the finding, so a report
-    # can show the actual attack + the server's telling response (like Burp's request/response
-    # panes). Each entry: {request:{method,url,headers,body}, response:{status,headers,body}}.
+    # Full proof: the labeled HTTP request/response exchange(s) that triggered the finding (with
+    # timing + size), so a report shows the actual attack + the server's telling response.
     evidence_log: list = field(default_factory=list)
+    payload: str = ""              # the exact payload that triggered it
+    detection: str = ""            # detection method (error-based / time-based / reflection / oast…)
+    confidence: str = ""           # confirmed | firm | tentative
+    raw_output: str = ""           # subprocess tool's raw output (sqlmap/nuclei/dalfox/jwt_tool…)
+    repro: str = ""                # a curl command that reproduces the finding
 
 
 def _run(args: list[str], timeout: int, stdin: str | None = None) -> str:
@@ -771,18 +775,26 @@ def _base_headers(cookie: str) -> dict:
 # Burp-style. Thread-local (the probe stage is concurrent). A worker calls _evid_start() before a
 # check, _req/verify record into the buffer, and _evid_take() snapshots + clears it.
 _EVID = threading.local()
-_EVID_MAX_BODY = 4000        # cap stored bodies so a report/JSON stays reasonable
+_EVID_MAX_BODY = 24000       # generous — a report needs the real response, not a 4k stub
+_EVID_MAX_EXCH = 40          # keep the whole detection sequence, not just the last hit
 
 
-def _evid_start() -> None:
+def _evid_start(label: str = "") -> None:
     _EVID.buf = []
     _EVID.on = True
+    _EVID.label = label
+
+
+def _evid_label(label: str) -> None:
+    """Label the NEXT recorded exchange (e.g. 'baseline', 'sleep(5) payload')."""
+    _EVID.label = label
 
 
 def _evid_take() -> list:
     buf = getattr(_EVID, "buf", None) or []
     _EVID.buf = []
     _EVID.on = False
+    _EVID.label = ""
     return list(buf)
 
 
@@ -791,30 +803,88 @@ def _redact_headers(h: dict) -> dict:
     for k, v in (h or {}).items():
         if k.lower() in ("authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"):
             sv = str(v)
-            out[k] = (sv[:16] + "…[redacted]") if len(sv) > 16 else "[redacted]"
+            out[k] = (sv[:22] + "…[redacted]") if len(sv) > 22 else "[redacted]"
         else:
             out[k] = str(v)
     return out
 
 
-def _rec(method: str, url: str, req_headers: dict, req_body, resp) -> None:
-    """Record one request/response exchange into the active evidence buffer (if recording)."""
+def _rec(method: str, url: str, req_headers: dict, req_body, resp, label: str = "") -> None:
+    """Record one request/response exchange (with timing + size) into the active evidence buffer."""
     if not getattr(_EVID, "on", False):
         return
     try:
+        body = getattr(resp, "text", "") or ""
+        elapsed = None
+        try:
+            elapsed = round(getattr(resp, "elapsed").total_seconds() * 1000)
+        except Exception:  # noqa: BLE001
+            elapsed = None
         rec = {
+            "label": label or getattr(_EVID, "label", "") or "",
             "request": {"method": method, "url": url,
                         "headers": _redact_headers(req_headers),
                         "body": (str(req_body)[:_EVID_MAX_BODY] if req_body else "")},
             "response": {"status": getattr(resp, "status_code", None),
                          "headers": _redact_headers(dict(getattr(resp, "headers", {}) or {})),
-                         "body": (getattr(resp, "text", "") or "")[:_EVID_MAX_BODY]},
+                         "elapsed_ms": elapsed, "size": len(body),
+                         "body": body[:_EVID_MAX_BODY],
+                         "truncated": len(body) > _EVID_MAX_BODY},
         }
         _EVID.buf.append(rec)
-        if len(_EVID.buf) > 12:          # keep only the most recent dozen exchanges
-            _EVID.buf = _EVID.buf[-12:]
+        _EVID.label = ""      # label applies to a single exchange
+        if len(_EVID.buf) > _EVID_MAX_EXCH:
+            _EVID.buf = _EVID.buf[-_EVID_MAX_EXCH:]
     except Exception:  # noqa: BLE001,S110 - recording must never break a probe
         pass
+
+
+def _curl_repro(ex: dict) -> str:
+    """A copy-pasteable curl command that reproduces the exchange (headers redacted)."""
+    req = ex.get("request", {})
+    parts = ["curl -i"]
+    if req.get("method", "GET") != "GET":
+        parts.append(f"-X {req['method']}")
+    for k, v in (req.get("headers") or {}).items():
+        if "redacted" in str(v).lower():
+            v = "<redacted>"
+        parts.append(f"-H {_shq(f'{k}: {v}')}")
+    if req.get("body"):
+        parts.append(f"--data {_shq(str(req['body'])[:2000])}")
+    parts.append(_shq(req.get("url", "")))
+    return " ".join(parts)
+
+
+def _shq(s: str) -> str:
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def _derive_meta(note: str, ev: list) -> tuple[str, str, str, str]:
+    """Derive (detection_method, confidence, payload, curl_repro) from the note + exchanges so the
+    report can badge HOW it was found and show the exact attack."""
+    low = (note or "").lower()
+    det = (
+        "time-based blind" if "time-based" in low or "sleep" in low else
+        "error-based" if "error signature" in low or "sql error" in low or "sql syntax" in low else
+        "boolean-based" if "boolean" in low else
+        "reflection" if "reflect" in low else
+        "out-of-band (OAST)" if "oast" in low or "callback" in low else
+        "read-back / persistence" if "read back" in low or "persisted" in low or "stuck" in low else
+        "source→sink flow" if "source" in low and "sink" in low else
+        "cross-object access" if "another object" in low or "idor" in low else
+        "content signature")
+    conf = (
+        "tentative" if "suspect" in low or "context-dependent" in low else
+        "confirmed" if any(k in low for k in ("confirmed", "cracked", "read /etc/passwd", "uid=",
+                                              "returned 20", "returned 2", "persisted", "win.ini",
+                                              "5s=", "base64 filter")) else
+        "firm")
+    payload, repro = "", ""
+    if ev:
+        rq = ev[-1].get("request", {})
+        payload = (rq.get("body") or rq.get("url") or "")[:400]
+        repro = _curl_repro(ev[-1])
+    return det, conf, payload, repro
 
 
 # Per-target injection shape, set by the probe worker before calling the verify_* checks (which
@@ -1370,9 +1440,11 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
             return found, None
 
         def _emit(cat, param, note, ev):
+            det, conf, payload, repro = _derive_meta(note, ev)
             found.append(Finding(tool="verify", category=cat, url=t.url, param=param,
                                  method=t.method, evidence=note, verified=True,
-                                 evidence_log=ev))
+                                 evidence_log=ev, detection=det, confidence=conf,
+                                 payload=payload, repro=repro))
 
         csrf_hit = None
         try:
@@ -1582,12 +1654,44 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
         except Exception:  # noqa: BLE001,S112 - one tool must never sink the mega scan
             continue
         cat = _ROSTER_CAT.get(name)
+        tool_raw = ""
+        if res.raw is not None:
+            try:
+                tool_raw = (res.raw if isinstance(res.raw, str)
+                            else json.dumps(res.raw, indent=1, default=str))[:12000]
+            except Exception:  # noqa: BLE001
+                tool_raw = str(res.raw)[:12000]
         for f in (res.findings or []):
             fcat = cat or f.get("category") or f.get("type") or f.get("name") or name
             url = f.get("url") or f.get("matched-at") or f.get("data") or target
-            ev = f.get("evidence") or f.get("name") or f.get("message_str") or ""
-            out.append(Finding(tool=name, category=fcat, url=str(url).split("?")[0],
-                               param=f.get("param"), evidence=str(ev)[:160]))
+            ev = (f.get("evidence") or f.get("name") or f.get("info", {}).get("name") if isinstance(f.get("info"), dict)
+                  else f.get("evidence") or f.get("name") or f.get("message_str") or "")
+            # Capture the tool's OWN request/response (nuclei -irr, dalfox PoC, etc.) as proof.
+            req, resp = f.get("request"), f.get("response")
+            ev_log = []
+            if req or resp:
+                ev_log = [{
+                    "label": f.get("template-id") or f.get("matcher-name") or f.get("template") or name,
+                    "request": {"method": f.get("method", "GET"), "url": str(f.get("matched-at") or url),
+                                "headers": {}, "body": str(req or "")[:_EVID_MAX_BODY]},
+                    "response": {"status": f.get("status"), "headers": {},
+                                 "elapsed_ms": None, "size": len(str(resp or "")),
+                                 "body": str(resp or "")[:_EVID_MAX_BODY]},
+                }]
+            # Per-finding raw detail: the tool's own JSON for this hit (matcher, extracted, cvss…).
+            try:
+                fraw = json.dumps(f, indent=1, default=str)[:9000]
+            except Exception:  # noqa: BLE001
+                fraw = str(f)[:9000]
+            extracted = f.get("extracted-results") or f.get("extracted") or ""
+            det = f.get("matcher-name") or f.get("type") or (f.get("info", {}) or {}).get("severity") \
+                if isinstance(f.get("info"), dict) else (f.get("matcher-name") or f.get("type") or "tool-detection")
+            out.append(Finding(
+                tool=name, category=fcat, url=str(url).split("?")[0], param=f.get("param"),
+                evidence=str(ev)[:400], evidence_log=ev_log,
+                raw_output=(fraw or tool_raw), repro=str(f.get("curl-command") or "")[:1200],
+                payload=str(f.get("payload") or f.get("curl-command") or extracted or "")[:400],
+                detection=str(det or "tool-detection"), confidence="firm", verified=True))
         # checkpoint after each roster tool so a kill mid-roster still shows tool-by-tool
         # progress AND flushes cumulative findings to disk (base + roster-so-far).
         if progress is not None:
@@ -2103,13 +2207,26 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 zap_note = f"error: {exc}"
     _prog.update("zap", findings, urls=len(urls), targets=len(targets), note=zap_note)
 
-    # dedup by (category, path, param)
-    seen: set = set(); uniq: list[Finding] = []
+    # dedup by (category, path, param) — but merge evidence so a richer duplicate wins its proof.
+    seen: dict = {}; uniq: list[Finding] = []
     for f in findings:
         k = (f.category, urlsplit(f.url).path, f.param)
         if k in seen:
+            kept = seen[k]
+            if not kept.evidence_log and f.evidence_log:   # keep whichever carries real proof
+                kept.evidence_log, kept.raw_output = f.evidence_log, (kept.raw_output or f.raw_output)
+                kept.payload, kept.repro = (kept.payload or f.payload), (kept.repro or f.repro)
             continue
-        seen.add(k); uniq.append(f)
+        seen[k] = f; uniq.append(f)
+    # Uniform enrichment: every finding gets a detection method / confidence / payload / repro so
+    # the report is deep even for tool findings that arrived thin. Derived from note + exchanges.
+    for f in uniq:
+        if not f.detection or not f.confidence or not f.repro:
+            d, c, p, r = _derive_meta(f.evidence or f.verify_note, f.evidence_log)
+            f.detection = f.detection or d
+            f.confidence = f.confidence or c
+            f.payload = f.payload or p
+            f.repro = f.repro or r
     return {
         "urls": urls, "targets": len(targets),
         "findings": [f.__dict__ for f in uniq],

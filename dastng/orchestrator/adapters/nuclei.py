@@ -26,7 +26,9 @@ class NucleiAdapter(ToolAdapter):
 
     def run(self, ctx: RunContext) -> AdapterResult:
         targets = ctx.seed_urls or [ctx.target]
-        args = ["nuclei", "-jsonl", "-silent"]
+        # -irr includes the full request/response in each JSON finding so the report can show the
+        # actual HTTP proof (not just a one-line template name). This is the evidence-depth lever.
+        args = ["nuclei", "-jsonl", "-silent", "-irr"]
         args += _session_header_args(ctx.session, ctx.target)
 
         # -dast turns on the fuzzing engine (the OSS answer to Burp active scan). Enabled by

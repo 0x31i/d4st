@@ -274,6 +274,27 @@ a{color:var(--cyan);text-decoration:none}
 .pane .st4,.pane .st5{color:var(--crit)}
 .exchsep{font-size:10px;color:var(--ink3);margin:12px 0 4px;letter-spacing:.1em}
 
+/* detection/confidence badges + payload/raw/repro blocks */
+.badge{font-size:9.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;
+  border-radius:5px;margin-left:7px;vertical-align:middle;border:1px solid var(--line)}
+.badge.det{color:var(--cyan);background:#59c2ff14}
+.badge.conf-confirmed{color:var(--green);background:#7fd96214;border-color:#7fd96255}
+.badge.conf-firm{color:var(--amber);background:#ffb45414;border-color:#ffb45455}
+.badge.conf-tentative{color:var(--ink2);background:#6b7c8f14}
+pre.payload{margin:0;padding:11px 13px;background:#160f0a;border:1px solid #3a2a12;border-radius:8px;
+  color:var(--amber);font-size:12px;white-space:pre-wrap;word-break:break-all;overflow:auto}
+pre.repro{margin:0;padding:11px 13px;background:#0a1014;border:1px solid #16323f;border-radius:8px;
+  color:var(--cyan);font-size:11.5px;white-space:pre-wrap;word-break:break-all;overflow:auto;user-select:all}
+details.raw{border:1px solid var(--line);border-radius:8px;background:var(--bg2);overflow:hidden}
+details.raw summary{cursor:pointer;padding:9px 13px;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--ink3);list-style:none;user-select:none}
+details.raw summary::-webkit-details-marker{display:none}
+details.raw summary::before{content:"▸ ";color:var(--amber)}
+details.raw[open] summary::before{content:"▾ "}
+details.raw pre{margin:0;padding:0 13px 13px;font-size:11px;line-height:1.5;color:var(--ink2);
+  white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto}
+.exlabel{font-size:11px;color:var(--amber);margin:10px 0 5px;font-weight:600}
+.pane .mt{color:var(--ink3);font-size:10px;letter-spacing:.06em}
 .foot{margin-top:44px;padding-top:16px;border-top:1px solid var(--line);color:var(--ink3);font-size:11.5px;
   display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px}
 .toolrow{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
@@ -304,9 +325,18 @@ def _render_exchange(ex: dict) -> str:
         reqtxt += "\n\n" + _esc(req["body"])
     st = resp.get("status")
     stcls = f"st{str(st)[0]}" if st else "st2"
-    resptxt = (f"<span class='{stcls}'>HTTP {_esc(st)}</span>\n"
-               + _esc(_fmt_headers(resp.get("headers"))) + "\n\n" + _esc(resp.get("body", "")))
-    return (f"<div class='proof'>"
+    meta = []
+    if resp.get("elapsed_ms") is not None:
+        meta.append(f"{resp['elapsed_ms']} ms")
+    if resp.get("size") is not None:
+        meta.append(f"{resp['size']} B")
+    metatxt = " · ".join(meta)
+    trunc = "\n\n[response truncated]" if resp.get("truncated") else ""
+    resptxt = (f"<span class='{stcls}'>HTTP {_esc(st)}</span>  <span class='mt'>{_esc(metatxt)}</span>\n"
+               + _esc(_fmt_headers(resp.get("headers"))) + "\n\n" + _esc(resp.get("body", "")) + trunc)
+    label = ex.get("label")
+    lblhtml = f"<div class='exlabel'>▸ {_esc(label)}</div>" if label else ""
+    return (lblhtml + "<div class='proof'>"
             f"<div class='pane'><div class='lbl'>Request<span>attack</span></div><pre>{reqtxt}</pre></div>"
             f"<div class='pane'><div class='lbl'>Response<span>evidence</span></div><pre>{resptxt}</pre></div>"
             f"</div>")
@@ -323,47 +353,62 @@ def _render_finding(f: dict, idx: int) -> str:
     tool = f.get("tool", "")
     exlog = f.get("evidence_log") or []
 
+    detection = f.get("detection", "")
+    confidence = f.get("confidence", "")
+    payload = f.get("payload", "")
+    raw = f.get("raw_output", "")
+    repro = f.get("repro", "")
+
     tags = [f"<span class='tag'>{_esc(meta['cwe'])}</span>",
             f"<span class='tag'>{_esc(meta['owasp'])}</span>",
             f"<span class='tag'>tool:{_esc(tool)}</span>"]
     if param:
         tags.insert(0, f"<span class='tag'>param:{_esc(param)}</span>")
+    badges = ""
+    if detection:
+        badges += f"<span class='badge det'>{_esc(detection)}</span>"
+    if confidence:
+        badges += f"<span class='badge conf-{_esc(confidence)}'>{_esc(confidence)}</span>"
 
-    proof = ""
+    blocks = [f"<div class='block'><div class='h'>Description</div><div class='desc'>{_esc(meta['desc'])}</div></div>"]
+    if reason:
+        blocks.append("<div class='block'><div class='h'>Reasoning — why this is a finding</div>"
+                      f"<div class='reason'>{_esc(reason)}</div></div>")
+    if payload:
+        blocks.append("<div class='block'><div class='h'>Payload</div>"
+                      f"<pre class='payload'>{_esc(payload)}</pre></div>")
     if exlog:
         parts = []
-        for i, ex in enumerate(exlog[-3:]):    # show up to the last 3 exchanges
+        for i, ex in enumerate(exlog):          # show the FULL attack sequence, not a sample
             if len(exlog) > 1:
-                parts.append(f"<div class='exchsep'>— exchange {i + 1} —</div>")
+                parts.append(f"<div class='exchsep'>exchange {i + 1} / {len(exlog)}</div>")
             parts.append(_render_exchange(ex))
-        proof = ("<div class='block'><div class='h'>Proof — request / response</div>"
-                 + "".join(parts) + "</div>")
-    else:
-        proof = ("<div class='block'><div class='h'>Evidence</div>"
-                 f"<div class='reason'>{_esc(reason) or 'reported by ' + _esc(tool)}</div></div>")
-
-    reasoning_block = ""
-    if exlog and reason:
-        reasoning_block = ("<div class='block'><div class='h'>Reasoning — why this is a finding</div>"
-                           f"<div class='reason'>{_esc(reason)}</div></div>")
+        blocks.append("<div class='block'><div class='h'>Proof — request / response "
+                      f"({len(exlog)} exchange{'s' if len(exlog) != 1 else ''})</div>"
+                      + "".join(parts) + "</div>")
+    elif not payload:
+        blocks.append("<div class='block'><div class='h'>Evidence</div>"
+                      f"<div class='reason'>{_esc(reason) or 'reported by ' + _esc(tool)}</div></div>")
+    if raw and raw.strip() not in ("", "{}", "[]"):
+        blocks.append("<div class='block'><details class='raw'><summary>Raw tool output "
+                      f"({_esc(tool)})</summary><pre>{_esc(raw)}</pre></details></div>")
+    if repro:
+        blocks.append("<div class='block'><div class='h'>Reproduce</div>"
+                      f"<pre class='repro'>{_esc(repro)}</pre></div>")
+    blocks.append(f"<div class='block'><div class='h'>Remediation</div><div class='fix'>{_esc(meta['fix'])}</div></div>")
 
     return f"""
     <div class="find {sev}">
       <div class="fhead">
         <span class="pill {sev}">{_esc(sev)}</span>
         <div class="ftitle">
-          <div class="t">{_esc(meta['title'])}</div>
+          <div class="t">{_esc(meta['title'])} {badges}</div>
           <div class="u"><span class="m">{_esc(method)}</span> {_esc(url)}</div>
           <div class="ftags">{''.join(tags)}</div>
         </div>
         <span class="chev">▸</span>
       </div>
-      <div class="fbody">
-        <div class="block"><div class="h">Description</div><div class="desc">{_esc(meta['desc'])}</div></div>
-        {reasoning_block}
-        {proof}
-        <div class="block"><div class="h">Remediation</div><div class="fix">{_esc(meta['fix'])}</div></div>
-      </div>
+      <div class="fbody">{''.join(blocks)}</div>
     </div>"""
 
 
