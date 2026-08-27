@@ -94,6 +94,20 @@ a{color:var(--cyan);text-decoration:none}
 .pane .lbl{font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;padding:6px 11px;border-bottom:1px solid var(--line);color:var(--ink3);background:#0a0e14;display:flex;justify-content:space-between}
 .pane pre{margin:0;padding:10px 12px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto}
 .rq{color:var(--amber)}.s2{color:var(--green)}.s3{color:var(--cyan)}.s4,.s5{color:var(--crit)}
+.mt{color:var(--ink3);font-size:10px}
+.badge{font-size:9px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:2px 6px;border-radius:5px;margin-left:6px;vertical-align:middle;border:1px solid var(--line)}
+.badge.det{color:var(--cyan);background:#59c2ff14}
+.badge.conf-confirmed{color:var(--green);background:#7fd96214;border-color:#7fd96255}
+.badge.conf-firm{color:var(--amber);background:#ffb45414;border-color:#ffb45455}
+.badge.conf-tentative{color:var(--ink2);background:#6b7c8f14}
+pre.payload{margin:0;padding:10px 12px;background:#160f0a;border:1px solid #3a2a12;border-radius:8px;color:var(--amber);font-size:11.5px;white-space:pre-wrap;word-break:break-all;overflow:auto}
+pre.repro{margin:0;padding:10px 12px;background:#0a1014;border:1px solid #16323f;border-radius:8px;color:var(--cyan);font-size:11px;white-space:pre-wrap;word-break:break-all;overflow:auto;user-select:all}
+details.raw{border:1px solid var(--line);border-radius:8px;background:var(--bg2);overflow:hidden}
+details.raw summary{cursor:pointer;padding:8px 12px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);list-style:none;user-select:none}
+details.raw summary::-webkit-details-marker{display:none}
+details.raw summary::before{content:"▸ ";color:var(--amber)}details.raw[open] summary::before{content:"▾ "}
+details.raw pre{margin:0;padding:0 12px 12px;font-size:11px;color:var(--ink2);white-space:pre-wrap;word-break:break-word;max-height:400px;overflow:auto}
+.exlabel{font-size:11px;color:var(--amber);margin:9px 0 4px;font-weight:600}
 .empty{color:var(--ink3);text-align:center;padding:80px 20px}
 .empty .big{font-size:40px;color:var(--amber2);margin-bottom:10px}
 .exsep{font-size:10px;color:var(--ink3);margin:11px 0 3px}
@@ -160,19 +174,25 @@ function renderFinding(f){
   const el=E('div','find '+f.severity);
   const tags=[`<span class="tag">${esc(f.cwe)}</span>`,`<span class="tag">${esc(f.owasp)}</span>`,`<span class="tag">tool:${esc(f.tool)}</span>`];
   if(f.param)tags.unshift(`<span class="tag">param:${esc(f.param)}</span>`);
+  let badges='';
+  if(f.detection)badges+=`<span class="badge det">${esc(f.detection)}</span>`;
+  if(f.confidence)badges+=`<span class="badge conf-${esc(f.confidence)}">${esc(f.confidence)}</span>`;
   const head=E('div','fhead');
   head.innerHTML=`<span class="pill ${f.severity}">${f.severity}</span>
-    <div class="ft"><div class="t">${esc(f.vtitle)}</div>
+    <div class="ft"><div class="t">${esc(f.vtitle)} ${badges}</div>
       <div class="u"><span class="m">${esc(f.method)}</span> ${esc(f.url)}</div>
       <div class="tags">${tags.join('')}</div></div><span class="chev">▸</span>`;
   head.onclick=()=>el.classList.toggle('open');
   const body=E('div','fbody');
   let h=`<div class="blk"><div class="h">Description</div><div>${esc(f.vdesc)}</div></div>`;
   const ev=f.evidence_log||[];
-  if(f.evidence&&ev.length)h+=`<div class="blk"><div class="h">Reasoning</div><div class="reason">${esc(f.evidence)}</div></div>`;
-  if(ev.length){h+=`<div class="blk"><div class="h">Proof — request / response</div>`;
-    ev.slice(-3).forEach((x,i)=>{if(ev.length>1)h+=`<div class="exsep">— exchange ${i+1} —</div>`;h+=proof(x);});h+=`</div>`;}
-  else h+=`<div class="blk"><div class="h">Evidence</div><div class="reason">${esc(f.evidence||('reported by '+f.tool))}</div></div>`;
+  if(f.evidence)h+=`<div class="blk"><div class="h">Reasoning</div><div class="reason">${esc(f.evidence)}</div></div>`;
+  if(f.payload)h+=`<div class="blk"><div class="h">Payload</div><pre class="payload">${esc(f.payload)}</pre></div>`;
+  if(ev.length){h+=`<div class="blk"><div class="h">Proof — request / response (${ev.length})</div>`;
+    ev.forEach((x,i)=>{if(ev.length>1)h+=`<div class="exsep">exchange ${i+1} / ${ev.length}</div>`;h+=proof(x);});h+=`</div>`;}
+  else if(!f.payload)h+=`<div class="blk"><div class="h">Evidence</div><div class="reason">${esc(f.evidence||('reported by '+f.tool))}</div></div>`;
+  if(f.raw_output&&f.raw_output.trim().length>2)h+=`<div class="blk"><details class="raw"><summary>Raw tool output (${esc(f.tool)})</summary><pre>${esc(f.raw_output)}</pre></details></div>`;
+  if(f.repro)h+=`<div class="blk"><div class="h">Reproduce</div><pre class="repro">${esc(f.repro)}</pre></div>`;
   h+=`<div class="blk"><div class="h">Remediation</div><div>${esc(f.vfix)}</div></div>`;
   body.innerHTML=h; el.appendChild(head); el.appendChild(body); return el;
 }
@@ -182,8 +202,10 @@ function proof(x){
   let req=`<span class="rq">${esc(rq.method||'GET')} ${esc(rq.url||'')}</span>\n`+hdr(rq.headers);
   if(rq.body)req+='\n\n'+esc(rq.body);
   const st=rs.status||0, sc='s'+String(st)[0];
-  let resp=`<span class="${sc}">HTTP ${esc(st)}</span>\n`+hdr(rs.headers)+'\n\n'+esc(rs.body||'');
-  return `<div class="proof"><div class="pane"><div class="lbl">Request<span>attack</span></div><pre>${req}</pre></div>
+  const mt=[rs.elapsed_ms!=null?rs.elapsed_ms+' ms':'',rs.size!=null?rs.size+' B':''].filter(Boolean).join(' · ');
+  let resp=`<span class="${sc}">HTTP ${esc(st)}</span>  <span class="mt">${esc(mt)}</span>\n`+hdr(rs.headers)+'\n\n'+esc(rs.body||'')+(rs.truncated?'\n\n[response truncated]':'');
+  const lbl=x.label?`<div class="exlabel">▸ ${esc(x.label)}</div>`:'';
+  return `${lbl}<div class="proof"><div class="pane"><div class="lbl">Request<span>attack</span></div><pre>${req}</pre></div>
     <div class="pane"><div class="lbl">Response<span>evidence</span></div><pre>${resp}</pre></div></div>`;
 }
 loadScans(); setInterval(loadScans, 15000);
