@@ -84,11 +84,55 @@ class Finding:
     repro: str = ""                # a curl command that reproduces the finding
 
 
-def _run_stalled(args: list[str], stall_secs: int = 600, ceiling_secs: int = 10800) -> tuple[str, str]:
-    """Run a subprocess, STREAMING its output, and kill it only when it is genuinely stuck — no
-    output for `stall_secs` — or when it blows past an absolute `ceiling_secs` backstop. A tool
-    that keeps emitting progress (ZAP active-scan %, etc.) is never dropped for merely being slow.
-    Returns (output, reason) where reason is 'completed' | 'stalled …' | 'ceiling …' | 'error …'.
+def _proc_cpu_seconds(pid: int) -> float | None:
+    """Total CPU seconds consumed by a process tree (parent + children). A rising value means the
+    process is actively computing — used to tell 'quietly grinding' from 'genuinely hung'."""
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        t = p.cpu_times()
+        total = t.user + t.system
+        for ch in p.children(recursive=True):
+            try:
+                ct = ch.cpu_times()
+                total += ct.user + ct.system
+            except Exception:  # noqa: BLE001
+                continue
+        return total
+    except Exception:  # noqa: BLE001 - psutil missing or process gone; fall back to ps
+        try:
+            out = subprocess.run(["ps", "-o", "cputime=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+            if not out:
+                return None
+            secs = 0
+            for part in out.replace("-", ":").split(":"):   # [dd-]hh:mm:ss or mm:ss
+                secs = secs * 60 + int(float(part))
+            return float(secs)
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def _container_busy(name: str) -> bool | None:
+    """Is a docker container actively using CPU right now? (For dockerized tools like ZAP, the host
+    'docker run' process is idle even while the container's JVM grinds, so we must ask the
+    container.) Returns True/False, or None if it can't be determined."""
+    try:
+        out = subprocess.run(["docker", "stats", "--no-stream", "--format", "{{.CPUPerc}}", name],
+                             capture_output=True, text=True, timeout=10).stdout.strip().rstrip("%")
+        return float(out) > 2.0 if out else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _run_stalled(args: list[str], stall_secs: int = 1200, ceiling_secs: int = 14400,
+                 container: str | None = None) -> tuple[str, str]:
+    """Run a subprocess, STREAMING output, and kill it ONLY when it is genuinely hung — no new
+    output AND no CPU work for `stall_secs` — or when it passes the absolute `ceiling_secs`
+    backstop. Conservative on purpose: a scan that is quietly grinding (burning CPU with little
+    output) is NEVER killed for being slow; only a deadlocked/idle process is. `container` names a
+    docker container whose CPU is polled instead of the (idle) host process. Returns
+    (output, reason): 'completed' | 'stuck: …' | 'ceiling: …' | 'error: …'.
     """
     import time as _t
     try:
@@ -97,25 +141,47 @@ def _run_stalled(args: list[str], stall_secs: int = 600, ceiling_secs: int = 108
     except Exception as exc:  # noqa: BLE001
         return "", f"error: {exc}"
     lines: list[str] = []
-    last = [_t.monotonic()]
+    last_out = [_t.monotonic()]
     done = threading.Event()
 
     def _reader():
         try:
-            for ln in proc.stdout:            # blocks per line; updates the heartbeat
+            for ln in proc.stdout:
                 lines.append(ln)
-                last[0] = _t.monotonic()
+                last_out[0] = _t.monotonic()
         except Exception:  # noqa: BLE001
             pass
         done.set()
 
     threading.Thread(target=_reader, daemon=True).start()
     start = _t.monotonic()
+    _cpu_prev = [_proc_cpu_seconds(proc.pid) or 0.0]
+    last_work = [start]
+
+    def _did_work() -> bool | None:
+        if container:                       # dockerized: ask the container, not the idle host proc
+            return _container_busy(container)
+        cur = _proc_cpu_seconds(proc.pid)   # host process: did cumulative CPU advance?
+        if cur is None:
+            return None
+        adv = cur > _cpu_prev[0] + 1.0
+        _cpu_prev[0] = cur
+        return adv
+
     reason = "completed"
-    while not done.wait(5):
+    while not done.wait(15):
         now = _t.monotonic()
-        if now - last[0] > stall_secs:
-            reason = f"stalled: no output for {int(now - last[0])}s (genuinely stuck)"
+        w = _did_work()
+        if w:                               # actively computing -> reset the stall clock
+            last_work[0] = now
+        elif w is None:                     # can't tell CPU -> treat output as the only signal
+            last_work[0] = last_out[0]
+        silent_for = now - last_out[0]
+        idle_for = now - last_work[0]
+        # stuck ONLY if BOTH: no output AND no CPU work for the whole window (a real deadlock).
+        if silent_for > stall_secs and idle_for > stall_secs:
+            reason = (f"stuck: no output AND no CPU for {int(min(silent_for, idle_for))}s "
+                      f"(genuinely hung, not just slow)")
             proc.kill()
             break
         if now - start > ceiling_secs:
@@ -2585,7 +2651,7 @@ jobs:
 """
         with open(os.path.join(out_dir, "plan.yaml"), "w", encoding="utf-8") as fh:
             fh.write(plan)
-        _stall = int(os.environ.get("DASTNG_ZAP_STALL", "600") or "600")
+        _stall = int(os.environ.get("DASTNG_ZAP_STALL", "1200") or "1200")  # 20min silence+idle
         print(f"[zap] frontier mode: feeding {len(feed)} URL(s) to ZAP "
               f"(active depth: {'unbounded' if not budget else str(budget) + ' min'}; "
               f"stall-kill {_stall}s; backstop {timeout}s)", flush=True)
@@ -2593,13 +2659,16 @@ jobs:
         # active-scan 100+ URLs, which OOM-crashes the JVM mid-scan (no report). Bump the heap
         # (DASTNG_ZAP_XMX, default 3g). zap.sh forwards -Xmx to the JVM.
         _xmx = os.environ.get("DASTNG_ZAP_XMX", "3g")
-        args = ["docker", "run", "--rm", "--add-host=host.docker.internal:host-gateway",
+        _cname = "dastng-zap-" + os.path.basename(out_dir)
+        args = ["docker", "run", "--rm", "--name", _cname,
+                "--add-host=host.docker.internal:host-gateway",
                 "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
                 "zaproxy/zap-stable", "zap.sh", f"-Xmx{_xmx}", "-cmd",
                 "-autorun", "/zap/wrk/plan.yaml", *auth_cfg]
-        # Stall watchdog, not a fixed clock: ZAP is dropped only if it goes silent (stuck) or hits
-        # the absolute backstop — never merely for being thorough/slow.
-        _zap_out, _reason = _run_stalled(args, stall_secs=_stall, ceiling_secs=timeout)
+        # Stall watchdog, not a fixed clock: ZAP is dropped only if the CONTAINER goes both silent
+        # AND idle (genuinely hung) or hits the absolute backstop — never for being thorough/slow.
+        _zap_out, _reason = _run_stalled(args, stall_secs=_stall, ceiling_secs=timeout,
+                                         container=_cname)
         if _reason != "completed":
             print(f"[zap] watchdog: {_reason}", flush=True)
         return _parse()
