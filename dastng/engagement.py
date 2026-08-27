@@ -2310,7 +2310,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # gap). Derived from the stage timeline + per-tool finding counts + the ZAP status. ----
     _stages_ran = {str(t.get("stage", "")).split("[")[0].split(":")[0]
                    for t in getattr(_prog, "timeline", [])}
-    _bt = Counter(f.tool for f in uniq)
+    _bt = _Counter(f.tool for f in uniq)
     _active = bool(tools and policy.active_scan)
     _engine_spec = [
         ("fingerprint", appprof is not None, appprof.summary() if appprof else "FAILED to fingerprint"),
