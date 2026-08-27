@@ -74,6 +74,10 @@ class Finding:
     evidence: str = ""
     verified: bool | None = None       # None=unverified, True=confirmed, False=refuted
     verify_note: str = ""
+    # Full proof: the HTTP request/response exchange(s) that triggered the finding, so a report
+    # can show the actual attack + the server's telling response (like Burp's request/response
+    # panes). Each entry: {request:{method,url,headers,body}, response:{status,headers,body}}.
+    evidence_log: list = field(default_factory=list)
 
 
 def _run(args: list[str], timeout: int, stdin: str | None = None) -> str:
@@ -465,13 +469,21 @@ def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[
                     continue
                 if r.status_code < 300:
                     _bola_done.add(urlsplit(_url(path)).path)
+                    _ev = [{
+                        "request": {"method": method.upper(), "url": target_url,
+                                    "headers": _redact_headers(_base_headers(cookie)),
+                                    "body": json.dumps(body) if body else ""},
+                        "response": {"status": r.status_code,
+                                     "headers": _redact_headers(dict(r.headers)),
+                                     "body": (r.text or "")[:_EVID_MAX_BODY]},
+                    }]
                     out.append(Finding(
                         tool="verify", category="bola", url=target_url, param=None,
                         method=method.upper(),
                         evidence=(f"{method.upper()} on another object ({oid!r}) at "
                                   f"{urlsplit(target_url).path} returned {r.status_code} with the "
                                   f"current identity — broken object-level authorization (IDOR)"),
-                        verified=True))
+                        verified=True, evidence_log=_ev))
                     break
     return out
 
@@ -552,6 +564,7 @@ def verify_cmdi(url: str, param: str, method: str, cookie: str) -> tuple[bool, s
         except Exception:  # noqa: BLE001, S112
             continue
         _feed(url, r.text)   # passive PII inspection of the audit-time response (Burp-style)
+        _rec(method, url, headers, f"{param}={payload}", r)
         if "uid=" in r.text and "gid=" in r.text:
             return True, f"cmd exec confirmed via '{sep}' (uid= in response)"
     return False, "no command output on replay"
@@ -596,6 +609,7 @@ def verify_reflected_xss(url: str, param: str, method: str, cookie: str) -> tupl
         except Exception:  # noqa: BLE001 - try the next payload
             continue
         _feed(url, r.text)   # passive PII inspection of the audit-time response (Burp-style)
+        _rec(method, url, headers, f"{param}={pay}", r)
         if pay in r.text:                       # reflected VERBATIM => breakout survived
             if conf == "confirmed":
                 return True, f"reflected unencoded ({tag}) — confirmed executable"
@@ -637,6 +651,7 @@ def verify_dom_xss(url: str, cookie: str) -> tuple[bool, str]:
         r = httpx.get(url, headers=headers, follow_redirects=True, timeout=12)
     except Exception as exc:  # noqa: BLE001
         return False, f"fetch error: {exc}"
+    _rec("GET", url, headers, None, r)
     js = "\n".join(_SCRIPT_BLOCK.findall(r.text or ""))
     if not js:
         return False, "no inline script"
@@ -751,6 +766,57 @@ def _base_headers(cookie: str) -> dict:
     return h
 
 
+# Evidence recorder: captures the raw HTTP request/response exchanges a probe generates so a
+# confirmed finding can carry its PROOF (the attack request + the server's telling response),
+# Burp-style. Thread-local (the probe stage is concurrent). A worker calls _evid_start() before a
+# check, _req/verify record into the buffer, and _evid_take() snapshots + clears it.
+_EVID = threading.local()
+_EVID_MAX_BODY = 4000        # cap stored bodies so a report/JSON stays reasonable
+
+
+def _evid_start() -> None:
+    _EVID.buf = []
+    _EVID.on = True
+
+
+def _evid_take() -> list:
+    buf = getattr(_EVID, "buf", None) or []
+    _EVID.buf = []
+    _EVID.on = False
+    return list(buf)
+
+
+def _redact_headers(h: dict) -> dict:
+    out = {}
+    for k, v in (h or {}).items():
+        if k.lower() in ("authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"):
+            sv = str(v)
+            out[k] = (sv[:16] + "…[redacted]") if len(sv) > 16 else "[redacted]"
+        else:
+            out[k] = str(v)
+    return out
+
+
+def _rec(method: str, url: str, req_headers: dict, req_body, resp) -> None:
+    """Record one request/response exchange into the active evidence buffer (if recording)."""
+    if not getattr(_EVID, "on", False):
+        return
+    try:
+        rec = {
+            "request": {"method": method, "url": url,
+                        "headers": _redact_headers(req_headers),
+                        "body": (str(req_body)[:_EVID_MAX_BODY] if req_body else "")},
+            "response": {"status": getattr(resp, "status_code", None),
+                         "headers": _redact_headers(dict(getattr(resp, "headers", {}) or {})),
+                         "body": (getattr(resp, "text", "") or "")[:_EVID_MAX_BODY]},
+        }
+        _EVID.buf.append(rec)
+        if len(_EVID.buf) > 12:          # keep only the most recent dozen exchanges
+            _EVID.buf = _EVID.buf[-12:]
+    except Exception:  # noqa: BLE001,S110 - recording must never break a probe
+        pass
+
+
 # Per-target injection shape, set by the probe worker before calling the verify_* checks (which
 # only know url+param). A thread-local because the probe stage runs workers concurrently — each
 # worker sets its own target's shape. Absent => classic query/form injection (unchanged).
@@ -780,23 +846,28 @@ def _req(method, url, param, value, cookie, follow=True):
         resp = httpx.request(method if method in ("GET", "POST", "PUT", "DELETE") else "GET",
                              u, headers=headers, follow_redirects=follow, timeout=12)
         _feed(u, resp.text)
+        _rec(method, u, headers, f"(path-injected {param}={value})", resp)
         return resp
     # (b) JSON request-body injection: APIs reject form-encoded bodies, so send the payload in a
     # JSON object with the other body params filled — the probe now actually reaches the sink.
     if ctx and ctx["body_type"] == "json" and method in ("POST", "PUT", "PATCH"):
         body = {p: (value if p == param else "1") for p in (ctx["all_params"] or [param])}
-        resp = httpx.request(method, url.replace("{" + param + "}", "1"), json=body,
-                             headers=headers, follow_redirects=follow, timeout=12)
+        _u = url.replace("{" + param + "}", "1")
+        resp = httpx.request(method, _u, json=body, headers=headers,
+                             follow_redirects=follow, timeout=12)
         _feed(url, resp.text)
+        _rec(method, _u, headers, json.dumps(body), resp)
         return resp
     # (c) classic query / form injection (unchanged). Submit=Submit: DVWA-style forms only process
     # the input when the submit button is present; a harmless extra param elsewhere.
     if method == "POST":
         resp = httpx.post(url, data={param: value, "Submit": "Submit"}, headers=headers,
                           follow_redirects=follow, timeout=12)
+        _rec("POST", url, headers, f"{param}={value}&Submit=Submit", resp)
     else:
         resp = httpx.get(url, params={param: value, "Submit": "Submit"}, headers=headers,
                          follow_redirects=follow, timeout=12)
+        _rec("GET", f"{url}?{param}={value}", headers, None, resp)
     _feed(url, resp.text)   # passive PII inspection of the audit-time response (Burp-style)
     return resp
 
@@ -1298,48 +1369,56 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
         if is_auth_endpoint(t.url):   # never inject auth endpoints
             return found, None
 
-        def add(cat, param, note):
+        def _emit(cat, param, note, ev):
             found.append(Finding(tool="verify", category=cat, url=t.url, param=param,
-                                 method=t.method, evidence=note, verified=True))
+                                 method=t.method, evidence=note, verified=True,
+                                 evidence_log=ev))
 
         csrf_hit = None
         try:
+            _evid_start()
             ok, note = verify_csrf(t, cookie, active=fuzz_forms)
+            _cev = _evid_take()
             if ok:
-                csrf_hit = (t.url, t.method, note)
+                csrf_hit = (t.url, t.method, note, _cev)
         except Exception:  # noqa: BLE001,S110
-            pass
+            _evid_take()
         # DOM-XSS is page-level (source->sink in the page JS), not per-param — check the page once.
         try:
+            _evid_start()
             ok, note = verify_dom_xss(t.url, cookie)
+            _dev = _evid_take()
             if ok:
-                add("xss", None, f"dom: {note}")
+                _emit("xss", None, f"dom: {note}", _dev)
         except Exception:  # noqa: BLE001,S110
-            pass
+            _evid_take()
         _set_inject_ctx(t)   # tell _req this target's injection shape (path-param / JSON body)
         for param in t.params:
+            # each check records its own request/response exchange(s) as proof for the finding.
+            def _ck(fn, cat, prefix=""):
+                _evid_start()
+                try:
+                    ok, note = fn(t.url, param, t.method, cookie)
+                except Exception:  # noqa: BLE001
+                    _evid_take()
+                    return
+                ev = _evid_take()
+                if ok:
+                    _emit(cat, param, prefix + note, ev)
             try:
-                ok, note = verify_cmdi(t.url, param, t.method, cookie)
-                if ok:
-                    add("command-injection", param, note)
-                ok, note = verify_reflected_xss(t.url, param, t.method, cookie)
-                if ok:
-                    add("xss", param, note)
-                ok, note = verify_sqli(t.url, param, t.method, cookie)
-                if ok:
-                    add("sql-injection", param, note)
-                ok, note = verify_lfi(t.url, param, t.method, cookie)
-                if ok:
-                    add("file-inclusion", param, note)
-                ok, note = verify_open_redirect(t.url, param, t.method, cookie)
-                if ok:
-                    add("open-redirect", param, note)
+                _ck(verify_cmdi, "command-injection")
+                _ck(verify_reflected_xss, "xss")
+                _ck(verify_sqli, "sql-injection")
+                _ck(verify_lfi, "file-inclusion")
+                _ck(verify_open_redirect, "open-redirect")
                 # stored XSS only makes sense on POST forms; it WRITES data, so production-safe
                 # (fuzz_forms=False) skips it.
                 if t.method == "POST" and fuzz_forms:
+                    _evid_start()
                     ok, note = verify_stored_xss(t, param, cookie)
+                    _sev = _evid_take()
                     if ok:
-                        add("xss", param, f"stored: {note}")
+                        _emit("xss", param, f"stored: {note}", _sev)
             except Exception:  # noqa: BLE001,S112 - one param must never sink the target
                 continue
         return found, csrf_hit
@@ -1366,7 +1445,7 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
     if _csrf_hits:
         _CSRF_GROUP_THRESHOLD = 8
         if len(_csrf_hits) >= _CSRF_GROUP_THRESHOLD:
-            _paths = [urlsplit(u).path for u, _m, _n in _csrf_hits]
+            _paths = [urlsplit(h[0]).path for h in _csrf_hits]
             _sample = ", ".join(_paths[:5]) + (" ..." if len(_paths) > 5 else "")
             out.append(Finding(
                 tool="verify", category="csrf", url=_csrf_hits[0][0], param=None, method="*",
@@ -1374,11 +1453,13 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
                           f"protection (no anti-CSRF token, session cookie without SameSite, "
                           f"Origin/Referer not validated) — the app has no CSRF framework. "
                           f"Sample: {_sample}"),
-                verified=True))
+                verified=True, evidence_log=(_csrf_hits[0][3] if len(_csrf_hits[0]) > 3 else [])))
         else:
-            for u, m, n in _csrf_hits:
+            for h in _csrf_hits:
+                u, m, n = h[0], h[1], h[2]
                 out.append(Finding(tool="verify", category="csrf", url=u, param=None,
-                                   method=m, evidence=n, verified=True))
+                                   method=m, evidence=n, verified=True,
+                                   evidence_log=(h[3] if len(h) > 3 else [])))
     return out
 
 
