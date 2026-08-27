@@ -25,6 +25,7 @@ class PassiveFinding:
     url: str
     detail: str
     severity: str = "low"
+    response: dict = None      # the request/response that demonstrates the issue (proof)
 
 
 def _is_https(url: str) -> bool:
@@ -124,11 +125,26 @@ def passive_scan(urls: list[str], cookie: str, cap: int = 40) -> list[PassiveFin
         except Exception:  # noqa: BLE001, S112
             continue
         set_cookies = r.headers.get_list("set-cookie") if hasattr(r.headers, "get_list") else []
+        # The response IS the proof for a passive finding (the headers that are missing/present).
+        _elapsed = None
+        try:
+            _elapsed = round(r.elapsed.total_seconds() * 1000)
+        except Exception:  # noqa: BLE001
+            _elapsed = None
+        _proof = {
+            "label": "observed response",
+            "request": {"method": "GET", "url": str(r.url),
+                        "headers": {"Cookie": "[redacted]"} if cookie else {}, "body": ""},
+            "response": {"status": r.status_code, "headers": dict(r.headers),
+                         "elapsed_ms": _elapsed, "size": len(r.text or ""),
+                         "body": (r.text or "")[:8000], "truncated": len(r.text or "") > 8000},
+        }
         for f in check_response(str(r.url), r.status_code, dict(r.headers), r.text,
                                 set_cookies, cors_acao=acao):
             key = (f.check, host)
             if key in seen:
                 continue
             seen.add(key)
+            f.response = _proof
             out.append(f)
     return out
