@@ -2377,8 +2377,34 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
             report = json.load(fh)
         out: list[Finding] = []
         for n in normalize_zap(report):
-            out.append(Finding(tool="zap", category=n.category, url=n.url, param=n.param,
-                               evidence=n.raw.get("name", "")))
+            alert = n.raw or {}
+            inst = (alert.get("instances") or [{}])[0] if isinstance(alert.get("instances"), list) else {}
+            attack = str(inst.get("attack") or "")
+            zev = str(inst.get("evidence") or "")
+            desc = re.sub(r"<[^>]+>", " ", str(alert.get("desc", "") or "")).strip()[:500]
+            solution = re.sub(r"<[^>]+>", " ", str(alert.get("solution", "") or "")).strip()[:400]
+            ev_log = []
+            if attack or zev:
+                ev_log = [{
+                    "label": "ZAP active-scan instance",
+                    "request": {"method": inst.get("method", "GET"),
+                                "url": inst.get("uri") or n.url, "headers": {},
+                                "body": (f"injected: {attack}" if attack else "")},
+                    "response": {"status": None, "headers": {}, "elapsed_ms": None,
+                                 "size": len(zev),
+                                 "body": (f"matched evidence in response: {zev}" if zev else "")},
+                }]
+            raw = json.dumps({k: alert.get(k) for k in ("name", "riskdesc", "confidence", "desc",
+                              "solution", "reference", "cweid", "wascid", "count", "instances")
+                              if alert.get(k)}, indent=1, default=str)[:9000]
+            conf = str(alert.get("confidence", ""))
+            out.append(Finding(
+                tool="zap", category=n.category, url=n.url, param=n.param or inst.get("param"),
+                evidence=(str(alert.get("name", "")) + (f" — {desc}" if desc else ""))[:600],
+                evidence_log=ev_log, raw_output=raw, payload=attack[:400], verified=True,
+                detection="zap active scan",
+                confidence=("firm" if conf in ("2", "3", "Medium", "High") else "tentative"),
+                verify_note=(f"Remediation (ZAP): {solution}" if solution else "")))
         # Soft-404 guard: on catch-all/SPA-routing apps, ZAP's file-existence checks
         # (.env/.htaccess/Trace.axd/backup-file leaks) false-positive on the index page. Re-verify
         # each existence finding against the app's not-found fingerprint and drop the FPs. Findings
