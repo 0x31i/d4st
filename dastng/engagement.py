@@ -84,6 +84,51 @@ class Finding:
     repro: str = ""                # a curl command that reproduces the finding
 
 
+def _run_stalled(args: list[str], stall_secs: int = 600, ceiling_secs: int = 10800) -> tuple[str, str]:
+    """Run a subprocess, STREAMING its output, and kill it only when it is genuinely stuck — no
+    output for `stall_secs` — or when it blows past an absolute `ceiling_secs` backstop. A tool
+    that keeps emitting progress (ZAP active-scan %, etc.) is never dropped for merely being slow.
+    Returns (output, reason) where reason is 'completed' | 'stalled …' | 'ceiling …' | 'error …'.
+    """
+    import time as _t
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+    except Exception as exc:  # noqa: BLE001
+        return "", f"error: {exc}"
+    lines: list[str] = []
+    last = [_t.monotonic()]
+    done = threading.Event()
+
+    def _reader():
+        try:
+            for ln in proc.stdout:            # blocks per line; updates the heartbeat
+                lines.append(ln)
+                last[0] = _t.monotonic()
+        except Exception:  # noqa: BLE001
+            pass
+        done.set()
+
+    threading.Thread(target=_reader, daemon=True).start()
+    start = _t.monotonic()
+    reason = "completed"
+    while not done.wait(5):
+        now = _t.monotonic()
+        if now - last[0] > stall_secs:
+            reason = f"stalled: no output for {int(now - last[0])}s (genuinely stuck)"
+            proc.kill()
+            break
+        if now - start > ceiling_secs:
+            reason = f"ceiling: exceeded {ceiling_secs}s absolute backstop"
+            proc.kill()
+            break
+    try:
+        proc.wait(timeout=30)
+    except Exception:  # noqa: BLE001
+        proc.kill()
+    return "".join(lines), reason
+
+
 def _run(args: list[str], timeout: int, stdin: str | None = None) -> str:
     try:
         p = subprocess.run(args, input=stdin, capture_output=True, text=True,
@@ -2487,16 +2532,16 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         with open(os.path.join(out_dir, "frontier.txt"), "w", encoding="utf-8") as fh:
             fh.write("\n".join(feed))
         # Active-scan budget must fit INSIDE the outer subprocess timeout alongside ZAP startup,
-        # the URL import, the passive-wait, and the report job — otherwise ZAP is killed
-        # mid-active-scan and NEVER writes the report (silent 0-findings). The old
-        # `max(10, timeout//60 - 20)` floored the active budget at 10 min even for a 10-min total
-        # timeout, so ZAP scanned for the whole window and the hard kill pre-empted the report.
-        # Allocate proportionally: fixed reserve for startup+import+report, then split the rest
-        # between passive-wait and active-scan, so the report job ALWAYS gets to run.
-        _tmin = max(6, timeout // 60)
-        _avail = max(2, _tmin - 5)                       # 5 min: startup + import + report
-        _passive_min = max(1, min(8, int(_avail * 0.3)))
-        budget = max(2, _avail - _passive_min)
+        # DEPTH vs KILL are now separate concerns (a slow-but-progressing scan must NOT be dropped):
+        #  - budget = maxScanDurationInMins = ZAP's OWN graceful depth cap. It stops active-scanning
+        #    at this and then WRITES ITS REPORT. Default 0 = unbounded (scan until the ruleset
+        #    finishes, however long) — override with DASTNG_ZAP_ACTIVE_MINS to cap depth.
+        #  - the process is NOT hard-killed on a fixed clock; it runs under a STALL WATCHDOG that
+        #    only kills ZAP if it produces no output for DASTNG_ZAP_STALL secs (genuinely stuck) or
+        #    exceeds the DASTNG_ZAP_TIMEOUT absolute backstop. So "ZAP is taking a while" is fine;
+        #    only "ZAP is broken/hung" ends it.
+        budget = int(os.environ.get("DASTNG_ZAP_ACTIVE_MINS", "0") or "0")   # 0 = unbounded
+        _passive_min = int(os.environ.get("DASTNG_ZAP_PASSIVE_MINS", "8") or "8")
         # Attack strength: 'medium' is right for a huge frontier (WAVSEP); a small target can
         # afford 'high' for maximum thoroughness. DASTNG_ZAP_STRENGTH overrides.
         strength = os.environ.get("DASTNG_ZAP_STRENGTH", "medium").lower()
@@ -2533,8 +2578,10 @@ jobs:
 """
         with open(os.path.join(out_dir, "plan.yaml"), "w", encoding="utf-8") as fh:
             fh.write(plan)
+        _stall = int(os.environ.get("DASTNG_ZAP_STALL", "600") or "600")
         print(f"[zap] frontier mode: feeding {len(feed)} URL(s) to ZAP "
-              f"(active-scan budget {budget} min)", flush=True)
+              f"(active depth: {'unbounded' if not budget else str(budget) + ' min'}; "
+              f"stall-kill {_stall}s; backstop {timeout}s)", flush=True)
         # ZAP's ergonomic default heap is ~25% of visible RAM (~1.5G on a 6G VM) — too small to
         # active-scan 100+ URLs, which OOM-crashes the JVM mid-scan (no report). Bump the heap
         # (DASTNG_ZAP_XMX, default 3g). zap.sh forwards -Xmx to the JVM.
@@ -2543,7 +2590,11 @@ jobs:
                 "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
                 "zaproxy/zap-stable", "zap.sh", f"-Xmx{_xmx}", "-cmd",
                 "-autorun", "/zap/wrk/plan.yaml", *auth_cfg]
-        _zap_out = _run(args, timeout=timeout)
+        # Stall watchdog, not a fixed clock: ZAP is dropped only if it goes silent (stuck) or hits
+        # the absolute backstop — never merely for being thorough/slow.
+        _zap_out, _reason = _run_stalled(args, stall_secs=_stall, ceiling_secs=timeout)
+        if _reason != "completed":
+            print(f"[zap] watchdog: {_reason}", flush=True)
         return _parse()
 
     # ---- legacy fallback: ZAP self-crawls (DASTNG_ZAP_MODE=spider, or no frontier) ----------
