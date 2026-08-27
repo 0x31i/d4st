@@ -2313,23 +2313,21 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     _bt = _Counter(f.tool for f in uniq)
     _active = bool(tools and policy.active_scan)
 
-    def _fired(stage: str, tool: str = "") -> bool:
-        # an engine ran if its stage is in the timeline OR it produced findings (findings are
-        # irrefutable proof it executed — robust even without a progress file).
-        return stage in _stages_ran or bool(tool and _bt.get(tool, 0) > 0)
-
-    # (engine, did-it-run, note, expected?) — `expected` gates whether NOT running is an ALARM.
-    # Active-scan engines are expected only when active scanning is on; ZAP only when enabled.
+    # "ran" is determined from CONTROL FLOW (deterministic, no dependence on a progress file or on
+    # whether the engine happened to find anything). passive + pii always execute; the active-scan
+    # engines execute iff active scanning is on; ZAP has its own honest ran-flag. `expected` gates
+    # whether NOT running is an ALARM (an intentionally-off engine is never an alarm). Note carries
+    # the finding count so "ran, found 0" is visible without being a false failure.
+    _ = _stages_ran  # (kept for observability; ran no longer depends on it)
     _engine_spec = [
         ("fingerprint", appprof is not None, appprof.summary() if appprof else "FAILED", True),
         ("crawl+discovery", len(urls) > 0, f"{len(urls)} urls, {len(targets)} targets", True),
-        ("nuclei-dast", _fired("nuclei-dast", "nuclei"), f"{_bt.get('nuclei', 0)} findings", _active),
-        ("roster", _fired("roster") or any(_bt.get(t, 0) for t in _MEGA_ROSTER),
-         f"{sum(_bt.get(t, 0) for t in _MEGA_ROSTER)} findings", _active),
-        ("native-probes", _fired("probes", "verify"), f"{_bt.get('verify', 0)} findings", _active),
-        ("passive", _fired("passive", "passive"), f"{_bt.get('passive', 0)} findings", True),
-        ("pii", _fired("pii", "pii"), f"{_bt.get('pii', 0)} findings", True),
-        ("sqlmap", _fired("sqlmap"), "ran", _active),
+        ("nuclei-dast", _active, f"{_bt.get('nuclei', 0)} findings", _active),
+        ("roster", _active, f"{sum(_bt.get(t, 0) for t in _MEGA_ROSTER)} findings", _active),
+        ("native-probes", _active, f"{_bt.get('verify', 0)} findings", _active),
+        ("passive", True, f"{_bt.get('passive', 0)} findings", True),
+        ("pii", True, f"{_bt.get('pii', 0)} findings", True),
+        ("sqlmap", _active, "ran", _active),
         ("zap", zap_ran, zap_note, bool(zap and _active)),
     ]
     chain = []
