@@ -859,6 +859,27 @@ def _shq(s: str) -> str:
     return "'" + str(s).replace("'", "'\\''") + "'"
 
 
+def _tool_evidence(f: dict, name: str) -> tuple[list, str]:
+    """Build (evidence_log, raw_output) from a subprocess tool's finding dict — its own
+    request/response (nuclei -irr, dalfox PoC) becomes proof, the full JSON becomes raw output."""
+    req, resp = f.get("request"), f.get("response")
+    ev = []
+    if req or resp:
+        ev = [{
+            "label": f.get("template-id") or f.get("matcher-name") or f.get("template") or name,
+            "request": {"method": f.get("method", "GET"),
+                        "url": str(f.get("matched-at") or f.get("url") or f.get("host") or ""),
+                        "headers": {}, "body": str(req or "")[:_EVID_MAX_BODY]},
+            "response": {"status": f.get("status"), "headers": {}, "elapsed_ms": None,
+                         "size": len(str(resp or "")), "body": str(resp or "")[:_EVID_MAX_BODY]},
+        }]
+    try:
+        raw = json.dumps(f, indent=1, default=str)[:9000]
+    except Exception:  # noqa: BLE001
+        raw = str(f)[:9000]
+    return ev, raw
+
+
 def _derive_meta(note: str, ev: list) -> tuple[str, str, str, str]:
     """Derive (detection_method, confidence, payload, curl_repro) from the note + exchanges so the
     report can badge HOW it was found and show the exact attack."""
@@ -1151,7 +1172,8 @@ def run_nuclei_dast(urls: list[str], cookie: str, politeness=None) -> list[Findi
     # the full 90min budget over 1861 targets, got killed, and we got nothing). Writing JSONL to
     # disk means whatever it found up to the kill is preserved and parsed. -stats optional.
     out_file = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False).name
-    args = ["nuclei", "-l", path, "-dast", "-jsonl", "-o", out_file, "-silent"]
+    # -irr includes the request/response in each finding so the report shows real HTTP proof.
+    args = ["nuclei", "-l", path, "-dast", "-jsonl", "-irr", "-o", out_file, "-silent"]
     if politeness:
         args += politeness.nuclei_flags()
     if cookie:
@@ -1163,9 +1185,19 @@ def run_nuclei_dast(urls: list[str], cookie: str, politeness=None) -> list[Findi
     except Exception:  # noqa: BLE001
         out = ""
     from .scoring.normalize import normalize_nuclei
-    return [Finding(tool="nuclei", category=n.category, url=n.url, param=n.param,
-                    evidence=(n.raw.get("info", {}) or {}).get("name", ""))
-            for n in normalize_nuclei(out)]
+    findings = []
+    for n in normalize_nuclei(out):
+        ev, raw = _tool_evidence(n.raw, "nuclei")
+        info = n.raw.get("info", {}) or {}
+        findings.append(Finding(
+            tool="nuclei", category=n.category, url=n.url, param=n.param,
+            evidence=info.get("name", "") + (f" — {info.get('description', '')[:200]}" if info.get("description") else ""),
+            evidence_log=ev, raw_output=raw, verified=True,
+            payload=str(n.raw.get("curl-command") or n.raw.get("matched-at") or "")[:400],
+            repro=str(n.raw.get("curl-command") or "")[:1200],
+            detection=n.raw.get("matcher-name") or n.raw.get("type") or "nuclei-template",
+            confidence="firm"))
+    return findings
 
 
 def run_sqlmap(t: Target, cookie: str, politeness=None, policy=None,
@@ -2092,8 +2124,15 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
 
     # 2) passive/config (hardened-app bulk: headers, cookies, CORS, TLS hygiene)
     for pf in passive_scan(urls, cookie):
+        _ev = []
+        if getattr(pf, "response", None):
+            _pr = dict(pf.response)
+            _pr["response"] = {**_pr["response"], "headers": _redact_headers(_pr["response"].get("headers", {}))}
+            _ev = [_pr]
         findings.append(Finding(tool="passive", category=pf.category, url=pf.url,
-                                param=pf.check, evidence=pf.detail, verified=True))
+                                param=pf.check, evidence=pf.detail, verified=True,
+                                evidence_log=_ev, detection="passive response analysis",
+                                confidence="firm"))
     _prog.update("passive", findings, urls=len(urls), targets=len(targets))
 
     # 2b) passive info-disclosure via CLI detectors (nuclei exposures/misconfig + PII/email
