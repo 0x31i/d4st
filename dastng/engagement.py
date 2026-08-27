@@ -2238,12 +2238,15 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 # surface the native stack discovered — no reliance on ZAP's own spider/browser.
                 # seed_url is only used by the legacy spider fallback (DASTNG_ZAP_MODE=spider).
                 _zap_seed = (_seeds[0] if _seeds else "")
+                _zap_before = len(findings)
                 findings += run_zap(target, cookie, _tf.mkdtemp(prefix="dastng-zap-"),
                                     timeout=_zap_to, seed_url=_zap_seed, frontier=urls)
                 zap_ran = True
-                zap_note = "ran"
+                zap_note = f"ran ({len(findings) - _zap_before} findings)"
             except Exception as exc:  # noqa: BLE001 - ZAP failure must not sink the scan
-                zap_note = f"error: {exc}"
+                zap_ran = False       # honest: a crash/timeout is a FAILURE, not "ran, 0 findings"
+                zap_note = f"FAILED: {exc}"
+                print(f"[zap] FAILED — {exc}", flush=True)
     _prog.update("zap", findings, urls=len(urls), targets=len(targets), note=zap_note)
 
     # dedup by (category, path, param) — but merge evidence so a richer duplicate wins its proof.
@@ -2257,6 +2260,33 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 kept.payload, kept.repro = (kept.payload or f.payload), (kept.repro or f.repro)
             continue
         seen[k] = f; uniq.append(f)
+    # ---- chain health: which engines actually FIRED this scan (so a silent tool failure — like
+    # ZAP getting killed before writing its report — shows up as an alarm, not a clean-looking
+    # gap). Derived from the stage timeline + per-tool finding counts + the ZAP status. ----
+    _stages_ran = {str(t.get("stage", "")).split("[")[0].split(":")[0]
+                   for t in getattr(_prog, "timeline", [])}
+    _bt = Counter(f.tool for f in uniq)
+    _active = bool(tools and policy.active_scan)
+    _engine_spec = [
+        ("fingerprint", appprof is not None, appprof.summary() if appprof else "FAILED to fingerprint"),
+        ("crawl+discovery", len(urls) > 0, f"{len(urls)} urls, {len(targets)} targets"),
+        ("nuclei-dast", (not _active) or "nuclei-dast" in _stages_ran, f"{_bt.get('nuclei', 0)} findings"),
+        ("roster", (not _active) or "roster" in _stages_ran, f"{sum(_bt.get(t, 0) for t in _MEGA_ROSTER)} findings"),
+        ("native-probes", (not _active) or "probes" in _stages_ran, f"{_bt.get('verify', 0)} findings"),
+        ("passive", "passive" in _stages_ran, f"{_bt.get('passive', 0)} findings"),
+        ("pii", "pii" in _stages_ran, f"{_bt.get('pii', 0)} findings"),
+        ("sqlmap", (not _active) or "sqlmap" in _stages_ran, "ran"),
+        ("zap", zap_ran, zap_note),
+    ]
+    chain = []
+    warnings = []
+    for name, ran, note in _engine_spec:
+        chain.append({"engine": name, "ran": bool(ran), "note": note})
+        if not ran:
+            warnings.append(f"{name}: {note}")
+    if warnings:
+        print("[chain] ⚠ ENGINES THAT DID NOT FIRE: " + " | ".join(warnings), flush=True)
+
     # Uniform enrichment: every finding gets a detection method / confidence / payload / repro so
     # the report is deep even for tool findings that arrived thin. Derived from note + exchanges.
     for f in uniq:
@@ -2290,6 +2320,9 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         # ZAP cross-check: whether the second engine ran, so the corroboration is auditable
         "zap": {"ran": zap_ran, "note": zap_note,
                 "findings": sum(1 for f in uniq if f.tool == "zap")},
+        # Chain health: every engine + whether it fired this scan. `warnings` lists any engine that
+        # did NOT run, so a silent tool failure is an explicit alarm, not an invisible gap.
+        "chain": chain, "warnings": warnings,
         # session robustness: how many times the scan re-authenticated mid-run (0 = session held;
         # >0 = the keeper caught + recovered a session loss that would otherwise have silently
         # zeroed the scan). Surfaced so session health is auditable, never a silent degradation.
@@ -2372,7 +2405,11 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         if not os.path.exists(report_path):
             _tail = "\n".join((_zap_out or "").splitlines()[-20:])
             print(f"[zap] NO report written — did not complete cleanly. Tail:\n{_tail}", flush=True)
-            return []
+            # LOUD failure: a missing report is a tool failure (timeout/crash), NOT a clean
+            # 0-findings result. Raise so the caller records ZAP as failed, not "ran", instead of
+            # a silent gap that makes the scan look clean.
+            raise RuntimeError("ZAP did not complete (killed/crashed before writing its report — "
+                               "raise DASTNG_ZAP_TIMEOUT or check container memory)")
         with open(report_path, encoding="utf-8") as fh:
             report = json.load(fh)
         out: list[Finding] = []
@@ -2450,11 +2487,16 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         with open(os.path.join(out_dir, "frontier.txt"), "w", encoding="utf-8") as fh:
             fh.write("\n".join(feed))
         # Active-scan budget must fit INSIDE the outer subprocess timeout alongside ZAP startup,
-        # the URL import (one GET per fed URL), the passive-wait, and the report job — otherwise
-        # ZAP is killed mid-active-scan and never writes the report (the Juice 198-URL/high-strength
-        # timeout). Reserve ~20 min of headroom (passive 8 + import/startup/report ~12).
-        _passive_min = 8
-        budget = max(10, timeout // 60 - 20)
+        # the URL import, the passive-wait, and the report job — otherwise ZAP is killed
+        # mid-active-scan and NEVER writes the report (silent 0-findings). The old
+        # `max(10, timeout//60 - 20)` floored the active budget at 10 min even for a 10-min total
+        # timeout, so ZAP scanned for the whole window and the hard kill pre-empted the report.
+        # Allocate proportionally: fixed reserve for startup+import+report, then split the rest
+        # between passive-wait and active-scan, so the report job ALWAYS gets to run.
+        _tmin = max(6, timeout // 60)
+        _avail = max(2, _tmin - 5)                       # 5 min: startup + import + report
+        _passive_min = max(1, min(8, int(_avail * 0.3)))
+        budget = max(2, _avail - _passive_min)
         # Attack strength: 'medium' is right for a huge frontier (WAVSEP); a small target can
         # afford 'high' for maximum thoroughness. DASTNG_ZAP_STRENGTH overrides.
         strength = os.environ.get("DASTNG_ZAP_STRENGTH", "medium").lower()
