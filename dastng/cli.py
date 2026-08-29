@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import click
 from rich.console import Console
@@ -322,6 +323,67 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
             _json.dump(result, fh, indent=2)
         console.print(f"report -> {out_path}")
 
+    # Auto-ingest into the observability store (console spine). Additive, non-fatal:
+    # a store hiccup must never fail a scan. Opt out with DASTNG_NO_INGEST=1.
+    if not os.environ.get("DASTNG_NO_INGEST"):
+        try:
+            from . import store
+            sid = _scan_id_for(out_path, target)
+            summ = store.ingest(result, sid)
+            console.print(f"[dim]ingested -> {store.db_path()} as '{sid}' "
+                          f"({summ['findings']} findings, {summ['exchanges']} exchanges)[/dim]")
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[yellow]store ingest skipped[/yellow]: {e}")
+
+
+def _scan_id_for(out_path: str | None, target: str) -> str:
+    """Stable scan id: the -o filename stem if given, else a slug of the target host."""
+    from urllib.parse import urlsplit
+    if out_path:
+        return os.path.splitext(os.path.basename(out_path))[0]
+    host = urlsplit(target).hostname or target or "scan"
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", host).strip("-") or "scan"
+
+
+@main.command()
+@click.argument("json_files", nargs=-1, required=True, type=click.Path(exists=True))
+@click.option("--id", "scan_id", default=None,
+              help="Scan id to store under (single-file only; default = filename stem).")
+@click.option("--db", "db_path_opt", default=None, help="SQLite path (default ~/.dastng/dastng.db).")
+def ingest(json_files: tuple, scan_id: str | None, db_path_opt: str | None) -> None:
+    """Load one or more engagement result JSONs into the observability store (SQLite).
+
+    Idempotent: re-ingesting a scan id replaces its rows and carries analyst triage/notes
+    forward. Use this to backfill existing result files into the console DB.
+    """
+    from . import store
+    if scan_id and len(json_files) > 1:
+        raise click.ClickException("--id is only valid with a single file.")
+    con = store.connect(db_path_opt)
+    store.init_schema(con)
+    total = 0
+    for jf in json_files:
+        try:
+            with open(jf, encoding="utf-8") as fh:
+                result = json.loads(fh.read())
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[red]skip[/red] {jf}: {e}")
+            continue
+        if "findings" not in result:
+            console.print(f"[yellow]skip[/yellow] {jf}: not an engagement result (no findings)")
+            continue
+        sid = scan_id or os.path.splitext(os.path.basename(jf))[0]
+        mtime = int(os.path.getmtime(jf))
+        summ = store.ingest(result, sid, con=con, created_at=mtime)
+        sv = summ["severities"]
+        console.print(f"[green]ingested[/green] {sid}: {summ['findings']} findings "
+                      f"({sv['critical']}c/{sv['high']}h/{sv['medium']}m/{sv['low']}l/{sv['info']}i) "
+                      f"· {summ['exchanges']} exchanges · {summ['urls']} urls · {summ['engines']} engines"
+                      + (f" · carried {summ['carried_forward']} triage" if summ['carried_forward'] else ""))
+        total += 1
+    con.close()
+    console.print(f"[bold]{total} scan(s) in {store.db_path(db_path_opt)}[/bold]")
+
 
 @main.command()
 def selftest() -> None:
@@ -388,11 +450,13 @@ def report(result_json: str, out: str, target: str, open_it: bool) -> None:
 @main.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8810, type=int)
-@click.option("--scans-dir", default="", help="Directory of scan result JSON files to serve.")
-def serve(host: str, port: int, scans_dir: str) -> None:
-    """Start the dast-ng web console (findings dashboard + report viewer)."""
+@click.option("--db", "db_path_opt", default=None,
+              help="SQLite store to serve (default ~/.dastng/dastng.db). Populate it with "
+                   "`dast-ng ingest`; scans also auto-ingest at scan-end.")
+def serve(host: str, port: int, db_path_opt: str | None) -> None:
+    """Start the dast-ng web console (observability dashboard + report viewer)."""
     from .server import run_server
-    run_server(host=host, port=port, scans_dir=scans_dir or None)
+    run_server(host=host, port=port, db_path=db_path_opt)
 
 
 if __name__ == "__main__":
