@@ -63,7 +63,11 @@ def test_write_back_triage_and_note(client):
 
 def test_report_rebuilds_from_store(client):
     html = client.get("/api/report/s1").text
-    assert "dast-ng" in html and "grade" not in html.lower()
+    # client-deliverable structure, and NO scorecard (the only 'grade' mention is the
+    # appendix disclaimer that no letter grade is assigned).
+    assert "dast-ng" in html
+    assert "Executive Summary" in html and "Detailed Findings" in html and "References" in html
+    assert "risk grade" not in html.lower() and "gA" not in html
 
 
 def test_live_endpoint(client, tmp_path, monkeypatch):
