@@ -59,6 +59,20 @@ a{color:var(--cyan);text-decoration:none}
 .hdr .p .sc{color:var(--ink3)}.hdr .p .d{color:var(--green)}.hdr .p .h{color:var(--amber)}
 .hdr .sub{color:var(--ink2);font-size:11.5px;margin-top:9px;display:flex;flex-wrap:wrap;gap:6px 18px}
 .hdr .sub b{color:var(--ink)}.hdr .sub .k{color:var(--ink3)}
+.hdrright{display:flex;flex-direction:column;align-items:flex-end;gap:12px}
+.exportwrap{position:relative}
+.exportbtn{font-family:var(--mono);font-size:11.5px;font-weight:700;letter-spacing:.08em;color:var(--amber);
+  background:linear-gradient(180deg,#161f2b,#0e151e);border:1px solid var(--line2);border-radius:8px;
+  padding:8px 13px;cursor:pointer;transition:border-color .12s,color .12s}
+.exportbtn:hover{border-color:var(--amber2);color:var(--amber2)}
+.exportmenu{display:none;position:absolute;right:0;top:38px;z-index:50;width:262px;
+  background:#0c1420;border:1px solid var(--line2);border-radius:11px;padding:7px;
+  box-shadow:0 18px 44px -14px rgba(0,0,0,.75)}
+.exportmenu.on{display:block}
+.exportmenu .emhead{font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink3);padding:7px 10px 5px}
+.exportmenu a{display:block;font-size:12.5px;color:var(--ink);padding:9px 10px;border-radius:7px;cursor:pointer;text-decoration:none}
+.exportmenu a:hover{background:var(--panel2);color:var(--amber)}
+.exportmenu .emnote{font-size:10.5px;color:var(--ink3);padding:8px 10px 4px;line-height:1.4;border-top:1px solid var(--line);margin-top:4px}
 .donut{width:100px;height:100px;border-radius:50%;flex:none;position:relative}
 .donut::after{content:"";position:absolute;inset:11px;border-radius:50%;background:radial-gradient(circle at 50% 34%,#101822,#0a0e14);border:1px solid var(--line)}
 .donut .in{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:1}
@@ -198,7 +212,19 @@ a{color:var(--cyan);text-decoration:none}
           <div class="p" id="hdrp"></div>
           <div class="sub" id="hdrsub"></div>
         </div>
-        <div class="donut" id="donut"><div class="in"><div class="n" id="donutn">0</div><div class="l">findings</div></div></div>
+        <div class="hdrright">
+          <div class="exportwrap">
+            <button class="exportbtn" id="exportbtn">↧ EXPORT ▾</button>
+            <div class="exportmenu" id="exportmenu">
+              <div class="emhead">Client report</div>
+              <a id="ex-html" target="_blank">Open full report (HTML)</a>
+              <a id="ex-pdf">Download full PDF</a>
+              <a id="ex-pdfc">Download concise PDF</a>
+              <div class="emnote">Concise caps giant response bodies on low-severity findings; critical &amp; high keep full evidence.</div>
+            </div>
+          </div>
+          <div class="donut" id="donut"><div class="in"><div class="n" id="donutn">0</div><div class="l">findings</div></div></div>
+        </div>
       </div>
       <div class="stats" id="stats"></div>
       <div id="livebar"></div>
@@ -283,6 +309,13 @@ function renderHeader(){
   document.querySelectorAll(".stat").forEach(el=>el.onclick=()=>{
     fSev=new Set([el.dataset.sev]);switchTab("findings");
   });
+  wireExport();
+}
+function wireExport(){
+  const id=encodeURIComponent(SCAN);
+  document.getElementById("ex-html").href="/api/report/"+id;
+  document.getElementById("ex-pdf").onclick=()=>{location.href="/api/report/"+id+"/pdf";document.getElementById("exportmenu").classList.remove("on");toast("building PDF…");};
+  document.getElementById("ex-pdfc").onclick=()=>{location.href="/api/report/"+id+"/pdf?concise=1";document.getElementById("exportmenu").classList.remove("on");toast("building concise PDF…");};
 }
 function renderTabs(){
   const cnt={overview:"",findings:OV.n_findings,surface:OV.urls_count,engines:(OV.engines||[]).length,
@@ -473,6 +506,8 @@ async function pollLive(){
     else{bar.innerHTML="";clearInterval(livtimer);selectScan(SCAN);}
   }catch(e){}
 }
+document.getElementById("exportbtn").onclick=e=>{e.stopPropagation();document.getElementById("exportmenu").classList.toggle("on");};
+document.addEventListener("click",e=>{if(!e.target.closest(".exportwrap"))document.getElementById("exportmenu").classList.remove("on");});
 loadScans().then(()=>{document.getElementById("boot").style.display="none";}).catch(e=>{document.getElementById("boot").textContent="failed to load ("+e.message+")";});
 setInterval(()=>{if(!fOpen)loadScans();},15000);
 </script></body></html>"""
