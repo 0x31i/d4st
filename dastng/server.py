@@ -156,13 +156,33 @@ def create_app(db_path: str | None = None):
             s = store.scan_overview(c, scan_id)
             return JSONResponse({"status": s["status"] if s else "unknown", "live": False})
 
-    @app.get("/api/report/{scan_id}", response_class=HTMLResponse)
-    def report(scan_id: str):
+    def _report_html(scan_id: str, client: str, ref: str, when: str, concise: bool) -> str:
         with con() as c:
             result = store.reconstruct_result(c, scan_id)
-            if not result:
-                raise HTTPException(404, "scan not found")
-            return build_report(result, target=result.get("target", ""))
+        if not result:
+            raise HTTPException(404, "scan not found")
+        rmeta = {k: v for k, v in dict(client=client, ref=ref, when=when).items() if v}
+        return build_report(result, target=result.get("target", ""), meta=rmeta, concise=concise)
+
+    @app.get("/api/report/{scan_id}", response_class=HTMLResponse)
+    def report(scan_id: str, client: str = Query(None), ref: str = Query(None),
+               when: str = Query(None), concise: bool = Query(False)):
+        return _report_html(scan_id, client, ref, when, concise)
+
+    @app.get("/api/report/{scan_id}/pdf")
+    def report_pdf(scan_id: str, client: str = Query(None), ref: str = Query(None),
+                   when: str = Query(None), concise: bool = Query(False)):
+        from fastapi.responses import Response
+
+        from .report import render_pdf
+        html = _report_html(scan_id, client, ref, when, concise)
+        try:
+            pdf = render_pdf(html)
+        except RuntimeError as e:
+            raise HTTPException(501, str(e))
+        fn = f"{scan_id}-report{'-concise' if concise else ''}.pdf"
+        return Response(pdf, media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="{fn}"'})
 
     return app
 

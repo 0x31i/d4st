@@ -425,23 +425,53 @@ def update(status: bool, components: tuple) -> None:
 
 
 @main.command()
-@click.argument("result_json")
+@click.argument("source")
 @click.option("--out", "-o", default="dastng_report.html", help="Output HTML report path.")
-@click.option("--target", "-t", default="", help="Target label for the report header.")
+@click.option("--target", "-t", default="", help="Target URL/host label.")
+@click.option("--client", default=None, help="Client / organisation name (cover page).")
+@click.option("--scope", default=None, help="Scope description (cover page).")
+@click.option("--window", default=None, help="Assessment window, e.g. '2026-08-14 -> 2026-08-15'.")
+@click.option("--prepared-by", "prepared_by", default=None, help="Preparer / firm (cover page).")
+@click.option("--ref", default=None, help="Engagement reference id.")
+@click.option("--logo", default=None, help="Logo path or data-URI for the cover.")
+@click.option("--when", default=None, help="Report date string (cover/footer).")
+@click.option("--from-db", "from_db", is_flag=True, default=False,
+              help="Treat SOURCE as a scan id in the SQLite store instead of a JSON path.")
+@click.option("--concise", is_flag=True, default=False,
+              help="Cap giant response bodies / raw output on medium/low/info findings "
+                   "(critical & high keep full evidence).")
 @click.option("--open", "open_it", is_flag=True, default=False, help="Open the report after writing.")
-def report(result_json: str, out: str, target: str, open_it: bool) -> None:
-    """Render a scan result JSON into a gorgeous self-contained HTML report (with request/response
-    proof, reasoning, and remediation per finding)."""
+def report(source: str, out: str, target: str, client: str | None, scope: str | None,
+           window: str | None, prepared_by: str | None, ref: str | None, logo: str | None,
+           when: str | None, from_db: bool, concise: bool, open_it: bool) -> None:
+    """Render a client-grade HTML report from a scan result JSON (or a store scan id with
+    --from-db). Light, print/PDF-ready (Cmd-P -> Save as PDF): cover page, executive summary,
+    scope & methodology, findings index, MAX-DETAIL findings with full request/response
+    evidence, and an appendix. No grade."""
     import json as _json
 
     from .report import build_report
-    with open(result_json) as fh:
-        result = _json.load(fh)
-    html = build_report(result, target=target)
-    with open(out, "w") as fh:
-        fh.write(html)
+    if from_db:
+        from . import store
+        con = store.connect()
+        result = store.reconstruct_result(con, source)
+        con.close()
+        if result is None:
+            raise click.ClickException(f"scan id '{source}' not found in the store")
+    else:
+        with open(source, encoding="utf-8") as fh:
+            result = _json.load(fh)
+    rmeta = {k: v for k, v in dict(client=client, scope=scope, window=window,
+             prepared_by=prepared_by, ref=ref, logo=logo, when=when).items() if v is not None}
+    html = build_report(result, target=target, meta=rmeta, concise=concise)
     n = len(result.get("findings", []))
-    console.print(f"[green]report[/green] -> {out}  ({n} findings)")
+    if out.lower().endswith(".pdf"):
+        from .report import render_pdf
+        render_pdf(html, out)
+    else:
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(html)
+    console.print(f"[green]report[/green] -> {out}  ({n} findings{', concise' if concise else ''})")
     if open_it:
         import webbrowser
         webbrowser.open(f"file://{os.path.abspath(out)}")
