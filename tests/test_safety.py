@@ -1,4 +1,4 @@
-from dastng.safety import LockoutMonitor, Politeness, is_auth_endpoint
+from d4st.safety import LockoutMonitor, Politeness, is_auth_endpoint
 
 
 def test_auth_endpoints_excluded():

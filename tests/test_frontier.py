@@ -1,4 +1,4 @@
-from dastng.orchestrator.frontier import Frontier, normalize_url
+from d4st.orchestrator.frontier import Frontier, normalize_url
 
 
 def test_normalize_dedup_by_param_names_not_values():

@@ -7,8 +7,8 @@ follows the redirect chain, and reports when the response actually redirects OFF
 the attacker URL. This is genuine capability for real client apps' naive/allowlist redirects,
 NOT a target-specific hack.
 
-Tool lives outside the venv (a git clone); point DASTNG_OPENREDIREX at it (default
-~/.dastng/tools/OpenRedireX). Payload file overridable via DASTNG_OPENREDIREX_PAYLOADS.
+Tool lives outside the venv (a git clone); point D4ST_OPENREDIREX at it (default
+~/.d4st/tools/OpenRedireX). Payload file overridable via D4ST_OPENREDIREX_PAYLOADS.
 """
 from __future__ import annotations
 
@@ -33,8 +33,8 @@ _FOUND = re.compile(r"\[FOUND\]\s+(?P<url>\S+)\s+redirects to\s+(?P<chain>.+)$")
 
 
 def _tool_dir() -> str:
-    return os.environ.get("DASTNG_OPENREDIREX",
-                          os.path.expanduser("~/.dastng/tools/OpenRedireX"))
+    return os.environ.get("D4ST_OPENREDIREX",
+                          os.path.expanduser("~/.d4st/tools/OpenRedireX"))
 
 
 @register
@@ -56,7 +56,7 @@ class OpenRedireXAdapter(ToolAdapter):
 
     def run(self, ctx: RunContext) -> AdapterResult:
         script = os.path.join(_tool_dir(), "openredirex.py")
-        payloads = os.environ.get("DASTNG_OPENREDIREX_PAYLOADS",
+        payloads = os.environ.get("D4ST_OPENREDIREX_PAYLOADS",
                                   os.path.join(_tool_dir(), "payloads.txt"))
         # Only feed URLs that carry a redirect-ish param — everything else is noise for this tool.
         urls = candidate_urls(ctx.seed_urls) or ctx.seed_urls or []

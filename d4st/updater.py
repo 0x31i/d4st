@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 
 def data_dir() -> str:
-    d = os.environ.get("DASTNG_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".dast-ng")
+    d = os.environ.get("D4ST_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".d4st")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -166,7 +166,7 @@ def freshness_report(warn_days: float = 14.0) -> list[str]:
     for name in UPDATERS:
         age = m.age_days(name)
         if age is None:
-            lines.append(f"  {name}: never updated  [run: dast-ng update]")
+            lines.append(f"  {name}: never updated  [run: d4st update]")
         else:
             tag = "  STALE" if age > warn_days else ""
             v = m.components[name].get("version", "")

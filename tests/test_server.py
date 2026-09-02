@@ -1,12 +1,12 @@
 """C2 read/write API over the store, via FastAPI TestClient against a temp DB."""
 import pytest
 
-from dastng import store
+from d4st import store
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from dastng.server import create_app  # noqa: E402
+from d4st.server import create_app  # noqa: E402
 from tests.test_store import _result  # reuse the synthetic engagement result
 
 
@@ -65,7 +65,7 @@ def test_report_rebuilds_from_store(client):
     html = client.get("/api/report/s1").text
     # client-deliverable structure, and NO scorecard (the only 'grade' mention is the
     # appendix disclaimer that no letter grade is assigned).
-    assert "dast-ng" in html
+    assert "d4st" in html
     assert "Executive Summary" in html and "Detailed Findings" in html and "References" in html
     assert "risk grade" not in html.lower() and "gA" not in html
 
@@ -77,6 +77,6 @@ def test_live_endpoint(client, tmp_path, monkeypatch):
     # a progress checkpoint is streamed back verbatim
     pf = tmp_path / "prog.json"
     pf.write_text('{"status":"in-progress","last_stage":"zap","n_findings":4,"elapsed_s":42}')
-    monkeypatch.setenv("DASTNG_PROGRESS_FILE", str(pf))
+    monkeypatch.setenv("D4ST_PROGRESS_FILE", str(pf))
     r = client.get("/api/scans/s1/live").json()
     assert r["status"] == "in-progress" and r["n_findings"] == 4

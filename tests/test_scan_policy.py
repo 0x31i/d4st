@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dastng.safety import get_policy, is_state_changing
+from d4st.safety import get_policy, is_state_changing
 
 
 def test_state_changing_detection():

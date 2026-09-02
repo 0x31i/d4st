@@ -1,6 +1,6 @@
 # Core-subset workflow: the DVWA-vs-Burp pilot pipeline.
 # Discovery stages feed the shared frontier; detection stages consume the converged
-# frontier. Tools referenced here must be registered adapters (dastng/orchestrator/adapters).
+# frontier. Tools referenced here must be registered adapters (d4st/orchestrator/adapters).
 #
 # The active tools (nuclei -dast, zap, sqlmap, dalfox, commix) emit attack traffic and are
 # skipped unless the run authorizes them (--allow-active). ZAP is both discovery + detection
