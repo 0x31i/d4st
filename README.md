@@ -6,10 +6,9 @@ a single captured session, deduplicates and verifies findings, and reports cover
 with commercial DAST at open-source cost.
 
 Designed as an ASM-NG satellite: it is its own standalone program (no SpiderFoot / ASM-NG
-runtime dependency) and can optionally POST findings to [ASM-NG](https://github.com/0x31i/asm-ng)
-via its REST API for a unified view.
+runtime dependency) and can optionally POST findings via its REST API for a unified view.
 
-## Why
+## Purpose
 
 Replaces recurring Burp Suite Enterprise authenticated scanning with a self-hosted pipeline
 that runs inside the client network. See `docs/` and the design plan for the full rationale
