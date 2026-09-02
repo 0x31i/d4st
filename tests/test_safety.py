@@ -8,7 +8,7 @@ def test_auth_endpoints_excluded():
 
 
 def test_non_auth_not_excluded():
-    for u in ["https://h/vulnerabilities/sqli/", "https://h/api/patient/search",
+    for u in ["https://h/vulnerabilities/sqli/", "https://h/api/records/search",
               "https://h/app/common/RecordSearch.html"]:
         assert not is_auth_endpoint(u), u
 
