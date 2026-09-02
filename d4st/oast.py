@@ -8,7 +8,7 @@ simpler and needs no internet egress.
 
 Each probe embeds a unique token in the callback path; a hit on that token proves the target
 fetched attacker-controlled content. Used by the RFI adapter and available to nuclei via
-DASTNG_INTERACTSH_SERVER for the real-engagement path.
+D4ST_INTERACTSH_SERVER for the real-engagement path.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # A token the included body carries, so an RFI that reflects the include is also caught in-band.
-OAST_BODY_TOKEN = "DASTNG_OAST_9f3a2c"
+OAST_BODY_TOKEN = "D4ST_OAST_9f3a2c"
 
 
 class _Handler(BaseHTTPRequestHandler):

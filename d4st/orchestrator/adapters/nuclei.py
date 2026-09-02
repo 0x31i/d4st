@@ -44,7 +44,7 @@ class NucleiAdapter(ToolAdapter):
                 args += ["-t", os.path.expanduser(tdir)]
         # interactsh (OAST) for blind/out-of-band detection. Self-hosted server via env, else
         # nuclei uses its default hosted server.
-        iserver = os.environ.get("DASTNG_INTERACTSH_SERVER")
+        iserver = os.environ.get("D4ST_INTERACTSH_SERVER")
         if iserver:
             args += ["-iserver", iserver]
 

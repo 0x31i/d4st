@@ -71,7 +71,7 @@ def load_oracle(name_or_path: str) -> Oracle:
             return _from_dict(yaml.safe_load(fh))
     fname = name_or_path if name_or_path.endswith(".yaml") else f"{name_or_path}.yaml"
     try:
-        text = resources.files("dastng.scoring.oracles").joinpath(fname).read_text(encoding="utf-8")
+        text = resources.files("d4st.scoring.oracles").joinpath(fname).read_text(encoding="utf-8")
         return _from_dict(yaml.safe_load(text))
     except (FileNotFoundError, ModuleNotFoundError, TypeError, AttributeError):
         pass

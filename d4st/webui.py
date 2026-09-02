@@ -1,4 +1,4 @@
-"""The dast-ng web console single-page app (served by server.py at /).
+"""The d4st web console single-page app (served by server.py at /).
 
 Vanilla JS against the DB-backed JSON API (no build step, no framework). Terminal/hacker
 aesthetic: deep ink ground, amber accent, monospace, severity stripes. NO grade — this is an
@@ -9,7 +9,7 @@ See docs/console-build-plan.md.
 
 INDEX_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>dast-ng console</title>
+<title>d4st console</title>
 <style>
 :root{
   --bg:#070a0f;--bg2:#0b0f16;--panel:#0d131c;--panel2:#111925;--line:#1c2733;--line2:#243243;
@@ -199,7 +199,7 @@ a{color:var(--cyan);text-decoration:none}
 </style></head><body>
 <div class="app">
   <aside class="side">
-    <div class="logo"><div class="b"><span class="dot"></span>dast-ng</div><div class="s">observability console</div></div>
+    <div class="logo"><div class="b"><span class="dot"></span>d4st</div><div class="s">observability console</div></div>
     <div class="scanhead"><span>Scans</span><span id="scancount" style="color:var(--ink3)"></span></div>
     <div class="scans" id="scans"></div>
     <div class="sidefoot"><span id="dbinfo">SQLite</span><span id="portinfo"></span></div>
@@ -268,7 +268,7 @@ async function loadScans(){
     return `<div class="scanitem${s.id===SCAN?" sel":""}" data-id="${esc(s.id)}">
       <div class="t"><span class="sevmark m-${sc(worst)}"></span><span class="nm">${esc(s.id)} · ${esc(host(s.target))}</span></div>
       <div class="meta">${badge}${wsev}<span>${ago(s.created_at)}</span></div></div>`;
-  }).join("")||'<div class="empty">no scans ingested yet<br><span style="color:var(--ink3)">run: dast-ng ingest scan.json</span></div>';
+  }).join("")||'<div class="empty">no scans ingested yet<br><span style="color:var(--ink3)">run: d4st ingest scan.json</span></div>';
   document.querySelectorAll(".scanitem").forEach(el=>el.onclick=()=>selectScan(el.dataset.id));
   if(!SCAN&&scans.length)selectScan(scans[0].id);
   return scans;

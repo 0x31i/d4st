@@ -1,8 +1,8 @@
-"""dast-ng web console — DB-backed FastAPI API over the SQLite observability store.
+"""d4st web console — DB-backed FastAPI API over the SQLite observability store.
 
-    dastng serve [--db ~/.dastng/dastng.db] [--port 8810]
+    d4st serve [--db ~/.d4st/d4st.db] [--port 8810]
 
-The store is populated by `dast-ng ingest` (backfill) and auto-ingested at scan-end. This
+The store is populated by `d4st ingest` (backfill) and auto-ingested at scan-end. This
 module only reads/writes the analyst columns; scan data is immutable. There is no grade — the
 console is an observability tool, not a scorecard. See docs/console-build-plan.md.
 
@@ -34,7 +34,7 @@ def create_app(db_path: str | None = None):
     from fastapi import Body, FastAPI, HTTPException, Query
     from fastapi.responses import HTMLResponse, JSONResponse
 
-    app = FastAPI(title="dast-ng console", docs_url=None, redoc_url=None)
+    app = FastAPI(title="d4st console", docs_url=None, redoc_url=None)
     dbp = store.db_path(db_path)
 
     def con():
@@ -141,12 +141,12 @@ def create_app(db_path: str | None = None):
 
     @app.get("/api/scans/{scan_id}/live")
     def live(scan_id: str):
-        """Live-scan feed: if an in-progress checkpoint file exists (DASTNG_PROGRESS_FILE,
+        """Live-scan feed: if an in-progress checkpoint file exists (D4ST_PROGRESS_FILE,
         written by run_engagement after every stage), return it so the console can stream
         stages/findings/timeline in real time. Otherwise report the stored terminal status."""
         import json as _j
         import os as _os
-        pf = _os.environ.get("DASTNG_PROGRESS_FILE")
+        pf = _os.environ.get("D4ST_PROGRESS_FILE")
         if pf and _os.path.exists(pf):
             try:
                 return JSONResponse(_j.loads(open(pf, encoding="utf-8").read()))
@@ -190,5 +190,5 @@ def create_app(db_path: str | None = None):
 def run_server(host: str = "127.0.0.1", port: int = 8810, db_path: str | None = None):
     import uvicorn
     dbp = store.db_path(db_path)
-    print(f"dast-ng console  ->  http://{host}:{port}   (db: {dbp})")
+    print(f"d4st console  ->  http://{host}:{port}   (db: {dbp})")
     uvicorn.run(create_app(dbp), host=host, port=port, log_level="warning")

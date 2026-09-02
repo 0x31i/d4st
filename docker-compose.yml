@@ -1,33 +1,33 @@
-# dast-ng — one all-in-one scanner container (core subset baked in).
+# d4st — one all-in-one scanner container (core subset baked in).
 #
-# Update loop (no rebuild): the dast-ng SOURCE is bind-mounted live, so a fix is just
+# Update loop (no rebuild): the d4st SOURCE is bind-mounted live, so a fix is just
 #   git pull && docker compose restart
 # Only a NEW dependency or a tool-binary change needs `docker compose build`.
 #
 # Run a scan (from the repo dir):
 #   docker compose up -d
-#   docker compose exec dastng dast-ng selftest                 # verify the toolchain
-#   docker compose exec dastng dast-ng auth capture -p app -b https://dev.client.tld -o sessions/app.json --headed
-#   docker compose exec dastng dast-ng engagement -t https://dev.client.tld -s sessions/app.json -o results/app.json
-#   # console:  http://localhost:8810   (report:  dast-ng report app --from-db ...)
+#   docker compose exec d4st d4st selftest                 # verify the toolchain
+#   docker compose exec d4st d4st auth capture -p app -b https://dev.client.tld -o sessions/app.json --headed
+#   docker compose exec d4st d4st engagement -t https://dev.client.tld -s sessions/app.json -o results/app.json
+#   # console:  http://localhost:8810   (report:  d4st report app --from-db ...)
 
 services:
-  dastng:
+  d4st:
     # Prebuilt image from GitHub Container Registry — `docker compose pull` gets it, no build.
     # `build: .` stays as a local fallback (`docker compose build`) for tool/Dockerfile work.
-    image: ghcr.io/0x31i/dast-ng:core
+    image: ghcr.io/0x31i/d4st:core
     build: .
-    container_name: dastng
+    container_name: d4st
     restart: unless-stopped
     environment:
       # SQLite observability store (persisted on the host via the ./data mount)
-      DASTNG_DB: /data/dastng.db
+      D4ST_DB: /data/d4st.db
       # Read-only verify seatbelt egress allow-list (the box's own IP on the client VPN)
-      DASTNG_VERIFY_EGRESS_IPS: "${DASTNG_VERIFY_EGRESS_IPS:-}"
+      D4ST_VERIFY_EGRESS_IPS: "${D4ST_VERIFY_EGRESS_IPS:-}"
       # OAST/interactsh server (blank = the hosted default)
-      DASTNG_INTERACTSH_SERVER: "${DASTNG_INTERACTSH_SERVER:-}"
+      D4ST_INTERACTSH_SERVER: "${D4ST_INTERACTSH_SERVER:-}"
     volumes:
-      - ./dastng:/app/dastng      # LIVE code — git pull + restart updates the tool, no rebuild
+      - ./d4st:/app/d4st      # LIVE code — git pull + restart updates the tool, no rebuild
       - ./data:/data              # SQLite store (scans + findings)
       - ./runs:/app/runs          # seed URL lists
       - ./sessions:/app/sessions  # captured auth sessions

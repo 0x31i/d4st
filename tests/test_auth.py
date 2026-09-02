@@ -1,9 +1,9 @@
 import pyotp
 
-from dastng.auth.profile import load_profile
-from dastng.auth.session import Session
-from dastng.auth.totp import totp_now
-from dastng.auth.translators import (
+from d4st.auth.profile import load_profile
+from d4st.auth.session import Session
+from d4st.auth.totp import totp_now
+from d4st.auth.translators import (
     dalfox_cookie,
     header_args,
     nuclei_secrets,

@@ -29,11 +29,11 @@ from urllib.parse import quote, urljoin, urlsplit
 
 
 def _bootstrap_tool_path() -> None:
-    """Put the dast-ng tool locations on PATH so every adapter's shutil.which(binary) resolves,
-    however the engagement was launched: ~/.dastng/bin (wrapper scripts + symlinks for git/venv
+    """Put the d4st tool locations on PATH so every adapter's shutil.which(binary) resolves,
+    however the engagement was launched: ~/.d4st/bin (wrapper scripts + symlinks for git/venv
     tools), ~/go/bin (Go tools like crlfuzz), and the active venv's bin (pip console scripts).
-    Override the tool-bin dir with DASTNG_TOOLS_BIN."""
-    extra = [os.environ.get("DASTNG_TOOLS_BIN", os.path.expanduser("~/.dastng/bin")),
+    Override the tool-bin dir with D4ST_TOOLS_BIN."""
+    extra = [os.environ.get("D4ST_TOOLS_BIN", os.path.expanduser("~/.d4st/bin")),
              os.path.expanduser("~/go/bin"), os.path.dirname(sys.executable),
              "/opt/homebrew/bin", "/usr/local/bin"]   # standard CLI-tool dirs (nuclei/katana/...)
     cur = os.environ.get("PATH", "").split(os.pathsep)
@@ -217,10 +217,10 @@ def blind_crawl(target: str, cookie: str, depth: int = 3, duration: str = "3m",
     server-rendered app (JSP/PHP/ASP) whose links are already in the raw HTML.
 
     The `headless` decision comes from the fingerprint stage (SPA => True, MPA => False).
-    Precedence: explicit DASTNG_HEADLESS_CRAWL env (operator override) > `headless` arg
+    Precedence: explicit D4ST_HEADLESS_CRAWL env (operator override) > `headless` arg
     (fingerprint) > legacy default (on). Pass `seeds` to crawl several entry roots (used when
     the landing page is link-poor and the fingerprint discovered richer entry points)."""
-    env = os.environ.get("DASTNG_HEADLESS_CRAWL")
+    env = os.environ.get("D4ST_HEADLESS_CRAWL")
     if env is not None:
         use_headless = env != "0"                # operator override wins
     elif headless is not None:
@@ -305,7 +305,7 @@ def discover_api_surface(target: str, urls: list[str], cookie: str) -> dict:
         if m:
             jwt = m.group(0)
             break
-    jwt = jwt or os.environ.get("DASTNG_JWT")
+    jwt = jwt or os.environ.get("D4ST_JWT")
     if jwt:
         surface["jwt"] = jwt
     return surface
@@ -403,7 +403,7 @@ def _json_body_props(op: dict) -> list[str]:
     return props
 
 
-def _sample_value(name: str, tag: str = "dastng") -> str:
+def _sample_value(name: str, tag: str = "d4st") -> str:
     n = name.lower()
     if "email" in n:
         return f"{tag}@example.com"
@@ -522,7 +522,7 @@ def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[
             continue
         if any(w in str(path).lower() for w in ("login", "signin", "sign-in", "authenticate", "token")):
             continue
-        uname = f"dastngma{int(time.time()) % 100000}{len(out)}"
+        uname = f"d4stma{int(time.time()) % 100000}{len(out)}"
         body = {p: (uname if ("user" in p.lower() or "name" in p.lower()) else _sample_value(p, uname))
                 for p in props}
         body.update({"admin": True, "is_admin": True, "role": "admin"})
@@ -564,7 +564,7 @@ def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[
         for m in re.finditer(r'"(?:username|user|name|login|id|email)"\s*:\s*"([^"]{1,64})"',
                              json.dumps(data) if not isinstance(data, str) else data):
             others.append(m.group(1))
-    others = [o for o in dict.fromkeys(others) if "dastng" not in o.lower()][:4]
+    others = [o for o in dict.fromkeys(others) if "d4st" not in o.lower()][:4]
     _bola_done = set()
     for path, ops in paths.items():
         if "{" not in str(path) or not isinstance(ops, dict):
@@ -1289,7 +1289,7 @@ def run_nuclei_dast(urls: list[str], cookie: str, politeness=None) -> list[Findi
         args += politeness.nuclei_flags()
     if cookie:
         args += ["-H", f"Cookie: {cookie}"]
-    _run(args, timeout=int(os.environ.get("DASTNG_NUCLEI_TIMEOUT", "5400") or "5400"))
+    _run(args, timeout=int(os.environ.get("D4ST_NUCLEI_TIMEOUT", "5400") or "5400"))
     try:  # read whatever nuclei streamed to disk (complete OR timeout-truncated)
         with open(out_file, encoding="utf-8", errors="ignore") as _fh:
             out = _fh.read()
@@ -1378,7 +1378,7 @@ def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[
     if cookie:
         args += ["-H", f"Cookie: {cookie}"]
     # 8k+ templates over a large frontier needs a real budget; honor the operator override.
-    _to = int(os.environ.get("DASTNG_NUCLEI_TIMEOUT", "3600") or "3600")
+    _to = int(os.environ.get("D4ST_NUCLEI_TIMEOUT", "3600") or "3600")
     out = _run(args, timeout=_to)
     findings: list[Finding] = []
     for line in out.splitlines():
@@ -1422,7 +1422,7 @@ def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[
 # requests /.env, gets the SPA index (200), and reports a leak. This is the same auto-calibration
 # real content scanners do (ffuf -ac, feroxbuster --filter-similar): fingerprint the not-found
 # response, then drop findings whose URL just returns that page.
-_SOFT404_RANDOM = ("dastng-nx-9q2z7x1a4k", "dastng-nx-4k8w3v6bqp.bak")
+_SOFT404_RANDOM = ("d4st-nx-9q2z7x1a4k", "d4st-nx-4k8w3v6bqp.bak")
 # Findings that ASSERT a file/path exists (soft-404-prone). Header/behaviour findings (CORS, CSP,
 # missing-header, SQLi, XSS) are NOT existence claims and must never be dropped by this guard.
 _EXISTENCE_MARKERS = (
@@ -1641,9 +1641,9 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
     # Parallelise across targets: the checks are network-I/O-bound, so a thread pool turns the
     # (formerly sequential, rate-limited) probe stage from hours into minutes at benchmark scale.
     # Concurrency is bounded by the policy (production-safe stays low, so fragile targets are not
-    # hammered), overridable via DASTNG_PROBE_WORKERS. Results are collected lock-free from each
+    # hammered), overridable via D4ST_PROBE_WORKERS. Results are collected lock-free from each
     # worker's return value.
-    _workers = int(os.environ.get("DASTNG_PROBE_WORKERS", "0") or "0") or \
+    _workers = int(os.environ.get("D4ST_PROBE_WORKERS", "0") or "0") or \
         (max(4, getattr(politeness, "concurrency", 10)) if politeness else 10)
     out: list[Finding] = []
     _csrf_hits: list[tuple[str, str, str]] = []
@@ -1749,17 +1749,17 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
     opts = {"cookie": cookie, "inject_cap": 0, "timeout": _to,
             "sqlmap_level": _lvl,
             # Owned-lab depth lever: safe-deep defaults risk 1 (safe payloads only) for live
-            # client infra. DASTNG_SQLMAP_RISK lets an operator raise it (2 adds OR-based, 3 adds
+            # client infra. D4ST_SQLMAP_RISK lets an operator raise it (2 adds OR-based, 3 adds
             # heavy time-based) on an authorized owned/benchmark target, without changing the
             # safe default. The adaptive health monitor still backs off if the target struggles.
-            "sqlmap_risk": int(os.environ.get("DASTNG_SQLMAP_RISK", policy.sqlmap_risk)),
+            "sqlmap_risk": int(os.environ.get("D4ST_SQLMAP_RISK", policy.sqlmap_risk)),
             "sqli_level": _lvl, "lfi_deep": policy.lfi_deep, "js_dir": js_dir,
             "workers": max(1, _pol.concurrency), "delay_ms": _pol.delay_ms,
             "rps": _pol.rps,
             # RFI/SSRF out-of-band detection: interface the target can reach back to (a same-LAN
             # IP for a self-hosted OastServer, or a public interactsh host). Without it, rfi_oast
-            # falls back to in-band reflection only. Set via DASTNG_OAST_HOST_IP.
-            "oast_host_ip": os.environ.get("DASTNG_OAST_HOST_IP", "")}
+            # falls back to in-band reflection only. Set via D4ST_OAST_HOST_IP.
+            "oast_host_ip": os.environ.get("D4ST_OAST_HOST_IP", "")}
     # Feed the discovered API surface to the API adapters (schemathesis/jwt_tool/graphw00f) — the
     # inputs they need but nothing else populates, which is why they always no-opped. Only present
     # keys are set, so a classic app still cleanly reports "not applicable".
@@ -1849,7 +1849,7 @@ class _Progress:
     """Incremental checkpoint writer: after every stage, atomically rewrite a JSON file with
     everything found so far + a stage timeline. So a scan that is killed / crashes / hangs still
     leaves an observable, up-to-date record of what it accomplished (instead of losing the whole
-    in-memory run). Enabled by DASTNG_PROGRESS_FILE. Cheap (a few hundred findings), best-effort
+    in-memory run). Enabled by D4ST_PROGRESS_FILE. Cheap (a few hundred findings), best-effort
     (never raises into the scan)."""
 
     def __init__(self, path: str):
@@ -1948,10 +1948,10 @@ class SessionKeeper:
 
 
 def _env_reauth():
-    """Build a reauth callable from DASTNG_REAUTH_CMD: a shell command that (re)authenticates and
+    """Build a reauth callable from D4ST_REAUTH_CMD: a shell command that (re)authenticates and
     prints a fresh 'name=value; ...' cookie string as its LAST stdout line. Decouples re-auth from
     the engagement — the operator supplies any login flow (form login, script, Playwright)."""
-    cmd = os.environ.get("DASTNG_REAUTH_CMD")
+    cmd = os.environ.get("D4ST_REAUTH_CMD")
     if not cmd:
         return None
 
@@ -1989,19 +1989,19 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # unless a probe URL + reauth are supplied (params or env), so back-compat is preserved.
     _session = SessionKeeper(
         cookie,
-        probe_url=session_probe or os.environ.get("DASTNG_SESSION_PROBE_URL", ""),
-        ok_marker=session_marker or os.environ.get("DASTNG_SESSION_MARKER", ""),
+        probe_url=session_probe or os.environ.get("D4ST_SESSION_PROBE_URL", ""),
+        ok_marker=session_marker or os.environ.get("D4ST_SESSION_MARKER", ""),
         reauth=reauth or _env_reauth())
     if _session.enabled:
         print(f"[session] keeper armed (probe={_session.probe_url})", flush=True)
         cookie = _session.ensure("preflight")
     # Rate override for robust targets (owned labs / benchmark apps with thousands of cases):
     # safe-deep's 2-rps throttle is right for fragile client prod, but it makes the active
-    # detectors (nuclei-dast/dalfox) time out over a huge frontier. DASTNG_RPS / DASTNG_CONCURRENCY
+    # detectors (nuclei-dast/dalfox) time out over a huge frontier. D4ST_RPS / D4ST_CONCURRENCY
     # let an operator raise the rate for a target that can take it, WITHOUT changing depth
     # (L5 / full payloads / full roster stay the same). The adaptive health monitor still backs
     # off if the target starts struggling, so this is a ceiling, not a foot-gun.
-    _rps_ov, _conc_ov = os.environ.get("DASTNG_RPS"), os.environ.get("DASTNG_CONCURRENCY")
+    _rps_ov, _conc_ov = os.environ.get("D4ST_RPS"), os.environ.get("D4ST_CONCURRENCY")
     if _rps_ov or _conc_ov:
         import dataclasses
         pol = dataclasses.replace(pol, rps=float(_rps_ov or pol.rps),
@@ -2067,8 +2067,8 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     _ferox_rate = max(10, int(pol.rps * pol.concurrency * 2)) if pol else 15
     _dopts = {"cookie": cookie, "harvest_rounds": 3, "ferox_depth": 2, "timeout": 1500,
               "ferox_threads": _ferox_threads, "ferox_rate": _ferox_rate}
-    if os.environ.get("DASTNG_FEROX_WORDLIST"):   # operator override (e.g. a fast list)
-        _dopts["ferox_wordlist"] = os.environ["DASTNG_FEROX_WORDLIST"]
+    if os.environ.get("D4ST_FEROX_WORDLIST"):   # operator override (e.g. a fast list)
+        _dopts["ferox_wordlist"] = os.environ["D4ST_FEROX_WORDLIST"]
     for _tool, _seeds in (("linkharvest", urls), ("feroxbuster", None)):
         try:
             _r = REGISTRY[_tool].run(_RC(target=target, seed_urls=_seeds or [], options=_dopts))
@@ -2103,9 +2103,9 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     findings: list[Finding] = []
 
     # Incremental progress checkpoint (crash-survivable observability): after each stage, rewrite
-    # DASTNG_PROGRESS_FILE with everything found so far + a stage timeline. So even a killed/hung
+    # D4ST_PROGRESS_FILE with everything found so far + a stage timeline. So even a killed/hung
     # scan leaves a readable record of what it got done.
-    _prog = _Progress(os.environ.get("DASTNG_PROGRESS_FILE", ""))
+    _prog = _Progress(os.environ.get("D4ST_PROGRESS_FILE", ""))
     _prog.update("crawl+discovery", findings, urls=len(urls), targets=len(targets),
                  note=f"{len(active_targets)} active targets")
 
@@ -2124,11 +2124,11 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
 
     # Per-parameter subprocess tools (sqlmap/ghauri/commix in the roster) cost one process per
     # target; on a benchmark app with thousands of parameterized cases (WAVSEP) that is days of
-    # runtime. DASTNG_INJECT_CAP bounds how many params those heavy tools attack (0 = unbounded).
+    # runtime. D4ST_INJECT_CAP bounds how many params those heavy tools attack (0 = unbounded).
     # The SCALABLE detectors that give recall — nuclei-dast (batch) + dalfox (batch) +
     # deterministic probe_targets — still run over ALL cases, so recall is not capped, only the
     # slow exploitation depth is. The cap is surfaced in the summary (never a silent truncation).
-    _inject_cap = int(os.environ.get("DASTNG_INJECT_CAP", "0") or "0")
+    _inject_cap = int(os.environ.get("D4ST_INJECT_CAP", "0") or "0")
 
     # 1) FAST detection breadth first — capture the full matrix while the target is certainly
     #    alive, BEFORE the heavy sqlmap depth pass (section 5). Ordering matters: sqlmap L5 is
@@ -2194,7 +2194,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         # real apps (no cap) still get every target.
         _nd_targets = [t.url for t in active_targets if t.method == "GET" and t.params]
         if _inject_cap:
-            _ncap = int(os.environ.get("DASTNG_NUCLEI_CAP", "400") or "400")
+            _ncap = int(os.environ.get("D4ST_NUCLEI_CAP", "400") or "400")
             _nd_targets = _stratified_sample(_nd_targets, _ncap)
         findings += run_nuclei_dast(_nd_targets, cookie, politeness=pol)
         _prog.update("nuclei-dast", findings, urls=len(urls), targets=len(targets))
@@ -2207,7 +2207,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             _safe_urls = [t.url for t in active_targets if t.params] or \
                 [t.url for t in active_targets]
             findings += run_roster(target, _safe_urls, cookie, policy,
-                                   js_dir=os.environ.get("DASTNG_JS_DIR", ""),
+                                   js_dir=os.environ.get("D4ST_JS_DIR", ""),
                                    level_override=health.sqlmap_level(policy.sqlmap_level),
                                    health=health, per_url_cap=_inject_cap, progress=_prog,
                                    base_findings=list(findings), api_surface=_api)
@@ -2344,13 +2344,13 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         else:
             import tempfile as _tf
             try:
-                _zap_to = int(os.environ.get("DASTNG_ZAP_TIMEOUT", "2400") or "2400")
+                _zap_to = int(os.environ.get("D4ST_ZAP_TIMEOUT", "2400") or "2400")
                 # Feed ZAP the CONVERGED FRONTIER (default) so it active/passive-scans the exact
                 # surface the native stack discovered — no reliance on ZAP's own spider/browser.
-                # seed_url is only used by the legacy spider fallback (DASTNG_ZAP_MODE=spider).
+                # seed_url is only used by the legacy spider fallback (D4ST_ZAP_MODE=spider).
                 _zap_seed = (_seeds[0] if _seeds else "")
                 _zap_before = len(findings)
-                findings += run_zap(target, cookie, _tf.mkdtemp(prefix="dastng-zap-"),
+                findings += run_zap(target, cookie, _tf.mkdtemp(prefix="d4st-zap-"),
                                     timeout=_zap_to, seed_url=_zap_seed, frontier=urls)
                 zap_ran = True
                 zap_note = f"ran ({len(findings) - _zap_before} findings)"
@@ -2479,14 +2479,14 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
     """OWASP ZAP as a SECOND ENGINE over the converged frontier. Requires docker + the
     zaproxy image.
 
-    Default mode ('frontier'): feed ZAP the exact URL set dast-ng already discovered (katana +
+    Default mode ('frontier'): feed ZAP the exact URL set d4st already discovered (katana +
     link-harvester + feroxbuster + JS-extracted routes) via a ZAP Automation Framework plan
     (import -> passive scan -> active scan -> JSON report). ZAP then attacks the same surface the
     native stack does, WITHOUT depending on ZAP's own spider or the container's broken headless
     browser (the AJAX spider fails as 'Failed to configure ZAP extension on browser launch').
     This is the reliable way to make ZAP process everything the tool found, every scan.
 
-    Set DASTNG_ZAP_MODE=spider to fall back to the legacy zap-full-scan self-crawl (seed_url
+    Set D4ST_ZAP_MODE=spider to fall back to the legacy zap-full-scan self-crawl (seed_url
     then points ZAP at a link-rich entry). frontier is the URL list; seed_url is the spider seed.
     """
     import os
@@ -2498,8 +2498,8 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
     # shared root mounts EMPTY inside the container ("Cannot access /zap/wrk/plan.yaml") and the
     # report is written container-side to a path that never appears on the host => run_zap saw no
     # zap.json and returned 0. THIS was the real ZAP 0-findings cause. Force the working dir under
-    # a shared base (default ~/.dastng/zap, overridable) regardless of the out_dir we were given.
-    _base = os.environ.get("DASTNG_ZAP_WORKDIR", os.path.expanduser("~/.dastng/zap"))
+    # a shared base (default ~/.d4st/zap, overridable) regardless of the out_dir we were given.
+    _base = os.environ.get("D4ST_ZAP_WORKDIR", os.path.expanduser("~/.d4st/zap"))
     os.makedirs(_base, exist_ok=True)
     out_dir = tempfile.mkdtemp(prefix="zap-", dir=_base)
     report_path = os.path.join(out_dir, "zap.json")
@@ -2517,7 +2517,7 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         "-config", "scanner.threadPerHost=2",       # fragile single-process targets
         "-config", "connection.timeoutInSecs=30",
     ]
-    mode = os.environ.get("DASTNG_ZAP_MODE", "frontier")
+    mode = os.environ.get("D4ST_ZAP_MODE", "frontier")
 
     def _parse() -> list[Finding]:
         if not os.path.exists(report_path):
@@ -2527,7 +2527,7 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
             # 0-findings result. Raise so the caller records ZAP as failed, not "ran", instead of
             # a silent gap that makes the scan look clean.
             raise RuntimeError("ZAP did not complete (killed/crashed before writing its report — "
-                               "raise DASTNG_ZAP_TIMEOUT or check container memory)")
+                               "raise D4ST_ZAP_TIMEOUT or check container memory)")
         with open(report_path, encoding="utf-8") as fh:
             report = json.load(fh)
         out: list[Finding] = []
@@ -2599,7 +2599,7 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
             _names = tuple(sorted(kv.split('=')[0] for kv in _pp.query.split('&') if kv))
             _byep.setdefault((_pp.path, _names), u)
         feed = list(_byep.values()) or [zt]
-        cap = int(os.environ.get("DASTNG_ZAP_URL_CAP", "150") or "150")
+        cap = int(os.environ.get("D4ST_ZAP_URL_CAP", "150") or "150")
         if len(feed) > cap:
             feed = _stratified_sample(feed, cap)
         with open(os.path.join(out_dir, "frontier.txt"), "w", encoding="utf-8") as fh:
@@ -2608,22 +2608,22 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         # DEPTH vs KILL are now separate concerns (a slow-but-progressing scan must NOT be dropped):
         #  - budget = maxScanDurationInMins = ZAP's OWN graceful depth cap. It stops active-scanning
         #    at this and then WRITES ITS REPORT. Default 0 = unbounded (scan until the ruleset
-        #    finishes, however long) — override with DASTNG_ZAP_ACTIVE_MINS to cap depth.
+        #    finishes, however long) — override with D4ST_ZAP_ACTIVE_MINS to cap depth.
         #  - the process is NOT hard-killed on a fixed clock; it runs under a STALL WATCHDOG that
-        #    only kills ZAP if it produces no output for DASTNG_ZAP_STALL secs (genuinely stuck) or
-        #    exceeds the DASTNG_ZAP_TIMEOUT absolute backstop. So "ZAP is taking a while" is fine;
+        #    only kills ZAP if it produces no output for D4ST_ZAP_STALL secs (genuinely stuck) or
+        #    exceeds the D4ST_ZAP_TIMEOUT absolute backstop. So "ZAP is taking a while" is fine;
         #    only "ZAP is broken/hung" ends it.
-        budget = int(os.environ.get("DASTNG_ZAP_ACTIVE_MINS", "0") or "0")   # 0 = unbounded
-        _passive_min = int(os.environ.get("DASTNG_ZAP_PASSIVE_MINS", "8") or "8")
+        budget = int(os.environ.get("D4ST_ZAP_ACTIVE_MINS", "0") or "0")   # 0 = unbounded
+        _passive_min = int(os.environ.get("D4ST_ZAP_PASSIVE_MINS", "8") or "8")
         # Attack strength: 'medium' is right for a huge frontier (WAVSEP); a small target can
-        # afford 'high' for maximum thoroughness. DASTNG_ZAP_STRENGTH overrides.
-        strength = os.environ.get("DASTNG_ZAP_STRENGTH", "medium").lower()
+        # afford 'high' for maximum thoroughness. D4ST_ZAP_STRENGTH overrides.
+        strength = os.environ.get("D4ST_ZAP_STRENGTH", "medium").lower()
         if strength not in ("low", "medium", "high", "insane"):
             strength = "medium"
         scope_re = f"{_p.scheme}://{re.escape(_p.netloc)}.*"
         plan = f"""env:
   contexts:
-    - name: dastng
+    - name: d4st
       urls: ['{zt}']
       includePaths: ['{scope_re}']
       excludePaths: ['.*logout.*', '.*signout.*', '.*/reset.*']
@@ -2638,7 +2638,7 @@ jobs:
     parameters: {{maxDuration: {_passive_min}}}
   - type: activeScan
     parameters:
-      context: dastng
+      context: d4st
       maxScanDurationInMins: {budget}
     policyDefinition:
       defaultStrength: {strength}
@@ -2651,15 +2651,15 @@ jobs:
 """
         with open(os.path.join(out_dir, "plan.yaml"), "w", encoding="utf-8") as fh:
             fh.write(plan)
-        _stall = int(os.environ.get("DASTNG_ZAP_STALL", "1200") or "1200")  # 20min silence+idle
+        _stall = int(os.environ.get("D4ST_ZAP_STALL", "1200") or "1200")  # 20min silence+idle
         print(f"[zap] frontier mode: feeding {len(feed)} URL(s) to ZAP "
               f"(active depth: {'unbounded' if not budget else str(budget) + ' min'}; "
               f"stall-kill {_stall}s; backstop {timeout}s)", flush=True)
         # ZAP's ergonomic default heap is ~25% of visible RAM (~1.5G on a 6G VM) — too small to
         # active-scan 100+ URLs, which OOM-crashes the JVM mid-scan (no report). Bump the heap
-        # (DASTNG_ZAP_XMX, default 3g). zap.sh forwards -Xmx to the JVM.
-        _xmx = os.environ.get("DASTNG_ZAP_XMX", "3g")
-        _cname = "dastng-zap-" + os.path.basename(out_dir)
+        # (D4ST_ZAP_XMX, default 3g). zap.sh forwards -Xmx to the JVM.
+        _xmx = os.environ.get("D4ST_ZAP_XMX", "3g")
+        _cname = "d4st-zap-" + os.path.basename(out_dir)
         args = ["docker", "run", "--rm", "--name", _cname,
                 "--add-host=host.docker.internal:host-gateway",
                 "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
@@ -2673,9 +2673,9 @@ jobs:
             print(f"[zap] watchdog: {_reason}", flush=True)
         return _parse()
 
-    # ---- legacy fallback: ZAP self-crawls (DASTNG_ZAP_MODE=spider, or no frontier) ----------
+    # ---- legacy fallback: ZAP self-crawls (D4ST_ZAP_MODE=spider, or no frontier) ----------
     zt = _zap_host_rewrite(seed_url or target)
-    _spider_min = int(os.environ.get("DASTNG_ZAP_SPIDER_MIN", "10") or "10")
+    _spider_min = int(os.environ.get("D4ST_ZAP_SPIDER_MIN", "10") or "10")
     zopts = " ".join(auth_cfg) + (
         " -config globalexcludeurl.url_list.url(0).regex=.*logout.*"
         " -config globalexcludeurl.url_list.url(0).enabled=true"
@@ -2686,7 +2686,7 @@ jobs:
             "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
             "zaproxy/zap-stable", "zap-full-scan.py", "-t", zt,
             "-J", "zap.json", "-a", "-m", str(_spider_min), "-T", "90", "-I", "-z", zopts]
-    if os.environ.get("DASTNG_ZAP_AJAX", "0") == "1":
+    if os.environ.get("D4ST_ZAP_AJAX", "0") == "1":
         args.insert(-3, "-j")
     _zap_out = _run(args, timeout=timeout)
     return _parse()

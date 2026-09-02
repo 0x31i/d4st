@@ -1,4 +1,4 @@
-# Running dast-ng on a Windows VM (WSL2 + Docker)
+# Running d4st on a Windows VM (WSL2 + Docker)
 
 For a Windows Server 2025 box that reaches the target's dev environment over a VPN. The whole
 scanner stack runs in one Linux container — you don't install any of the tools on Windows,
@@ -36,18 +36,18 @@ sudo usermod -aG docker "$USER"       # then close+reopen the shell
 sudo service docker start             # (or: enable systemd in /etc/wsl.conf)
 ```
 
-## 4. Get dast-ng + pull the prebuilt image
+## 4. Get d4st + pull the prebuilt image
 
 The scanner image is published to GitHub Container Registry, so you **pull** it — no local
 build. (You still clone the repo: it carries the compose file and the source that gets
 bind-mounted for live updates.)
 
 ```bash
-git clone https://github.com/0x31i/dast-ng.git
-cd dast-ng
-docker compose pull          # pulls ghcr.io/0x31i/dast-ng:core (ZAP + nuclei + katana + sqlmap + dalfox + commix + Playwright)
+git clone https://github.com/0x31i/d4st.git
+cd d4st
+docker compose pull          # pulls ghcr.io/0x31i/d4st:core (ZAP + nuclei + katana + sqlmap + dalfox + commix + Playwright)
 docker compose up -d
-docker compose exec dastng dast-ng selftest    # MUST be green before scanning
+docker compose exec d4st d4st selftest    # MUST be green before scanning
 ```
 
 If the package is private you'll first authenticate once:
@@ -58,7 +58,7 @@ If the package is private you'll first authenticate once:
 
 Connect the Windows VPN client, then from inside the container:
 ```bash
-docker compose exec dastng bash -lc 'curl -sS -o /dev/null -w "%{http_code}\n" https://<dev-env-url>/'
+docker compose exec d4st bash -lc 'curl -sS -o /dev/null -w "%{http_code}\n" https://<dev-env-url>/'
 ```
 A 200/302/401 means the container can reach it through the VPN. If it hangs or fails, the
 mirrored-networking step didn't take — recheck `.wslconfig` + `wsl --shutdown`.
@@ -67,21 +67,21 @@ mirrored-networking step didn't take — recheck `.wslconfig` + `wsl --shutdown`
 
 ```bash
 # capture an authenticated session (headed the first time to log in / do MFA):
-docker compose exec dastng dast-ng auth capture -p app -b https://<dev-env-url> -o sessions/app.json --headed
+docker compose exec d4st d4st auth capture -p app -b https://<dev-env-url> -o sessions/app.json --headed
 # blind authenticated engagement:
-docker compose exec dastng dast-ng engagement -t https://<dev-env-url> -s sessions/app.json -o results/app.json
+docker compose exec d4st d4st engagement -t https://<dev-env-url> -s sessions/app.json -o results/app.json
 ```
 Watch it in the console at `http://localhost:8810`, then produce the client report:
 ```bash
-docker compose exec dastng dast-ng report app --from-db --client "<Client>" -o results/app-report.pdf
+docker compose exec d4st d4st report app --from-db --client "<Client>" -o results/app-report.pdf
 ```
 
 ## Updating the tool (the easy loop)
 
-Almost every fix is dast-ng Python code (adapter flags, parsing, report). The source is
+Almost every fix is d4st Python code (adapter flags, parsing, report). The source is
 bind-mounted live, so:
 ```bash
-git pull && docker compose restart dastng
+git pull && docker compose restart d4st
 ```
 No rebuild, ~10 seconds. Only when the **tools** change (a new dependency or scanner binary)
 do you pull a fresh image — Docker re-fetches just the changed layer:
@@ -91,7 +91,7 @@ git pull && docker compose pull && docker compose up -d
 
 ## If something misbehaves (remote diagnosis)
 
-1. `docker compose exec dastng dast-ng selftest` — pinpoints a broken tool→parser path.
+1. `docker compose exec d4st d4st selftest` — pinpoints a broken tool→parser path.
 2. Screenshot the console **Engines** tab (each scanner's ran/skipped/note/count) + **Timeline**.
 3. Paste both back — the fix is almost always a code change you pull with the loop above.
 

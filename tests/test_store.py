@@ -1,7 +1,7 @@
 """C1 store: ingest fidelity, enrichment, idempotency, analyst carry-forward."""
 import os
 
-from dastng import store
+from d4st import store
 
 
 def _result():

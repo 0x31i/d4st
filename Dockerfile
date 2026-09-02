@@ -1,7 +1,7 @@
-# dast-ng all-in-one scanner image (core subset).
+# d4st all-in-one scanner image (core subset).
 #
 # Strategy for painless remote updates: BAKE the heavy, slow-changing scanner tools into
-# the image, but install the dast-ng SOURCE editable (pip install -e) so the docker-compose
+# the image, but install the d4st SOURCE editable (pip install -e) so the docker-compose
 # bind-mount makes code live. A fix is then just `git pull && docker compose restart` on the
 # host — no image rebuild. Only a tool-binary problem needs a rebuild.
 #
@@ -57,12 +57,12 @@ RUN git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap 
     && printf '#!/usr/bin/env bash\nexec python3 /opt/commix/commix.py "$@"\n' > /usr/local/bin/commix \
     && chmod +x /usr/local/bin/sqlmap /usr/local/bin/commix
 
-# --- dast-ng orchestrator (editable install; bind-mount overrides code at runtime) ---
+# --- d4st orchestrator (editable install; bind-mount overrides code at runtime) ---
 WORKDIR /app
 COPY pyproject.toml README.md ./
-COPY dastng/ dastng/
+COPY d4st/ d4st/
 RUN pip install --no-cache-dir -e . \
     && python3 -m playwright install --with-deps chromium
 
 EXPOSE 8810
-CMD ["dast-ng", "serve", "--host", "0.0.0.0", "--port", "8810"]
+CMD ["d4st", "serve", "--host", "0.0.0.0", "--port", "8810"]

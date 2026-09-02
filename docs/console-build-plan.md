@@ -1,4 +1,4 @@
-# dast-ng observability console — build plan
+# d4st observability console — build plan
 
 Status: **design locked, build not started.** This plan turns the file-based scan output into
 a fast, DB-backed observability console that surfaces **all** collected probes and data, while
@@ -6,7 +6,7 @@ leaving the CLI (the primary interface) completely untouched.
 
 ## Locked decisions
 
-- **Store: SQLite.** Embedded, zero-ops, single file. Keeps dast-ng a `pip install && dastng
+- **Store: SQLite.** Embedded, zero-ops, single file. Keeps d4st a `pip install && d4st
   serve` appliance with no external services. Postgres was rejected as too heavy for this
   data scale (hundreds of rows/scan) and deployment model (single self-hosted appliance).
   A thin data-access layer keeps the engine swappable if it ever needs Postgres.
@@ -14,10 +14,10 @@ leaving the CLI (the primary interface) completely untouched.
   and "posture" verdict are removed from the console *and* the standalone report (done). The
   header shows a **severity donut** (total findings, ring proportioned by the severity mix)
   and a neutral count headline instead.
-- **Frontend: upgrade the existing vanilla-JS SPA** (`dastng/webui.py`), not a React fork.
+- **Frontend: upgrade the existing vanilla-JS SPA** (`d4st/webui.py`), not a React fork.
   No Node/Vite build step; stays one Python-served artifact. Data scale doesn't need TanStack
   virtualization. (Revisit only if we later want exact ASM-NG table interactions.)
-- **Identity preserved.** dast-ng's terminal/amber/monospace look stays — distinct from
+- **Identity preserved.** d4st's terminal/amber/monospace look stays — distinct from
   ASM-NG, same product family.
 - **CLI is the driver; the DB is a read/observe spine.** Ingest happens at scan-end (and on
   demand for existing JSONs). Nothing about `launch` / `engagement` / `auth` / `score`
@@ -139,7 +139,7 @@ CREATE TABLE events (              -- health + session timeline (also the live f
 CREATE INDEX ix_ev2_scan ON events(scan_id);
 ```
 
-New module: `dastng/store.py` — the DAL. `connect()`, `init_schema()`, `ingest(result, scan_id)`,
+New module: `d4st/store.py` — the DAL. `connect()`, `init_schema()`, `ingest(result, scan_id)`,
 and typed query helpers (`list_scans`, `scan_overview`, `query_findings(filters, sort, page)`,
 `finding_detail`, `frontier`, `probes`, `events`, `set_triage`, `set_note`). Uses stdlib
 `sqlite3` with `row_factory`; WAL mode for concurrent read during a live-scan write.
@@ -147,17 +147,17 @@ and typed query helpers (`list_scans`, `scan_overview`, `query_findings(filters,
 ## Ingest
 
 - **Auto at scan-end**: after `run_engagement` returns, the CLI (`engagement` command) calls
-  `store.ingest(result, scan_id)` when a `DASTNG_DB` path is configured (default
-  `~/.dastng/dastng.db`). Purely additive — does not change existing `-o out.json` behavior.
-- **On demand**: `dast-ng ingest <scan.json> [--id NAME]` for the pile of existing result
-  JSONs (`results*/`, `~/.dastng/scans/*.json`). Idempotent: re-ingesting a scan_id replaces
+  `store.ingest(result, scan_id)` when a `D4ST_DB` path is configured (default
+  `~/.d4st/d4st.db`). Purely additive — does not change existing `-o out.json` behavior.
+- **On demand**: `d4st ingest <scan.json> [--id NAME]` for the pile of existing result
+  JSONs (`results*/`, `~/.d4st/scans/*.json`). Idempotent: re-ingesting a scan_id replaces
   its rows (delete+reinsert), carrying analyst `triage_status`/`analyst_note` forward by
   `dedup_key` — same carry-forward pattern as ASM-NG's findings store.
 - **Enrichment at ingest**: join `category -> VULN_META` once, write severity/cwe/owasp/
   vtitle/vfix onto each finding row. (VULN_META stays the source of truth; re-ingest picks up
   changes.)
 
-## API (FastAPI, expands `dastng/server.py`)
+## API (FastAPI, expands `d4st/server.py`)
 
 Read:
 - `GET /api/scans` — list (id, target, created_at, status, counts, sev mix) for the sidebar.
@@ -182,13 +182,13 @@ Write-back (the "manage" part):
 - (write endpoints only mutate the analyst columns; scan data is immutable.)
 
 Live:
-- `GET /api/scans/{id}/live` — if a `DASTNG_PROGRESS_FILE` exists for an in-progress scan,
+- `GET /api/scans/{id}/live` — if a `D4ST_PROGRESS_FILE` exists for an in-progress scan,
   stream/poll its checkpoint (status, last_stage, elapsed, counts, timeline) so the Timeline
   and header update in real time. Poll first (simple, robust); SSE optional later.
 
 Still no auth by default (localhost appliance); a config flag can gate it for networked deploys.
 
-## Frontend (upgrade `dastng/webui.py` SPA)
+## Frontend (upgrade `d4st/webui.py` SPA)
 
 Seven surfaces, matching the approved mockup (terminal/amber, severity donut, no grade):
 1. **Overview** — coverage card + session-health card + policy + engine summary. Stats are
@@ -215,10 +215,10 @@ and a poll loop for live scans. Reuse the existing `proof()` exchange renderer.
 
 ## Phasing (this is DAST plan Phase 6, sub-phased)
 
-- **C1 — Store + ingest. ✅ DONE.** `dastng/store.py` (schema, DAL, `ingest()` w/ VULN_META
-  denorm + carry-forward by dedup_key + read helpers), `dast-ng ingest` command, auto-ingest
-  hook at scan-end (`DASTNG_NO_INGEST=1` opts out). Backfilled dvwa/vampi/dvwa-demo into
-  `~/.dastng/dastng.db`. Verified: counts match source (dvwa 68 findings / 130 urls / 52
+- **C1 — Store + ingest. ✅ DONE.** `d4st/store.py` (schema, DAL, `ingest()` w/ VULN_META
+  denorm + carry-forward by dedup_key + read helpers), `d4st ingest` command, auto-ingest
+  hook at scan-end (`D4ST_NO_INGEST=1` opts out). Backfilled dvwa/vampi/dvwa-demo into
+  `~/.d4st/d4st.db`. Verified: counts match source (dvwa 68 findings / 130 urls / 52
   exchanges), re-ingest idempotent, analyst triage+note carried forward, frontier `hit_by`
   precise (full-url match, not path — avoids the ASM-NG path-collision trap). Tests:
   `tests/test_store.py` (3 pass). Note: frontier `discovered_by`/`is_target` and health
@@ -229,7 +229,7 @@ and a poll loop for live scans. Reuse the existing `proof()` exchange renderer.
   nested exchanges, frontier, probes, events, evidence, **raw** grid), write-back
   (triage/note, analyst columns only), and `/api/report/{id}` rebuilt from the store via
   `store.reconstruct_result`. `raw` = `store.raw_records` UNION (finding/url/probe/exchange/
-  event) with per-column + global-q filters. `dast-ng serve` now takes `--db`. Verified via
+  event) with per-column + global-q filters. `d4st serve` now takes `--db`. Verified via
   TestClient + live uvicorn boot against the backfill (dvwa raw = 259 records; write-back
   persists; report has no grade). Tests: `tests/test_server.py` (6). Full suite 119 pass.
 - **C3 — SPA findings + overview. ✅ DONE.** `webui.py` rewritten as a dependency-free
@@ -243,7 +243,7 @@ and a poll loop for live scans. Reuse the existing `proof()` exchange renderer.
 - **C5 — Write-back. ✅ DONE.** Triage buttons (confirm/false-positive/accept) + analyst note
   field wired to the POST endpoints; row status badge updates; carry-forward across re-ingest
   (C1). Browser-verified: triage + note persist to the DB on re-read.
-- **C6 — Live scans. ✅ DONE.** `/api/scans/{id}/live` streams the `DASTNG_PROGRESS_FILE`
+- **C6 — Live scans. ✅ DONE.** `/api/scans/{id}/live` streams the `D4ST_PROGRESS_FILE`
   checkpoint (else stored terminal status); SPA shows a live bar + polls every 2.5s while a
   scan is in-progress, re-selecting the scan on completion. Test covers both paths.
 - **C7 — Polish. ✅ CORE DONE.** Empty states (no scans / no findings match / old-scan empty
@@ -258,7 +258,7 @@ Full suite **120 pass**.
 
 ## Explicitly deferred — separate track
 
-- **Report heavy work.** The standalone `dast-ng report` HTML is its own ongoing workstream
+- **Report heavy work.** The standalone `d4st report` HTML is its own ongoing workstream
   (owner: "continue heavy work on the report later"). Grade is already stripped there; further
   report improvements are tracked separately from the console build.
 - **ASM-NG wire-in.** Optional `POST findings to ASM-NG` export stays schema-compatible; not

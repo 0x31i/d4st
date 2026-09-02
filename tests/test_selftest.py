@@ -1,5 +1,5 @@
-from dastng.orchestrator.adapters.dalfox import parse_dalfox
-from dastng.selftest import parse_guard, run_selftest, selftest_ok
+from d4st.orchestrator.adapters.dalfox import parse_dalfox
+from d4st.selftest import parse_guard, run_selftest, selftest_ok
 
 
 def test_parse_guard_flags_unparsed_output():

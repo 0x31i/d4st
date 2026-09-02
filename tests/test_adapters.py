@@ -1,9 +1,9 @@
-from dastng.orchestrator.adapters import REGISTRY
-from dastng.orchestrator.adapters._targets import candidate_urls
-from dastng.orchestrator.adapters.commix import parse_commix
-from dastng.orchestrator.adapters.dalfox import parse_dalfox
-from dastng.orchestrator.adapters.sqlmap import parse_sqlmap
-from dastng.orchestrator.adapters.zap import parse_zap
+from d4st.orchestrator.adapters import REGISTRY
+from d4st.orchestrator.adapters._targets import candidate_urls
+from d4st.orchestrator.adapters.commix import parse_commix
+from d4st.orchestrator.adapters.dalfox import parse_dalfox
+from d4st.orchestrator.adapters.sqlmap import parse_sqlmap
+from d4st.orchestrator.adapters.zap import parse_zap
 
 
 def test_registry_has_core_subset():

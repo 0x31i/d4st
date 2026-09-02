@@ -3,7 +3,7 @@ behaviour that holds in BOTH backends (Presidio or built-in fallback)."""
 
 from __future__ import annotations
 
-from dastng.pii import PiiScanner, _luhn, _mask
+from d4st.pii import PiiScanner, _luhn, _mask
 
 
 def test_mask_never_leaks_raw_value():
@@ -46,7 +46,7 @@ def test_backend_reports_itself():
 
 
 def test_structured_profile_drops_ner_names():
-    from dastng.pii import PiiScanner
+    from d4st.pii import PiiScanner
     html = '<a title="John Smith">x</a> SSN 456-78-9012 admin@x.org'
     ents = {h.entity for h in PiiScanner(structured_only=True).scan_text(html)}
     assert "PERSON" not in ents            # NER excluded in the response-pipeline profile
@@ -54,7 +54,7 @@ def test_structured_profile_drops_ner_names():
 
 
 def test_response_collector_dedups_by_body():
-    from dastng.pii import ResponsePiiCollector
+    from d4st.pii import ResponsePiiCollector
     c = ResponsePiiCollector()
     body = "card 4111111111111111, ssn 456-78-9012"
     c.feed("http://x/a", body)
@@ -64,8 +64,8 @@ def test_response_collector_dedups_by_body():
 
 
 def test_engagement_feed_hook_collects():
-    from dastng import engagement as e
-    from dastng.pii import ResponsePiiCollector
+    from d4st import engagement as e
+    from d4st.pii import ResponsePiiCollector
     col = ResponsePiiCollector()
     e.set_pii_sink(col)
     e._feed("http://x/audit", "leaked admin@x.org and 456-78-9012")

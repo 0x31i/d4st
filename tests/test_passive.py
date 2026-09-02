@@ -1,4 +1,4 @@
-from dastng.passive import check_response
+from d4st.passive import check_response
 
 
 def _checks(**kw):

@@ -155,7 +155,7 @@ def build_attack_profile(appprof: 'AppProfile | None') -> AttackProfile:
 def _get(url: str, cookie: str, timeout: int = 12):
     if requests is None:
         return None
-    headers = {'User-Agent': 'dastng-fingerprint/1.0'}
+    headers = {'User-Agent': 'd4st-fingerprint/1.0'}
     if cookie:
         headers['Cookie'] = cookie
     try:

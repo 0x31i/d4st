@@ -1,12 +1,12 @@
-from dastng.orchestrator.adapters import REGISTRY
-from dastng.orchestrator.adapters.api import parse_graphw00f, parse_jwt_tool
-from dastng.orchestrator.adapters.discovery import parse_feroxbuster, parse_gau, parse_x8
-from dastng.orchestrator.adapters.injection2 import (
+from d4st.orchestrator.adapters import REGISTRY
+from d4st.orchestrator.adapters.api import parse_graphw00f, parse_jwt_tool
+from d4st.orchestrator.adapters.discovery import parse_feroxbuster, parse_gau, parse_x8
+from d4st.orchestrator.adapters.injection2 import (
     parse_crlfuzz,
     parse_ghauri,
     parse_sstimap,
 )
-from dastng.orchestrator.adapters.secrets import (
+from d4st.orchestrator.adapters.secrets import (
     parse_gitleaks,
     parse_semgrep,
     parse_trufflehog,

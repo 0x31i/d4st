@@ -1,8 +1,8 @@
-id: dastng-pii-disclosure
+id: d4st-pii-disclosure
 
 info:
   name: PII / Email Address Disclosed in Response
-  author: dast-ng
+  author: d4st
   severity: info
   description: >
     Flags personally identifiable information reflected in an HTTP response body

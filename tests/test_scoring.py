@@ -1,16 +1,16 @@
 import json
 
-from dastng.scoring import categories as C
-from dastng.scoring.burp import parse_burp
-from dastng.scoring.normalize import (
+from d4st.scoring import categories as C
+from d4st.scoring.burp import parse_burp
+from d4st.scoring.normalize import (
     normalize_commix,
     normalize_dalfox,
     normalize_nuclei,
     normalize_sqlmap,
     normalize_zap,
 )
-from dastng.scoring.oracle import load_oracle, path_of
-from dastng.scoring.score import build_matrix, matrix_to_dict, score_columns
+from d4st.scoring.oracle import load_oracle, path_of
+from d4st.scoring.score import build_matrix, matrix_to_dict, score_columns
 
 # ----- categories -------------------------------------------------------------
 

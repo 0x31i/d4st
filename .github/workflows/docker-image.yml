@@ -1,7 +1,7 @@
 name: build-image
 
 # Builds the all-in-one scanner image and publishes it to GitHub Container Registry
-# (ghcr.io/0x31i/dast-ng) so it can be pulled directly — no local build needed.
+# (ghcr.io/0x31i/d4st) so it can be pulled directly — no local build needed.
 #
 # Runs on changes to the image or the orchestrator, and on manual dispatch.
 
@@ -11,7 +11,7 @@ on:
     paths:
       - 'Dockerfile'
       - 'pyproject.toml'
-      - 'dastng/**'
+      - 'd4st/**'
       - '.github/workflows/docker-image.yml'
   workflow_dispatch:
 

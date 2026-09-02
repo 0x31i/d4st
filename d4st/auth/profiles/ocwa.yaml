@@ -1,17 +1,17 @@
 # OCWA (OVERCLOCK Web Application) login recipe. DVWA-derived, but post-login lands on
-# homepage.php (not index.php). Base URL supplied at run time (--base or DASTNG_OCWA_URL).
+# homepage.php (not index.php). Base URL supplied at run time (--base or D4ST_OCWA_URL).
 name: ocwa
 type: form
-base_url_env: DASTNG_OCWA_URL
+base_url_env: D4ST_OCWA_URL
 login_url: "{base}/login.php"
 username_selector: "input[name=username]"
 password_selector: "input[name=password]"
 submit_selector: "input[name=Login], input[type=submit]"
 username: admin
 password: password
-# Override creds without committing them: export DASTNG_OCWA_USER / DASTNG_OCWA_PASS
-username_env: DASTNG_OCWA_USER
-password_env: DASTNG_OCWA_PASS
+# Override creds without committing them: export D4ST_OCWA_USER / D4ST_OCWA_PASS
+username_env: D4ST_OCWA_USER
+password_env: D4ST_OCWA_PASS
 
 success:
   url_contains: "homepage.php"

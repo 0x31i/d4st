@@ -45,7 +45,7 @@ def load_workflow(name_or_path: str) -> dict:
     # Prefer packaged resources; fall back to the filesystem next to this module (robust
     # across Python 3.9 namespace-package quirks and editable installs).
     try:
-        text = resources.files("dastng.workflows").joinpath(fname).read_text(encoding="utf-8")
+        text = resources.files("d4st.workflows").joinpath(fname).read_text(encoding="utf-8")
         return yaml.safe_load(text)
     except (FileNotFoundError, ModuleNotFoundError, TypeError, AttributeError):
         pass

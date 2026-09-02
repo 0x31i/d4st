@@ -1,4 +1,4 @@
-from dastng.jsanalysis import detect_vuln_libs, extract_endpoints
+from d4st.jsanalysis import detect_vuln_libs, extract_endpoints
 
 
 def test_extract_api_endpoints():
@@ -35,7 +35,7 @@ def test_detect_lodash_prototype_pollution():
 
 
 def test_semgrep_category_mapping():
-    from dastng.jsanalysis import _semgrep_category
+    from d4st.jsanalysis import _semgrep_category
     assert _semgrep_category("dom-source-to-redirect", ["CWE-601"]) == "open-redirect"
     assert _semgrep_category("dom-source-to-data-sink", []) == "dom-data-manipulation"
     assert _semgrep_category("dom-source-to-html-sink", ["CWE-79"]) == "xss"
@@ -45,7 +45,7 @@ def test_semgrep_category_mapping():
 def test_parse_semgrep_json():
     import json
 
-    from dastng.jsanalysis import parse_semgrep_json
+    from d4st.jsanalysis import parse_semgrep_json
     doc = json.dumps({"results": [{"check_id": "rules.dom-source-to-html-sink",
                       "path": "a.js", "start": {"line": 3},
                       "extra": {"message": "DOM XSS", "metadata": {"cwe": ["CWE-79"]}}}]})

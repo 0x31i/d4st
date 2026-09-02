@@ -10,7 +10,7 @@ import os
 
 from .base import AdapterResult, RunContext, ToolAdapter, register
 
-# Canonical category strings (kept in sync with dastng.scoring.categories, no import to
+# Canonical category strings (kept in sync with d4st.scoring.categories, no import to
 # avoid coupling the orchestrator to the scoring package).
 _INFO_DISCLOSURE = "info-disclosure"
 _XSS = "xss"

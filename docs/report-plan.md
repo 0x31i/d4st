@@ -1,4 +1,4 @@
-# dast-ng report — client-deliverable build plan
+# d4st report — client-deliverable build plan
 
 Status: **design locked, build not started.** Turns the current dark, screen-first technical
 report into a **client-grade deliverable** that replaces the Burp Suite Enterprise report for
@@ -75,7 +75,7 @@ differentiator over a shallow commercial scan.
   engagement window, prepared-by, reference id, confidentiality text) via CLI flags
   (`--client`, `--window`, `--prepared-by`, `--logo`, `--ref`) and/or `--report-meta meta.json`.
   Sensible defaults; never fabricated.
-- **Data-gap honesty** — dast-ng's engagement result does not yet capture scan start/end/
+- **Data-gap honesty** — d4st's engagement result does not yet capture scan start/end/
   duration, requests-made, or network-error counts (Burp does). R5 adds lightweight capture
   where cheap (timing, request counter); anything not captured is simply omitted, never faked.
 
@@ -100,7 +100,7 @@ differentiator over a shallow commercial scan.
   engagement-side — omitted, not faked; a small future engagement add.)
 - **R6 — Polish + print QA. ✅ CORE DONE.** Browser-verified structure (cover + 5 sections, 68
   grouped findings, all detail blocks, no horizontal overflow, no grade/scorecard). CLI
-  `dast-ng report <json|scan-id --from-db> --client … -o out.html`. Deferred as minor:
+  `d4st report <json|scan-id --from-db> --client … -o out.html`. Deferred as minor:
   confidentiality watermark, engagement-side timing capture, console /api/report client-meta
   query params.
 
