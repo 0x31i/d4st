@@ -28,7 +28,7 @@ _ENDPOINT_RE = re.compile(r"""
   (?:"|'|`)
 """, re.VERBOSE)
 
-_API_HINT = re.compile(r"/api/|/rest/|/v\d+/|\.asmx|\.ashx|GetInfo|GetInfo", re.IGNORECASE)
+_API_HINT = re.compile(r"/api/|/rest/|/v\d+/|\.asmx|\.ashx", re.IGNORECASE)
 
 # SPA API routes are built in template literals / concatenation, so the whole path is rarely a
 # single quoted string — `${this.host}/rest/products/search?q=${e}` never sits between quotes.

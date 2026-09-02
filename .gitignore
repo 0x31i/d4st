@@ -17,6 +17,7 @@ results/
 .tools/
 .output/
 results_*
+.schemathesis/
 
 # fetched tool payloads/templates (see scripts/fetch_vendor.sh)
 vendor/
