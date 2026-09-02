@@ -1,47 +1,38 @@
-version: "3.8"
+# dast-ng — one all-in-one scanner container (core subset baked in).
+#
+# Update loop (no rebuild): the dast-ng SOURCE is bind-mounted live, so a fix is just
+#   git pull && docker compose restart
+# Only a NEW dependency or a tool-binary change needs `docker compose build`.
+#
+# Run a scan (from the repo dir):
+#   docker compose up -d
+#   docker compose exec dastng dast-ng selftest                 # verify the toolchain
+#   docker compose exec dastng dast-ng auth capture -p app -b https://dev.client.tld -o sessions/app.json --headed
+#   docker compose exec dastng dast-ng engagement -t https://dev.client.tld -s sessions/app.json -o results/app.json
+#   # console:  http://localhost:8810   (report:  dast-ng report app --from-db ...)
 
 services:
-  db:
-    image: postgres:16
-    container_name: dastng-db
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: dastng
-      POSTGRES_USER: dastng
-      POSTGRES_PASSWORD: "${DASTNG_DB_PASSWORD:-changeme}"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    ports:
-      - "127.0.0.1:5433:5432"
-
-  orchestrator:
+  dastng:
+    # Prebuilt image from GitHub Container Registry — `docker compose pull` gets it, no build.
+    # `build: .` stays as a local fallback (`docker compose build`) for tool/Dockerfile work.
+    image: ghcr.io/0x31i/dast-ng:core
     build: .
-    container_name: dastng-orchestrator
+    container_name: dastng
     restart: unless-stopped
-    depends_on:
-      - db
     environment:
-      DASTNG_DATABASE_URL: "postgresql://dastng:${DASTNG_DB_PASSWORD:-changeme}@db:5432/dastng"
-      DASTNG_API_KEYS: "${DASTNG_API_KEYS:-}"
+      # SQLite observability store (persisted on the host via the ./data mount)
+      DASTNG_DB: /data/dastng.db
+      # Read-only verify seatbelt egress allow-list (the box's own IP on the client VPN)
       DASTNG_VERIFY_EGRESS_IPS: "${DASTNG_VERIFY_EGRESS_IPS:-}"
+      # OAST/interactsh server (blank = the hosted default)
       DASTNG_INTERACTSH_SERVER: "${DASTNG_INTERACTSH_SERVER:-}"
-    ports:
-      - "0.0.0.0:8810:8810"
     volumes:
-      - ./runs:/app/runs
-      - ./sessions:/app/sessions
-
-  # OAST / blind-vuln callback server. Self-hosting needs a domain with NS records
-  # pointed at this host; until then, leave DASTNG_INTERACTSH_SERVER empty to use
-  # the default hosted server. Wired in Phase 2.
-  # interactsh:
-  #   image: projectdiscovery/interactsh-server:latest
-  #   container_name: dastng-interactsh
-  #   restart: unless-stopped
-  #   command: ["-domain", "oast.your-domain.example", "-http-port", "8811"]
-  #   ports:
-  #     - "0.0.0.0:8811:8811"
-
-volumes:
-  pgdata:
-    driver: local
+      - ./dastng:/app/dastng      # LIVE code — git pull + restart updates the tool, no rebuild
+      - ./data:/data              # SQLite store (scans + findings)
+      - ./runs:/app/runs          # seed URL lists
+      - ./sessions:/app/sessions  # captured auth sessions
+      - ./results:/app/results    # engagement result JSONs
+    ports:
+      - "0.0.0.0:8810:8810"       # observability console
+    # Scanning needs to reach the client dev env through the host's VPN. On Windows this
+    # relies on WSL2 mirrored networking (see docs/deploy-windows.md). No extra caps needed.
