@@ -1,11 +1,11 @@
 # DVWA (Damn Vulnerable Web Application) login recipe.
-# Base URL is supplied at run time: `--base http://dvwa.local` or set DASTNG_DVWA_URL.
+# Base URL is supplied at run time: `--base http://dvwa.local` or set D4ST_DVWA_URL.
 # DVWA's login.php carries a per-form user_token (anti-CSRF); a real browser (Playwright)
 # submits it automatically, so scripted form login works without hand-handling the token.
 # After login we set the `security` cookie to the requested level (default low).
 name: dvwa
 type: form
-base_url_env: DASTNG_DVWA_URL
+base_url_env: D4ST_DVWA_URL
 login_url: "{base}/login.php"
 username_selector: "input[name=username]"
 password_selector: "input[name=password]"
@@ -29,5 +29,5 @@ post_login_cookies:
 
 totp:
   enabled: false
-  # seed_env: DASTNG_DVWA_TOTP_SEED
+  # seed_env: D4ST_DVWA_TOTP_SEED
   # selector: "input[name=otp]"

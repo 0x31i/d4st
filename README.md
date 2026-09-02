@@ -1,4 +1,4 @@
-# dast-ng
+# d4st
 
 Standalone open-source DAST (dynamic application security testing) appliance for recurring,
 unattended, authenticated web-app scanning. Chains best-in-class open-source scanners behind
@@ -33,7 +33,7 @@ and the DVWA-vs-Burp-Pro coverage benchmark.
   Postgres + REST + React. Each forked file carries an `UPSTREAM:` header. The findings
   schema is kept ASM-NG-compatible so the optional wire-in stays trivial.
 - **Every tool is an adapter** implementing `run(target, session) -> native_json`. Workflows
-  are declared in YAML (`dastng/workflows/*.yaml`).
+  are declared in YAML (`d4st/workflows/*.yaml`).
 - **Shared frontier**: every discovery tool feeds a deduplicated URL/param frontier that the
   scanners re-consume (capped convergence loop; coverage caps are logged, never silently
   truncated).
@@ -48,8 +48,8 @@ own backend/UI -> FHC MFA pilot).
 
 ```bash
 pip install -e ".[dev]"
-dast-ng version
-dast-ng launch --workflow core --target https://dvwa.local --dry-run
+d4st version
+d4st launch --workflow core --target https://dvwa.local --dry-run
 ```
 
 ## License

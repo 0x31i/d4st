@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import httpx
 
-from dastng.oast import OAST_BODY_TOKEN, OastServer
-from dastng.orchestrator.adapters import REGISTRY
-from dastng.orchestrator.adapters.lfi_fuzz import _parse_ffuf
+from d4st.oast import OAST_BODY_TOKEN, OastServer
+from d4st.orchestrator.adapters import REGISTRY
+from d4st.orchestrator.adapters.lfi_fuzz import _parse_ffuf
 
 
 def test_gap_adapters_registered():
@@ -38,7 +38,7 @@ def test_oast_server_records_callback_and_reflects_token():
 
 
 def test_lfi_fuzz_no_params_is_ok_not_error():
-    from dastng.orchestrator.adapters.base import RunContext
+    from d4st.orchestrator.adapters.base import RunContext
     res = REGISTRY["lfi_fuzz"].run(RunContext(target="http://x/no-params", seed_urls=[]))
     assert res.ok is True
     assert res.findings == []

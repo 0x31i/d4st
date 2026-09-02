@@ -79,7 +79,7 @@ def load_profile(name_or_path: str) -> AuthProfile:
             return _from_dict(yaml.safe_load(fh))
     fname = name_or_path if name_or_path.endswith(".yaml") else f"{name_or_path}.yaml"
     try:
-        text = resources.files("dastng.auth.profiles").joinpath(fname).read_text(encoding="utf-8")
+        text = resources.files("d4st.auth.profiles").joinpath(fname).read_text(encoding="utf-8")
         return _from_dict(yaml.safe_load(text))
     except (FileNotFoundError, ModuleNotFoundError, TypeError, AttributeError):
         pass

@@ -1,4 +1,4 @@
-"""dast-ng observability store — SQLite spine for the web console.
+"""d4st observability store — SQLite spine for the web console.
 
 The CLI stays file-based; this module ingests an engagement result dict into a small,
 indexed SQLite database that the console (server.py) reads. Nothing here changes how a
@@ -27,11 +27,11 @@ from urllib.parse import urlsplit
 
 from .report import SEV_ORDER, _meta_for
 
-DEFAULT_DB = os.path.expanduser("~/.dastng/dastng.db")
+DEFAULT_DB = os.path.expanduser("~/.d4st/d4st.db")
 
 
 def db_path(path: str | None = None) -> str:
-    p = path or os.environ.get("DASTNG_DB") or DEFAULT_DB
+    p = path or os.environ.get("D4ST_DB") or DEFAULT_DB
     Path(p).expanduser().parent.mkdir(parents=True, exist_ok=True)
     return str(Path(p).expanduser())
 

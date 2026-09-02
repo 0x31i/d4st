@@ -1,4 +1,4 @@
-"""dast-ng command-line interface."""
+"""d4st command-line interface."""
 
 from __future__ import annotations
 
@@ -19,13 +19,13 @@ console = Console()
 
 @click.group()
 def main() -> None:
-    """dast-ng: standalone open-source DAST appliance."""
+    """d4st: standalone open-source DAST appliance."""
 
 
 @main.command()
 def version() -> None:
     """Print the version."""
-    console.print(f"dast-ng {__version__}")
+    console.print(f"d4st {__version__}")
 
 
 @main.command()
@@ -65,7 +65,7 @@ def launch(workflow: str, target: str, session_path: str | None,
             else:
                 raise click.ClickException(
                     f"session invalid ({note}); refusing to scan logged-out. Re-capture with "
-                    f"`dast-ng auth capture` (check credentials), or pass --force to override."
+                    f"`d4st auth capture` (check credentials), or pass --force to override."
                 )
 
     runner = WorkflowRunner(
@@ -293,7 +293,7 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
     stale = stale_components()
     if stale:
         console.print(f"[yellow]stale detection content[/yellow]: {', '.join(stale)} "
-                      f"— run `dast-ng update` for freshest templates/rules (or proceed offline).")
+                      f"— run `d4st update` for freshest templates/rules (or proceed offline).")
     if profile in ("production-safe", "passive-only"):
         console.print(f"[cyan]safety policy[/cyan]: [bold]{profile}[/bold] — throttled, "
                       f"{'no attack traffic' if profile == 'passive-only' else 'no data mutation / no destructive endpoints / safe sqlmap'}")
@@ -324,8 +324,8 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
         console.print(f"report -> {out_path}")
 
     # Auto-ingest into the observability store (console spine). Additive, non-fatal:
-    # a store hiccup must never fail a scan. Opt out with DASTNG_NO_INGEST=1.
-    if not os.environ.get("DASTNG_NO_INGEST"):
+    # a store hiccup must never fail a scan. Opt out with D4ST_NO_INGEST=1.
+    if not os.environ.get("D4ST_NO_INGEST"):
         try:
             from . import store
             sid = _scan_id_for(out_path, target)
@@ -349,7 +349,7 @@ def _scan_id_for(out_path: str | None, target: str) -> str:
 @click.argument("json_files", nargs=-1, required=True, type=click.Path(exists=True))
 @click.option("--id", "scan_id", default=None,
               help="Scan id to store under (single-file only; default = filename stem).")
-@click.option("--db", "db_path_opt", default=None, help="SQLite path (default ~/.dastng/dastng.db).")
+@click.option("--db", "db_path_opt", default=None, help="SQLite path (default ~/.d4st/d4st.db).")
 def ingest(json_files: tuple, scan_id: str | None, db_path_opt: str | None) -> None:
     """Load one or more engagement result JSONs into the observability store (SQLite).
 
@@ -426,7 +426,7 @@ def update(status: bool, components: tuple) -> None:
 
 @main.command()
 @click.argument("source")
-@click.option("--out", "-o", default="dastng_report.html", help="Output HTML report path.")
+@click.option("--out", "-o", default="d4st_report.html", help="Output HTML report path.")
 @click.option("--target", "-t", default="", help="Target URL/host label.")
 @click.option("--client", default=None, help="Client / organisation name (cover page).")
 @click.option("--scope", default=None, help="Scope description (cover page).")
@@ -481,10 +481,10 @@ def report(source: str, out: str, target: str, client: str | None, scope: str | 
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8810, type=int)
 @click.option("--db", "db_path_opt", default=None,
-              help="SQLite store to serve (default ~/.dastng/dastng.db). Populate it with "
-                   "`dast-ng ingest`; scans also auto-ingest at scan-end.")
+              help="SQLite store to serve (default ~/.d4st/d4st.db). Populate it with "
+                   "`d4st ingest`; scans also auto-ingest at scan-end.")
 def serve(host: str, port: int, db_path_opt: str | None) -> None:
-    """Start the dast-ng web console (observability dashboard + report viewer)."""
+    """Start the d4st web console (observability dashboard + report viewer)."""
     from .server import run_server
     run_server(host=host, port=port, db_path=db_path_opt)
 
