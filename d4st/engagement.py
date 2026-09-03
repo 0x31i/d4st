@@ -635,7 +635,44 @@ def discover_targets(urls: list[str], cookie: str, host: str) -> list[Target]:
             seen.add(key)
             targets.append(Target(url=f.action, method=f.method, params=ip, values=f.values,
                                   csrf_field=f.csrf_field, csrf_url=f.csrf_url))
+
+    # Frontier soft-404 guard: on a catch-all / SPA app every path returns 2xx, so the crawl and
+    # content-discovery flood the target list with nonexistent URLs (feroxbuster recursion on a
+    # varying catch-all defeats its own --filter-similar). Left unfiltered, the injection tools —
+    # especially commix's time-based `sleep` payloads — waste hours probing junk that cannot be
+    # vulnerable, and the results look artificially thin. Drop targets whose BASE PATH just returns
+    # the directory's catch-all response, reusing the same directory-local calibration that guards
+    # findings. Conservative: a real page/param (distinct from a random sibling) always survives.
+    targets, _n404 = _drop_soft404_targets(targets, cookie)
+    if _n404:
+        print(f"[frontier] dropped {_n404} soft-404/catch-all target(s) before injection "
+              f"({len(targets)} real target(s) remain)", flush=True)
     return targets
+
+
+def _drop_soft404_targets(targets: list["Target"], cookie: str) -> tuple[list["Target"], int]:
+    """Drop injection targets on catch-all/nonexistent paths BEFORE any tool probes them. Uses the
+    proven directory-local `_is_soft404_fp` calibration (target base path vs a random sibling),
+    cached per base path so param-variations of one endpoint are checked once. Fail-safe: on any
+    calibration error the target is KEPT (never lose real coverage)."""
+    kept: list = []
+    dropped = 0
+    cache: dict = {}
+    for t in targets:
+        base = (getattr(t, "url", "") or "").split("?")[0].split("#")[0]
+        if not base:
+            kept.append(t)
+            continue
+        if base not in cache:
+            try:
+                cache[base] = _is_soft404_fp(t.url, cookie)
+            except Exception:  # noqa: BLE001 - inconclusive: keep, don't drop real depth
+                cache[base] = False
+        if cache[base]:
+            dropped += 1
+            continue
+        kept.append(t)
+    return kept, dropped
 
 
 # ----- response pipeline (Burp-style passive inspection of EVERY response) ----
