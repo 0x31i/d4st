@@ -1840,10 +1840,35 @@ def _stratified_sample(urls: list[str], cap: int) -> list[str]:
     return out
 
 
+def _session_from_cookie(cookie: str, target: str) -> dict | None:
+    """Wrap a raw 'name=value; name2=value2' Cookie header (what SessionKeeper hands us) into the
+    Session dict shape the roster adapters expect via ctx.session.
+
+    CRITICAL: every roster adapter (ghauri/commix/dalfox/lfi_fuzz/...) reads its auth cookie through
+    _cookie_header(ctx.session), NOT options['cookie']. run_roster historically built RunContext
+    without session=, so ctx.session was None and EVERY roster tool ran UNAUTHENTICATED — hitting
+    the login wall and reporting 0 on any app behind auth. This bridges the keeper's cookie string
+    onto ctx.session so the whole roster runs as the logged-in user."""
+    if not cookie:
+        return None
+    from urllib.parse import urlsplit
+    host = urlsplit(target if "//" in target else "//" + target).hostname or ""
+    cookies = []
+    for part in cookie.split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name.strip():
+            cookies.append({"name": name.strip(), "value": value.strip(),
+                            "domain": host, "path": "/"})
+    if not cookies:
+        return None
+    return {"name": "keeper", "origin": target, "storage_state": {"cookies": cookies},
+            "headers": {}, "meta": {}, "captured_at": ""}
+
+
 def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
                js_dir: str = "", level_override: int | None = None, health=None,
                per_url_cap: int = 0, progress=None, base_findings=None,
-               api_surface: dict | None = None) -> list[Finding]:
+               api_surface: dict | None = None, session_keeper=None) -> list[Finding]:
     """Run the full detection roster over the SAFE, converged frontier and normalize each
     adapter's findings to Finding. Tools whose surface is absent (GraphQL/OpenAPI/JWT/JS)
     cleanly no-op. Every tool is isolated so one failure never sinks the scan.
@@ -1890,11 +1915,23 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
     capped_urls = _stratified_sample(safe_urls, per_url_cap) if per_url_cap else safe_urls
     batch_cap = max(per_url_cap * 8, 240) if per_url_cap else 0
     dalfox_urls = _stratified_sample(safe_urls, batch_cap) if batch_cap else safe_urls
+    # Auth: the roster adapters read the cookie via ctx.session, so hand them the keeper's cookie in
+    # that shape (else the whole roster runs unauthenticated — the roster:0 root cause).
+    _sess = _session_from_cookie(cookie, target)
     out: list[Finding] = []
     for name in _MEGA_ROSTER:
         ad = REGISTRY.get(name)
         if ad is None or not ad.available():
             continue
+        # Keep the session alive ACROSS the long roster: a keeper re-auth at the roster boundary is
+        # not enough when nuclei/sqlmap earlier in the run already burned the session lifetime. Probe
+        # (and re-auth on loss) before each tool so a mid-roster death doesn't leave every remaining
+        # tool testing the login page. Cheap: ensure() is a single HEAD-ish probe unless auth is lost.
+        if session_keeper is not None and getattr(session_keeper, "enabled", False):
+            _ck = session_keeper.ensure(f"roster:{name}")
+            if _ck and _ck != cookie:
+                cookie, _sess = _ck, _session_from_cookie(_ck, target)
+                opts["cookie"] = _ck
         if getattr(ad, "active", False) and not policy.active_scan:
             continue
         # Circuit breaker: if the target went unhealthy, stop launching more active tools
@@ -1908,7 +1945,7 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
         else:
             tool_urls = safe_urls     # genuinely single-process batch tools
         try:
-            res = ad.run(RunContext(target=target, seed_urls=tool_urls, options=opts))
+            res = ad.run(RunContext(target=target, session=_sess, seed_urls=tool_urls, options=opts))
         except Exception:  # noqa: BLE001,S112 - one tool must never sink the mega scan
             continue
         cat = _ROSTER_CAT.get(name)
@@ -2329,7 +2366,8 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                                    js_dir=os.environ.get("D4ST_JS_DIR", ""),
                                    level_override=health.sqlmap_level(policy.sqlmap_level),
                                    health=health, per_url_cap=_inject_cap, progress=_prog,
-                                   base_findings=list(findings), api_surface=_api)
+                                   base_findings=list(findings), api_surface=_api,
+                                   session_keeper=_session)
         _prog.update("roster", findings, urls=len(urls), targets=len(targets))
         # completeness probes only while the target is alive (they replay payloads = more load)
         if not health.halted:
@@ -2441,6 +2479,12 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         for _i, t in enumerate(_sql_targets):
             if health.check() >= 2:   # target unhealthy -> stop, keep everything already found
                 break
+            # sqlmap grinds minutes PER target, so this loop can outlast the session lifetime. A
+            # single pre-loop re-auth is not enough: if the session dies at target 3 of 40, every
+            # later sqlmap runs against the login page and confirms nothing. Re-probe (re-auth on
+            # loss) every few targets so the whole depth loop stays authenticated.
+            if _i and _i % 4 == 0:
+                cookie = _session.ensure(f"sqlmap[{_i}]")
             lvl = health.sqlmap_level(policy.sqlmap_level)
             findings += run_sqlmap(t, cookie, politeness=pol, policy=policy, level_override=lvl)
             if _i % 5 == 0:   # checkpoint periodically through the slow depth loop
