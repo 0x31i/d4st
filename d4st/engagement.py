@@ -1459,7 +1459,12 @@ def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[
 # requests /.env, gets the SPA index (200), and reports a leak. This is the same auto-calibration
 # real content scanners do (ffuf -ac, feroxbuster --filter-similar): fingerprint the not-found
 # response, then drop findings whose URL just returns that page.
-_SOFT404_RANDOM = ("d4st-nx-9q2z7x1a4k", "d4st-nx-4k8w3v6bqp.bak")
+_SOFT404_RANDOM = ("d4st-nx-9q2z7x1a4k", "d4st-nx-4k8w3v6bqp", "d4st-nx-p7m2t8w1zc")
+# Strip per-request noise (CSRF tokens, session ids, timestamps, nonces) so soft-404 comparison
+# sees page STRUCTURE, not volatile values that differ every request: long hex, base64, digit runs.
+_SOFT404_NOISE = re.compile(r"[0-9a-f]{16,}|[A-Za-z0-9+/]{24,}={0,2}|\d{4,}", re.I)
+_SOFT404_SIM = 0.90            # content-similarity at/above this == same page structure
+_SOFT404_BASELINE: dict = {}   # (parent, cookie) -> (status, [normalized not-found bodies]) or None
 # Findings that ASSERT a file/path exists (soft-404-prone). Header/behaviour findings (CORS, CSP,
 # missing-header, SQLi, XSS) are NOT existence claims and must never be dropped by this guard.
 _EXISTENCE_MARKERS = (
@@ -1470,26 +1475,74 @@ _EXISTENCE_MARKERS = (
 )
 
 
+def _soft404_norm(text: str) -> str:
+    """Normalize a body for structural comparison: drop volatile per-request tokens (CSRF/session/
+    timestamp) and collapse whitespace, so two renders of the SAME page compare as identical even
+    when their dynamic values differ."""
+    return re.sub(r"\s+", " ", _SOFT404_NOISE.sub("", (text or "").lower()))[:20000]
+
+
+def _soft404_sim(a: str, b: str) -> float:
+    """Structural similarity of two already-normalized bodies (0..1)."""
+    from difflib import SequenceMatcher
+    if not a and not b:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _soft404_baseline(parent: str, cookie: str):
+    """Multi-sample not-found fingerprint for one directory. Fetch several RANDOM, guaranteed-
+    nonexistent siblings and, ONLY if they agree with each other (a stable catch-all), return
+    (status, [normalized bodies]) as the baseline. Returns None when the directory has a real 404
+    (siblings differ from real content) or a too-variable not-found — in which case callers must
+    KEEP the candidate, never drop it. Cached per (dir, cookie). Target-agnostic: derived purely
+    from the app's own live responses."""
+    key = (parent, cookie)
+    if key in _SOFT404_BASELINE:
+        return _SOFT404_BASELINE[key]
+    import httpx
+    hdr = {"Cookie": cookie} if cookie else {}
+    got = []
+    for rnd in _SOFT404_RANDOM:
+        try:
+            r = httpx.get(f"{parent}/{rnd}", headers=hdr, timeout=10, follow_redirects=False)
+            got.append((r.status_code, _soft404_norm(r.text)))
+        except Exception:  # noqa: BLE001
+            pass
+    result = None
+    # need >=2 samples, all the same status, and mutually similar (else the dir's not-found is
+    # either a real 404 or too dynamic to judge — either way, don't calibrate/drop from it).
+    if len(got) >= 2 and all(s == got[0][0] for s, _ in got) \
+            and _soft404_sim(got[0][1], got[1][1]) >= _SOFT404_SIM:
+        result = (got[0][0], [b for _, b in got])
+    _SOFT404_BASELINE[key] = result
+    return result
+
+
 def _is_soft404_fp(url: str, cookie: str) -> bool:
-    """Directory-LOCAL soft-404 calibration (what ffuf -ac / feroxbuster --filter-similar do):
-    fetch the finding URL and a random SIBLING in the same directory. If both return the same
-    status + near-identical body, the 'file' is just that directory's catch-all response — a false
-    positive, not a real exposed file. Per-directory, so it handles apps whose /api, /rest, /ftp
-    subtrees each have their own not-found response."""
+    """Live, target-agnostic soft-404 calibration (no prior knowledge of the app), robust to
+    dynamic pages. Fingerprint the directory's not-found response from MULTIPLE random nonexistent
+    siblings, then compare the candidate by content SIMILARITY (not raw length, which a changing
+    dashboard/feed could fool). A candidate that returns the same status AND is highly similar to a
+    page that provably does not exist is the directory's catch-all — a false 'exists'. Anything
+    that differs in status/content, errors, or can't be calibrated is KEPT (never drop real
+    coverage). Same technique as ffuf -ac / feroxbuster --filter-similar, hardened."""
     import httpx
     clean = url.split("?")[0].split("#")[0]
     parent = clean.rsplit("/", 1)[0]
-    sib = f"{parent}/{_SOFT404_RANDOM[0]}"
+    base = _soft404_baseline(parent, cookie)
+    if base is None:
+        return False                       # real 404 or un-calibratable directory -> keep
+    base_status, base_bodies = base
     hdr = {"Cookie": cookie} if cookie else {}
     try:
-        r1 = httpx.get(clean, headers=hdr, timeout=10, follow_redirects=False)
-        r2 = httpx.get(sib, headers=hdr, timeout=10, follow_redirects=False)
+        r = httpx.get(clean, headers=hdr, timeout=10, follow_redirects=False)
     except Exception:  # noqa: BLE001
-        return False
-    if r1.status_code != r2.status_code:
-        return False                      # the real file responds differently => keep it
-    l1, l2 = len(r1.text or ""), len(r2.text or "")
-    return abs(l1 - l2) <= max(64, int(0.15 * max(l1, l2, 1)))
+        return False                       # inconclusive -> keep
+    if r.status_code != base_status:
+        return False                       # candidate answers differently -> real -> keep
+    cand = _soft404_norm(r.text)
+    return max(_soft404_sim(cand, b) for b in base_bodies) >= _SOFT404_SIM
 
 
 def _soft404_filter(findings, target: str, cookie: str, host_rewrite=None):
