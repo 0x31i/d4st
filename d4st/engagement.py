@@ -675,6 +675,29 @@ def _drop_soft404_targets(targets: list["Target"], cookie: str) -> tuple[list["T
     return kept, dropped
 
 
+def _materialize_url(t: "Target") -> str:
+    """Turn a GET Target into a CONCRETE parameterized URL the URL-list injection tools (sqlmap,
+    ghauri, commix, dalfox, lfi_fuzz) can consume. A form target's `url` is only the action path
+    (e.g. /vulnerabilities/sqli/) — its params live in t.params/t.values, so it has no query string
+    and the tools' require-params filter silently drops it (they never test form-based injection
+    points, the majority on a real app). Fill each param with the form's own value (so a required
+    Submit button is carried, and the endpoint actually executes) or a probe value where none
+    exists. Already-concrete URLs pass through unchanged; POST forms return "" (native probes and
+    the form-fuzzers handle those via request bodies)."""
+    from urllib.parse import urlencode, urlsplit
+    url = getattr(t, "url", "") or ""
+    if (getattr(t, "method", "GET") or "GET").upper() != "GET":
+        return ""
+    if urlsplit(url).query:                 # already a concrete ?a=b URL
+        return url
+    params = getattr(t, "params", None) or []
+    values = getattr(t, "values", None) or {}
+    if not params:
+        return ""
+    q = {p: (values.get(p) or "1") for p in params}
+    return f"{url.split('?')[0]}?{urlencode(q)}"
+
+
 # ----- response pipeline (Burp-style passive inspection of EVERY response) ----
 # Any response the probes generate (including AUDIT-time responses to injected payloads) is
 # fed to the active PII sink, so PII that only surfaces in an error/audit response is caught
@@ -2296,7 +2319,11 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         if not health.halted:
             # FULL frontier to the roster: batch tools (dalfox/nuclei) cover every case; the
             # per-URL subprocess tools get a stratified per-category cap inside run_roster.
-            _safe_urls = [t.url for t in active_targets if t.params] or \
+            # Materialize form targets into concrete ?a=b URLs so the URL-list injection tools
+            # (sqlmap/ghauri/commix/dalfox/lfi_fuzz) actually test form-based injection points,
+            # not just already-parameterized crawl URLs. Without this, forms (DVWA's SQLi, and
+            # most real-app injection points) are silently skipped by these tools.
+            _safe_urls = [u for u in (_materialize_url(t) for t in active_targets) if u] or \
                 [t.url for t in active_targets]
             findings += run_roster(target, _safe_urls, cookie, policy,
                                    js_dir=os.environ.get("D4ST_JS_DIR", ""),
