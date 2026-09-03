@@ -2340,7 +2340,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         if health.check() >= 2:
             zap_note = "skipped: target unhealthy"
         elif not zap_available():
-            zap_note = "skipped: docker/zap-stable image not available"
+            zap_note = "skipped: ZAP unavailable (no baked-in zap.sh, no dockerized zaproxy image)"
         else:
             import tempfile as _tf
             try:
@@ -2451,9 +2451,25 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
 
 # ----- ZAP (passive categories + generative active scan, dockerized) ----------
 
+def _zap_in_image() -> bool:
+    """True when d4st is running INSIDE the packaged appliance image, which is built FROM the
+    ZAP image — so `zap.sh` + `zap-full-scan.py` are already on PATH and ZAP runs in-process.
+    In that case there is NO docker-in-docker to spin up a `zaproxy/zap-stable` sibling
+    container (that path silently skips ZAP → active coverage vanishes). Detecting the baked-in
+    ZAP lets us run it directly instead. D4ST_ZAP_MODE=docker forces the legacy sibling-container
+    path (host/source runs where d4st is NOT inside the ZAP image)."""
+    if os.environ.get("D4ST_ZAP_DOCKER", "") == "1":
+        return False
+    import shutil
+    return shutil.which("zap.sh") is not None or shutil.which("zap-full-scan.py") is not None
+
+
 def zap_available() -> bool:
-    """True if the dockerized ZAP can run (docker daemon up + zap-stable image pulled).
-    Lets the mega scan include ZAP when present and cleanly skip it when not."""
+    """True if ZAP can run: baked into the appliance image (preferred), OR dockerized on the
+    host (docker daemon up + zap-stable image pulled). Lets the scan include ZAP when present
+    and cleanly skip it only when neither path exists."""
+    if _zap_in_image():
+        return True
     try:
         if subprocess.run(["docker", "info"], capture_output=True, timeout=15,
                           check=False).returncode != 0:
@@ -2466,8 +2482,12 @@ def zap_available() -> bool:
 
 
 def _zap_host_rewrite(u: str) -> str:
-    """localhost/127.0.0.1 inside the container is the CONTAINER, not the host. Rewrite to
-    host.docker.internal so ZAP reaches the app on the Mac. (LAN IPs pass through unchanged.)"""
+    """localhost/127.0.0.1 inside a SIBLING ZAP container is that container, not the host — so on
+    the dockerized path we rewrite to host.docker.internal. In-image ZAP shares the d4st network
+    namespace (the target is reachable directly), so it passes through unchanged. LAN IPs always
+    pass through."""
+    if _zap_in_image():
+        return u
     for lh in ("localhost", "127.0.0.1"):
         if f"//{lh}" in u:
             return u.replace(f"//{lh}", "//host.docker.internal")
@@ -2499,10 +2519,34 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
     # report is written container-side to a path that never appears on the host => run_zap saw no
     # zap.json and returned 0. THIS was the real ZAP 0-findings cause. Force the working dir under
     # a shared base (default ~/.d4st/zap, overridable) regardless of the out_dir we were given.
-    _base = os.environ.get("D4ST_ZAP_WORKDIR", os.path.expanduser("~/.d4st/zap"))
-    os.makedirs(_base, exist_ok=True)
-    out_dir = tempfile.mkdtemp(prefix="zap-", dir=_base)
+    _in_image = _zap_in_image()
+    if _in_image:
+        # Baked-in ZAP runs in-process — no bind mount. Use /zap/wrk (the ZAP image's own working
+        # dir, always writable), which makes every hardcoded /zap/wrk/... path in the plan below
+        # resolve directly. Clear any stale artifacts from a prior run first.
+        out_dir = "/zap/wrk"
+        os.makedirs(out_dir, exist_ok=True)
+        for _stale in ("zap.json", "plan.yaml", "frontier.txt"):
+            try:
+                os.remove(os.path.join(out_dir, _stale))
+            except OSError:
+                pass
+    else:
+        _base = os.environ.get("D4ST_ZAP_WORKDIR", os.path.expanduser("~/.d4st/zap"))
+        os.makedirs(_base, exist_ok=True)
+        out_dir = tempfile.mkdtemp(prefix="zap-", dir=_base)
     report_path = os.path.join(out_dir, "zap.json")
+
+    def _wrap(zap_cmd: list[str], cname: str) -> list[str]:
+        """In-image: run the baked-in ZAP binary directly. Host: wrap it in a dockerized
+        zaproxy/zap-stable sibling container with the working dir bind-mounted to /zap/wrk."""
+        if _in_image:
+            return zap_cmd
+        return ["docker", "run", "--rm", "--name", cname,
+                "--add-host=host.docker.internal:host-gateway",
+                "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
+                "zaproxy/zap-stable", *zap_cmd]
+
     ck = cookie.replace("; ", ";")
     # Auth cookie replacer + logout exclusion — shared by both modes, passed as ZAP -config.
     auth_cfg = [
@@ -2660,11 +2704,10 @@ jobs:
         # (D4ST_ZAP_XMX, default 3g). zap.sh forwards -Xmx to the JVM.
         _xmx = os.environ.get("D4ST_ZAP_XMX", "3g")
         _cname = "d4st-zap-" + os.path.basename(out_dir)
-        args = ["docker", "run", "--rm", "--name", _cname,
-                "--add-host=host.docker.internal:host-gateway",
-                "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
-                "zaproxy/zap-stable", "zap.sh", f"-Xmx{_xmx}", "-cmd",
-                "-autorun", "/zap/wrk/plan.yaml", *auth_cfg]
+        # /zap/wrk is the process-side path in BOTH modes: it's the ZAP image's working dir
+        # in-image, and the bind-mount point of out_dir on the dockerized path.
+        args = _wrap(["zap.sh", f"-Xmx{_xmx}", "-cmd",
+                      "-autorun", "/zap/wrk/plan.yaml", *auth_cfg], _cname)
         # Stall watchdog, not a fixed clock: ZAP is dropped only if the CONTAINER goes both silent
         # AND idle (genuinely hung) or hits the absolute backstop — never for being thorough/slow.
         _zap_out, _reason = _run_stalled(args, stall_secs=_stall, ceiling_secs=timeout,
@@ -2682,11 +2725,10 @@ jobs:
         f" -config spider.maxDuration={_spider_min}"
         " -config spider.maxDepth=10 -config spider.maxChildren=0"
     )
-    args = ["docker", "run", "--rm", "--add-host=host.docker.internal:host-gateway",
-            "-v", f"{os.path.abspath(out_dir)}:/zap/wrk/:rw",
-            "zaproxy/zap-stable", "zap-full-scan.py", "-t", zt,
-            "-J", "zap.json", "-a", "-m", str(_spider_min), "-T", "90", "-I", "-z", zopts]
+    _spider_cmd = ["zap-full-scan.py", "-t", zt,
+                   "-J", "zap.json", "-a", "-m", str(_spider_min), "-T", "90", "-I", "-z", zopts]
     if os.environ.get("D4ST_ZAP_AJAX", "0") == "1":
-        args.insert(-3, "-j")
+        _spider_cmd.insert(-3, "-j")
+    args = _wrap(_spider_cmd, "d4st-zap-spider")
     _zap_out = _run(args, timeout=timeout)
     return _parse()
