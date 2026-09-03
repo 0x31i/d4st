@@ -1,10 +1,34 @@
-# d4st
+<p align="center">
+  <img src="docs/d4st-logo.png" alt="d4st" width="340">
+</p>
 
-**A standalone, open-source DAST appliance for recurring, unattended, authenticated web-app
-scanning.** d4st chains best-in-class open-source scanners behind a single captured login
-session, drives them over a shared crawl frontier, deterministically verifies findings to
-suppress false positives, and produces a client-grade report — coverage on par with commercial
-DAST, at open-source cost.
+<h3 align="center">Standalone open-source DAST appliance</h3>
+
+<p align="center">
+  Recurring, unattended, <b>authenticated</b> web-app scanning — a full open-source scanner
+  stack behind one captured session, deterministically verified findings, client-grade reports.
+</p>
+
+<p align="center">
+  <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-6E56CF.svg">
+  <img alt="Deploy: Docker" src="https://img.shields.io/badge/Deploy-Docker-2496ED?logo=docker&logoColor=white">
+  <img alt="Scanners: 25+" src="https://img.shields.io/badge/Scanners-25%2B-8B5CF6">
+  <img alt="Auth: Playwright + TOTP" src="https://img.shields.io/badge/Auth-Playwright%20%2B%20TOTP-4C1D95">
+  <img alt="CLI-first" src="https://img.shields.io/badge/Interface-CLI--first-1F1147">
+</p>
+
+<p align="center">
+  <video src="https://github.com/0x31i/d4st/raw/main/docs/d4st-intro.mp4" controls muted width="760"></video>
+</p>
+
+<p align="center"><a href="https://github.com/0x31i/d4st/raw/main/docs/d4st-intro.mp4"><b>▶ Watch the intro</b></a></p>
+
+---
+
+d4st chains best-in-class open-source scanners behind a single captured login session, drives
+them over a shared crawl frontier, deterministically verifies findings to suppress false
+positives, and produces a client-grade report — coverage on par with commercial DAST, at
+open-source cost.
 
 It runs self-hosted inside your own network (no off-VPN reachability problem), ships as a
 single Docker image, and is CLI-first so it automates cleanly. It replaces the *recurring
