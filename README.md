@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/d4st-logo.png" alt="d4st" width="340">
+  <img src="docs/d4st-logo-wide.png" alt="d4st" width="820">
 </p>
 
 <h3 align="center">Standalone open-source DAST appliance</h3>
