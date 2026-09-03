@@ -74,11 +74,13 @@ RUN set -eux; \
     go install github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest; \
     go install github.com/BishopFox/jsluice/cmd/jsluice@latest; \
     go install github.com/Charlie-belmer/nosqli@latest; \
-    go install github.com/gitleaks/gitleaks/v8@latest; \
-    go install github.com/trufflesecurity/trufflehog/v3@latest
+    go install github.com/zricethezav/gitleaks/v8@latest   # module still declares the old org path
 
-# --- Rust-based scanners (release binaries / official installers, no cargo build) ---
+# --- release-binary / official-installer tools (no compile) ---
 RUN set -eux; \
+    # trufflehog: official installer grabs the prebuilt binary (go-install compiles a huge tree)
+    curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+      | sh -s -- -b /usr/local/bin; \
     curl -sfL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh \
       | bash -s -- -b /usr/local/bin; \
     # x8 hidden-parameter finder: resolve latest tag via the releases redirect, grab the binary
