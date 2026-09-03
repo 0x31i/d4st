@@ -81,13 +81,15 @@ RUN set -eux; \
     # trufflehog: official installer grabs the prebuilt binary (go-install compiles a huge tree)
     curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
       | sh -s -- -b /usr/local/bin; \
-    curl -sfL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh \
-      | bash -s -- -b /usr/local/bin; \
-    # x8 hidden-parameter finder: resolve latest tag via the releases redirect, grab the binary
-    xver="$(curl -sfL --retry 5 --retry-all-errors --connect-timeout 30 -o /dev/null -w '%{url_effective}' https://github.com/Sh1Yo/x8/releases/latest | sed -E 's#.*/tag/v?##')"; \
+    # feroxbuster: its install-nix.sh ignores -b and installs to cwd, so fetch the release zip.
+    # Asset names are version-less, so releases/latest/download/<asset> always gets the current build.
     curl -sfL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 --speed-limit 2048 --speed-time 30 \
-      -o /usr/local/bin/x8 "https://github.com/Sh1Yo/x8/releases/download/v${xver}/x8_linux_amd64" \
-      && chmod +x /usr/local/bin/x8
+      -o /tmp/ferox.zip https://github.com/epi052/feroxbuster/releases/latest/download/x86_64-linux-feroxbuster.zip; \
+    unzip -o /tmp/ferox.zip -d /usr/local/bin feroxbuster; rm -f /tmp/ferox.zip; chmod +x /usr/local/bin/feroxbuster; \
+    # x8 hidden-parameter finder: gzipped release binary
+    curl -sfL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 --speed-limit 2048 --speed-time 30 \
+      -o /tmp/x8.gz https://github.com/Sh1Yo/x8/releases/latest/download/x86_64-linux-x8.gz; \
+    gunzip -c /tmp/x8.gz > /usr/local/bin/x8; rm -f /tmp/x8.gz; chmod +x /usr/local/bin/x8
 
 # --- apt scanner (Ruby) ---
 RUN apt-get update && apt-get install -y --no-install-recommends whatweb \
