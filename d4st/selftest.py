@@ -98,11 +98,41 @@ class SelfTestResult:
     detail: str
 
 
+# Canonical scanner roster: every external binary an adapter expects on PATH. selftest FAILS if
+# any is missing, so a partial image (e.g. only the core subset baked in) is caught the first
+# time `d4st selftest` runs, instead of the adapter silently skipping the tool mid-engagement.
+ROSTER = [
+    # core detection
+    "nuclei", "katana", "dalfox", "sqlmap", "commix", "zap-full-scan.py", "interactsh-client",
+    # recon / discovery
+    "ffuf", "feroxbuster", "x8", "gau", "whatweb",
+    # JS / secrets
+    "jsluice", "semgrep", "trufflehog", "gitleaks",
+    # API / GraphQL
+    "schemathesis", "jwt_tool", "graphw00f",
+    # active detection / injection
+    "ghauri", "sstimap", "crlfuzz", "nosqli", "openredirex", "dotdotpwn", "xsrfprobe",
+    # TLS
+    "testssl.sh",
+]
+
+
+def roster_presence() -> list["SelfTestResult"]:
+    """Assert every roster binary is on PATH. A MISSING tool means the image is incomplete and
+    that tool's adapter would silently skip, so this fails the selftest loudly."""
+    return [
+        SelfTestResult(f"tool:{t}", t, shutil.which(t) is not None,
+                       "on PATH" if shutil.which(t) else "MISSING from image (adapter would skip)")
+        for t in ROSTER
+    ]
+
+
 def run_selftest() -> list[SelfTestResult]:
     """Run each parse path against a canary that MUST be detected. A failure means the
     parser/tool is broken (not that the canary is safe)."""
     from .engagement import verify_lfi, verify_open_redirect, verify_reflected_xss, verify_sqli
-    out: list[SelfTestResult] = []
+    # Roster presence first: a missing tool is an incomplete image, caught up front.
+    out: list[SelfTestResult] = roster_presence()
     with CanaryServer() as c:
         b = c.base
         # our deterministic probes
