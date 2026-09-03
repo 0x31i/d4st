@@ -1462,7 +1462,9 @@ def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[
 _SOFT404_RANDOM = ("d4st-nx-9q2z7x1a4k", "d4st-nx-4k8w3v6bqp", "d4st-nx-p7m2t8w1zc")
 # Strip per-request noise (CSRF tokens, session ids, timestamps, nonces) so soft-404 comparison
 # sees page STRUCTURE, not volatile values that differ every request: long hex, base64, digit runs.
-_SOFT404_NOISE = re.compile(r"[0-9a-f]{16,}|[A-Za-z0-9+/]{24,}={0,2}|\d{4,}", re.I)
+# Also strip our own d4st-nx probe markers so a not-found page that ECHOES the requested path (e.g.
+# Apache's "URL /x not found") reduces to its shared structure and still calibrates across samples.
+_SOFT404_NOISE = re.compile(r"d4st-nx-[a-z0-9]+|[0-9a-f]{16,}|[A-Za-z0-9+/]{24,}={0,2}|\d{4,}", re.I)
 _SOFT404_SIM = 0.90            # content-similarity at/above this == same page structure
 _SOFT404_BASELINE: dict = {}   # (parent, cookie) -> (status, [normalized not-found bodies]) or None
 # Findings that ASSERT a file/path exists (soft-404-prone). Header/behaviour findings (CORS, CSP,
