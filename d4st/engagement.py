@@ -1406,6 +1406,15 @@ def run_sqlmap(t: Target, cookie: str, politeness=None, policy=None,
         args += ["-u", f"{t.url}?{t.data_string()}" if "?" not in t.url else t.url]
     if cookie:
         args += ["--cookie", cookie]
+    # Restrict testing to the REAL injectable params. At level 5 sqlmap otherwise tests the Cookie
+    # header too, injecting payloads into the SESSION cookie (PHPSESSID/security on DVWA) — which
+    # corrupts its own auth mid-run, so every subsequent request 302s to the login page and the
+    # boolean/error/time differential is poisoned (=> 0 confirmed injections despite the endpoint
+    # being trivially vulnerable). Pinning -p to the form/query params keeps the session intact and
+    # is faster. Fall back to testing everything only when we somehow have no param list.
+    _p = [p for p in (t.params or []) if p and p != t.csrf_field]
+    if _p:
+        args += ["-p", ",".join(_p)]
     if t.csrf_field:
         args += ["--csrf-token", t.csrf_field, "--csrf-url", t.csrf_url]
     # Bound wall-time per parameter. sqlmap BEU confirms a detectable injection within a couple
@@ -1878,6 +1887,25 @@ def _session_from_cookie(cookie: str, target: str) -> dict | None:
             "headers": {}, "meta": {}, "captured_at": ""}
 
 
+# Param-name signatures of a password/credential-CHANGE form. Fuzzing these can reset the account's
+# OWN password (DVWA's csrf module did exactly this — every payload set a new password and locked the
+# scanner out, cascading into dead sessions + 0 injection findings) and it mutates the client's
+# credentials, which is never acceptable in an unattended engagement. Matched on field names so it is
+# fully target-agnostic (works on any app, not just DVWA).
+_CRED_MUTATION_HINTS = (
+    "password_new", "password_conf", "new_password", "newpassword", "confirm_password",
+    "confirmpassword", "password_confirmation", "npass", "cpass", "pass_new", "pass_conf",
+    "current_password", "old_password", "oldpassword", "passwd_new",
+)
+
+
+def _is_credential_form(t) -> bool:
+    """True if a target's params look like a password/credential-change form (has a new/confirm
+    password field). Such forms are crawled + passively/CSRF-analyzed but never actively fuzzed."""
+    names = {str(p).lower() for p in (getattr(t, "params", None) or [])}
+    return any(h in names for h in _CRED_MUTATION_HINTS)
+
+
 def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
                js_dir: str = "", level_override: int | None = None, health=None,
                per_url_cap: int = 0, progress=None, base_findings=None,
@@ -2255,6 +2283,17 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # SAFETY: never actively test auth endpoints (submitting payloads/failed logins there
     # locks accounts and logs the scanner out). Passive checks still cover them read-only.
     targets = [t for t in targets if not is_auth_endpoint(t.url)]
+    # SAFETY: never actively fuzz a password/credential-CHANGE form. Sending payloads there can
+    # reset the account's own password (DVWA's csrf module did this, locking every later stage out
+    # of the app -> dead sessions, sqlmap 0 findings) and it mutates the client's credentials. Drop
+    # them from active testing ALWAYS (any profile); they remain crawled + passively/CSRF-analyzed.
+    _cred = [t for t in targets if _is_credential_form(t)]
+    _cred_paths = {urlsplit(t.url).path for t in _cred}   # also excluded from ZAP's frontier below
+    if _cred:
+        targets = [t for t in targets if not _is_credential_form(t)]
+        print(f"[safety] excluded {len(_cred)} credential-change form(s) from active fuzzing "
+              f"(would mutate creds / lock out the scan): "
+              f"{', '.join(sorted(_cred_paths))}", flush=True)
     # SAFETY: under production-safe, never fuzz destructive/notifying endpoints
     # (delete/send/pay/...). They are still crawled + passively analyzed, just not attacked.
     active_targets = targets
@@ -2526,8 +2565,15 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 # seed_url is only used by the legacy spider fallback (D4ST_ZAP_MODE=spider).
                 _zap_seed = (_seeds[0] if _seeds else "")
                 _zap_before = len(findings)
+                # ZAP runs LAST, after the long sqlmap depth loop, so the session it inherits is the
+                # most likely to have expired. Re-auth right before it so ZAP scans authenticated
+                # (its cookie replacer only helps if the cookie it is handed is still valid).
+                cookie = _session.ensure("zap")
+                # Keep credential-change forms out of ZAP's frontier too — ZAP fills forms during
+                # its active scan and would otherwise reset the password ZAP itself logged in with.
+                _zap_frontier = [u for u in urls if urlsplit(u).path not in _cred_paths]
                 findings += run_zap(target, cookie, _tf.mkdtemp(prefix="d4st-zap-"),
-                                    timeout=_zap_to, seed_url=_zap_seed, frontier=urls)
+                                    timeout=_zap_to, seed_url=_zap_seed, frontier=_zap_frontier)
                 zap_ran = True
                 zap_note = f"ran ({len(findings) - _zap_before} findings)"
             except Exception as exc:  # noqa: BLE001 - ZAP failure must not sink the scan
@@ -2590,6 +2636,11 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             f.confidence = f.confidence or c
             f.payload = f.payload or p
             f.repro = f.repro or r
+    # Final session health: re-probe (re-auth on loss) so authed_at_end reflects whether the session
+    # is RECOVERABLE at the end, not whether it happened to idle-out during ZAP's long run. Honest:
+    # if the re-auth genuinely fails, alive() is still False and authed_at_end reports it.
+    if _session.enabled:
+        _session.ensure("final")
     return {
         "urls": urls, "targets": len(targets),
         "findings": [f.__dict__ for f in uniq],
