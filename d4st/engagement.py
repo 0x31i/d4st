@@ -603,9 +603,16 @@ def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[
     return out
 
 
-def discover_targets(urls: list[str], cookie: str, host: str) -> list[Target]:
+def discover_targets(urls: list[str], cookie: str, host: str,
+                     session_keeper=None) -> list[Target]:
     """Turn crawled URLs into injection targets: GET URLs with query params, and every
-    discovered form (POST/GET) with its CSRF token."""
+    discovered form (POST/GET) with its CSRF token.
+
+    The form loop fetches EACH unique page (up to ~12s apiece), so on a large app it easily
+    outlasts the session lifetime. If the session dies partway, fetch_forms then returns the
+    LOGGED-OUT login page for every remaining page and silently misses their authenticated forms
+    (the DVWA SQLi form was lost exactly this way). Pass session_keeper to re-probe/re-auth before
+    each page fetch so every form is discovered as the logged-in user."""
     targets: list[Target] = []
     seen: set = set()
     # host may carry a port (localhost:3000) while urlsplit(...).hostname strips it — compare
@@ -622,9 +629,15 @@ def discover_targets(urls: list[str], cookie: str, host: str) -> list[Target]:
                 targets.append(Target(url=u, method="GET", params=params))
 
     # forms (fetch each unique page once)
+    _keeper_on = session_keeper is not None and getattr(session_keeper, "enabled", False)
     for page in sorted({u.split("?")[0] for u in urls}):
         if (urlsplit(page).hostname or want_host).lower() != want_host:
             continue
+        # Keep the session alive ACROSS the long form-fetch loop: re-probe (re-auth on loss) before
+        # each page so a mid-loop session death can't turn every remaining authenticated form into
+        # a missed login page. Cheap when the session is healthy (one probe); only re-auths on loss.
+        if _keeper_on:
+            cookie = session_keeper.ensure("discover-forms")
         for f in fetch_forms(page, cookie):
             ip = f.injectable_params()
             if not ip:
@@ -2238,7 +2251,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # form discovery so fetch_forms parses the REAL authenticated forms, not the login page (the
     # exact failure DVWA exposed: dead session => every form looked like the login form).
     cookie = _session.ensure("discover-targets")
-    targets = discover_targets(urls, cookie, host)
+    targets = discover_targets(urls, cookie, host, session_keeper=_session)
     # SAFETY: never actively test auth endpoints (submitting payloads/failed logins there
     # locks accounts and logs the scanner out). Passive checks still cover them read-only.
     targets = [t for t in targets if not is_auth_endpoint(t.url)]
