@@ -132,3 +132,35 @@ def test_parse_zap_findings_and_urls():
 
 def test_parse_zap_empty():
     assert parse_zap({}) == ([], [])
+
+
+def test_map_bounded_respects_ceiling_and_isolates_errors():
+    """The per-URL fan-out helper must never exceed the caller's concurrency ceiling (that is
+    the whole safety guarantee) and one item raising must not sink the batch."""
+    import threading
+    import time
+
+    from d4st.orchestrator.adapters.base import map_bounded
+
+    peak = {"cur": 0, "max": 0}
+    lock = threading.Lock()
+
+    def fn(x):
+        with lock:
+            peak["cur"] += 1
+            peak["max"] = max(peak["max"], peak["cur"])
+        time.sleep(0.01)
+        with lock:
+            peak["cur"] -= 1
+        if x == 3:
+            raise ValueError("boom")
+        return x * 10
+
+    errs = []
+    res = map_bounded(fn, list(range(8)), workers=3, on_error=lambda e: errs.append(e))
+    assert peak["max"] <= 3                       # never more concurrent than the ceiling
+    assert sorted(r for r in res) == [0, 10, 20, 40, 50, 60, 70]   # 30 dropped by the error
+    assert len(errs) == 1
+    # workers clamps to len(items); empty is a no-op; workers=1 runs inline
+    assert map_bounded(lambda x: x, [], workers=4) == []
+    assert map_bounded(lambda x: x * 2, [5], workers=99) == [10]

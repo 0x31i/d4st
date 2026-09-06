@@ -44,7 +44,22 @@ def test_staging_and_aggressive_are_full_depth():
 def test_legacy_aliases_resolve():
     assert get_policy("polite").name == "production-safe"
     assert get_policy("normal").name == "staging"
-    assert get_policy("unknown-name").name == "safe-deep"   # safe-deep is THE default
+    assert get_policy("unknown-name").name == "engagement"   # engagement is THE default
+
+
+def test_engagement_is_default_and_matches_safe_deep_contract():
+    """The default profile is faster (bounded parallelism) but must carry the SAME safety
+    contract as safe-deep on every risk-bearing knob — speed and safety are orthogonal."""
+    assert get_policy("literally-anything-unknown").name == "engagement"
+    e, sd = get_policy("engagement"), get_policy("safe-deep")
+    for attr in ("active_scan", "skip_state_changing", "sqlmap_risk", "sqlmap_technique",
+                 "sqlmap_level", "oast_selfhosted_only", "lfi_deep"):
+        assert getattr(e, attr) == getattr(sd, attr), attr
+    # the only difference is throughput: higher bounded concurrency + rate than the gentle profile
+    assert e.politeness.concurrency > sd.politeness.concurrency
+    assert e.politeness.rps > sd.politeness.rps
+    # ...but still bounded, never the owned-lab aggressive ceiling
+    assert e.politeness.concurrency <= get_policy("aggressive").politeness.concurrency
 
 
 def test_sqlmap_args_render():

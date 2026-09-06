@@ -10,7 +10,7 @@ import re
 import tempfile
 
 from ._targets import candidate_urls
-from .base import AdapterResult, RunContext, ToolAdapter, register
+from .base import AdapterResult, RunContext, ToolAdapter, map_bounded, register
 from .session_util import _cookie_header
 
 # commix reports e.g. (wording varies by version/technique):
@@ -74,22 +74,31 @@ class CommixAdapter(ToolAdapter):
                                  note="commix binary not found on PATH")
 
         cookie = _cookie_header(ctx.session, ctx.target)
+        _d = ctx.options.get("delay_ms")
+        _timeout = min(int(ctx.options.get("timeout", 900)), 150)
+
+        def _probe(url: str) -> list[dict]:
+            out_dir = tempfile.mkdtemp(prefix="commix_")
+            args = ["commix", "--url", url, "--batch", "--output-dir", out_dir]
+            if _d:   # honor scan politeness between requests
+                args += ["--delay", str(max(1, int(_d / 1000)))]
+            if cookie:
+                args += ["--cookie", cookie]
+            # per-URL wall-time cap: don't let one target burn the roster's full budget
+            proc = self._exec(args, timeout=_timeout)
+            return parse_commix(proc.stdout, url)
+
+        # Bounded fan-out over the target list. Pool size = the scan's concurrency ceiling
+        # (workers), so this honors the same politeness as every other stage: serial on gentle
+        # profiles (safe-deep concurrency=2 stays ~2-way), parallel on faster ones — instead of
+        # the old strictly-serial grind that ignored the concurrency knob and cost hours.
+        _errors = [0]
+        results = map_bounded(_probe, targets, ctx.options.get("workers", 1),
+                              on_error=lambda _e: _errors.__setitem__(0, _errors[0] + 1))
         findings: list[dict] = []
-        errors = 0
-        for url in targets:
-            try:
-                out_dir = tempfile.mkdtemp(prefix="commix_")
-                args = ["commix", "--url", url, "--batch", "--output-dir", out_dir]
-                _d = ctx.options.get("delay_ms")
-                if _d:   # honor scan politeness between requests
-                    args += ["--delay", str(max(1, int(_d / 1000)))]
-                if cookie:
-                    args += ["--cookie", cookie]
-                # per-URL wall-time cap: don't let one target burn the roster's full budget
-                proc = self._exec(args, timeout=min(int(ctx.options.get("timeout", 900)), 150))
-                findings.extend(parse_commix(proc.stdout, url))
-            except Exception:  # noqa: BLE001 - one target failing must not sink the rest
-                errors += 1
+        for r in results:
+            findings.extend(r or [])
+        errors = _errors[0]
 
         note = f"{len(findings)} cmd-injection point(s)"
         if errors:
