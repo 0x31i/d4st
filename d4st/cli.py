@@ -248,13 +248,16 @@ def score(oracle: str, results_dir: str, burp_path: str | None, out_path: str | 
 @click.option("--target", "-t", required=True, help="Base URL (blind: no endpoints supplied).")
 @click.option("--session", "-s", "session_path", required=True, help="Captured session JSON.")
 @click.option("--depth", default=3, type=int, help="Crawl depth.")
-@click.option("--profile", default="safe-deep",
-              type=click.Choice(["safe-deep", "production-safe", "passive-only", "staging",
-                                 "aggressive", "polite", "normal"]),
-              help="Scan policy. DEFAULT 'safe-deep': one posture for every scan — safe for "
-                   "live infra (throttled, no data mutation, no destructive/auth endpoints, "
-                   "non-corrupting sqlmap) AND maximum depth (full tool roster + full payload "
-                   "corpus + convergence discovery). Others are narrower overrides.")
+@click.option("--profile", default="engagement",
+              type=click.Choice(["engagement", "safe-deep", "production-safe", "passive-only",
+                                 "staging", "aggressive", "polite", "normal"]),
+              help="Scan policy. DEFAULT 'engagement': a normal-engagement posture that finishes "
+                   "in hours, not days — full depth (full tool roster + payload corpus + "
+                   "convergence discovery) and the full safe contract (no data mutation, no "
+                   "destructive/auth endpoints, non-corrupting sqlmap, in-network OAST, adaptive "
+                   "halt on target stress), sped up by BOUNDED parallelism. Use 'safe-deep' for "
+                   "fragile/legacy targets (same depth, gentle single-stream throttle). Others "
+                   "are narrower overrides.")
 @click.option("--out", "-o", "out_path", default=None, help="Write findings JSON here.")
 def engagement(target: str, session_path: str, depth: int, profile: str,
                out_path: str | None) -> None:

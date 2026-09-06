@@ -102,11 +102,13 @@ class Politeness:
 
 
 # Named profiles.
-POLITE = Politeness(rps=2.0, concurrency=2, delay_ms=250)     # production / lockout-prone
+POLITE = Politeness(rps=2.0, concurrency=2, delay_ms=250)      # fragile / lockout-prone infra
+ENGAGEMENT = Politeness(rps=12.0, concurrency=6, delay_ms=0)   # normal engagement (bounded parallel)
 NORMAL = Politeness(rps=8.0, concurrency=8, delay_ms=0)        # test env
 AGGRESSIVE = Politeness(rps=25.0, concurrency=20, delay_ms=0)  # owned lab, allowlisted
 
-PROFILES = {"polite": POLITE, "normal": NORMAL, "aggressive": AGGRESSIVE}
+PROFILES = {"polite": POLITE, "engagement": ENGAGEMENT, "normal": NORMAL,
+            "aggressive": AGGRESSIVE}
 
 
 @dataclass
@@ -131,11 +133,23 @@ class ScanPolicy:
                 f"--technique={self.sqlmap_technique}"]
 
 
-# Named policies. 'safe-deep' is THE default: one posture, every scan — safe for live infra
-# AND maximum detection depth. Safety and depth are orthogonal: throttling + no data mutation
-# + skipping destructive/auth endpoints + non-corrupting sqlmap techniques keep it safe, while
-# the full tool roster + full payload corpus + full param coverage keep it deep.
+# Named policies. 'engagement' is THE default: a normal professional-engagement posture that
+# finishes in hours, not days. Safety and speed are orthogonal here — it keeps the FULL safe
+# contract (never fuzz destructive/notifying or auth endpoints, no data-mutating writes beyond
+# form fuzzing, error/union/boolean sqlmap only, OAST in-network, adaptive halt on target
+# stress) and gets its speed from BOUNDED parallelism (per-URL tools fan out to the concurrency
+# ceiling) plus dropping the artificial per-request delay floor. 'safe-deep' is the same depth
+# at a gentler single-stream throttle — the right choice for fragile/legacy targets (e.g. EHR).
 POLICIES: dict[str, ScanPolicy] = {
+    # Default: fast-but-safe. Bounded parallelism (concurrency 6) + full depth + full safety.
+    "engagement": ScanPolicy(
+        name="engagement", politeness=ENGAGEMENT, active_scan=True, fuzz_forms=True,
+        skip_state_changing=True,          # never fuzz delete/send/pay/... endpoints
+        sqlmap_level=5, sqlmap_risk=1,     # max coverage, safe payloads only (same as safe-deep)
+        sqlmap_technique="BEU",            # boolean/error/union: no time-hang, no stacked writes
+        lfi_deep=True, oast_selfhosted_only=True),
+    # Same depth + safety as engagement but a gentle single-stream throttle (concurrency 2) for
+    # fragile/lockout-prone targets where even bounded parallelism is too much.
     "safe-deep": ScanPolicy(
         name="safe-deep", politeness=POLITE, active_scan=True, fuzz_forms=True,
         skip_state_changing=True,          # never fuzz delete/send/pay/... endpoints
@@ -170,7 +184,7 @@ POLICIES["normal"] = POLICIES["staging"]
 
 
 def get_policy(name: str) -> ScanPolicy:
-    return POLICIES.get(name, POLICIES["safe-deep"])
+    return POLICIES.get(name, POLICIES["engagement"])
 
 
 @dataclass

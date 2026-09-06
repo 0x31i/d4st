@@ -2156,18 +2156,20 @@ def _env_reauth():
 
 
 def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
-                   dom: bool = True, tools: bool = True, profile: str = "safe-deep",
+                   dom: bool = True, tools: bool = True, profile: str = "engagement",
                    zap: bool = True, reauth=None, session_probe: str = "",
                    session_marker: str = "", jwt_refresh=None) -> dict:
     """Full blind flow covering BOTH profiles: blatant injection (DVWA-style) AND the
     hardened-app profile (config/passive + vulnerable JS + API + DOM-based). Returns
     {urls, targets, findings} with findings verified.
 
-    profile: ScanPolicy name. 'production-safe' (live/client infra) throttles hard, sends NO
-    data-mutating traffic, skips destructive/notifying endpoints, and limits sqlmap to safe
-    techniques. 'passive-only' sends no attack traffic at all. 'staging'/'aggressive' are for
-    disposable targets. Auth endpoints (login/logout/reset) are NEVER actively tested under any
-    profile, so the scan cannot lock accounts."""
+    profile: ScanPolicy name. DEFAULT 'engagement' — full depth + full safe contract, sped up by
+    bounded parallelism (finishes in hours). 'safe-deep' is the same depth at a gentle
+    single-stream throttle for fragile/legacy targets. 'production-safe' (live/client infra)
+    throttles hard, sends NO data-mutating traffic, skips destructive/notifying endpoints, and
+    limits sqlmap to safe techniques. 'passive-only' sends no attack traffic at all.
+    'staging'/'aggressive' are for disposable targets. Auth endpoints (login/logout/reset) are
+    NEVER actively tested under any profile, so the scan cannot lock accounts."""
     from .dom import dom_probe
     from .jsanalysis import analyze_js
     from .passive import passive_scan
