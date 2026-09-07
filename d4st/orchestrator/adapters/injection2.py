@@ -8,7 +8,7 @@ import re
 import tempfile
 
 from ._targets import candidate_urls
-from .base import AdapterResult, RunContext, ToolAdapter, register
+from .base import AdapterResult, RunContext, ToolAdapter, map_bounded, register
 from .session_util import _cookie_header
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -68,16 +68,21 @@ class GhauriAdapter(ToolAdapter):
         if not self.available():
             return AdapterResult(tool=self.name, ok=False, command=cmd, note="ghauri not found")
         cookie = _cookie_header(ctx.session, ctx.target)
-        findings: list[dict] = []
-        for url in targets:
+        # Per-URL wall cap: the old code passed the whole-roster `timeout` (up to 1800s) as a
+        # single-URL timeout, so one slow/unresponsive param stalled the serial loop for up to
+        # 30min. Cap short (matches commix 150 / ghauri.py 120) and fan out bounded by concurrency.
+        _to = min(int(ctx.options.get("timeout", 900)), 120)
+
+        def _probe(url: str) -> list[dict]:
             args = ["ghauri", "-u", url, "--batch"]
             if cookie:
                 args += ["--cookie", cookie]
-            try:
-                proc = self._exec(args, timeout=ctx.options.get("timeout", 900))
-                findings.extend(parse_ghauri(proc.stdout))
-            except Exception:  # noqa: BLE001, S112
-                continue
+            proc = self._exec(args, timeout=_to)
+            return parse_ghauri(proc.stdout)
+
+        findings: list[dict] = []
+        for r in map_bounded(_probe, targets, ctx.options.get("workers", 1)):
+            findings.extend(r or [])
         return AdapterResult(tool=self.name, ok=True, findings=findings, command=cmd,
                              note=f"{len(findings)} injection point(s)")
 
@@ -103,16 +108,22 @@ class SstimapAdapter(ToolAdapter):
         if not self.available():
             return AdapterResult(tool=self.name, ok=False, command=cmd, note="sstimap not found")
         cookie = _cookie_header(ctx.session, ctx.target)
-        findings: list[dict] = []
-        for url in targets:
+        # SSTImap decides in seconds on a param it can't inject; the old code used the whole-roster
+        # timeout (up to 1800s) as a PER-URL cap AND ran strictly serially, so every non-injectable
+        # param (e.g. an empty ?x=) hung ~30min in turn — the WAVSEP sstimap bottleneck. Cap short
+        # and fan out bounded by the scan's concurrency, exactly like the commix adapter.
+        _to = min(int(ctx.options.get("timeout", 600)), 120)
+
+        def _probe(url: str) -> list[dict]:
             args = ["sstimap", "-u", url]
             if cookie:
                 args += ["--cookie", cookie]
-            try:
-                proc = self._exec(args, timeout=ctx.options.get("timeout", 600))
-                findings.extend(parse_sstimap(proc.stdout))
-            except Exception:  # noqa: BLE001, S112
-                continue
+            proc = self._exec(args, timeout=_to)
+            return parse_sstimap(proc.stdout)
+
+        findings: list[dict] = []
+        for r in map_bounded(_probe, targets, ctx.options.get("workers", 1)):
+            findings.extend(r or [])
         return AdapterResult(tool=self.name, ok=True, findings=findings, command=cmd,
                              note=f"{len(findings)} ssti")
 
