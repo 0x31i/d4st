@@ -22,8 +22,6 @@
   <video src="https://github.com/0x31i/d4st/raw/main/assets/d4st-intro.mp4" controls muted width="760"></video>
 </p>
 
-<p align="center"><a href="https://github.com/0x31i/d4st/raw/main/assets/d4st-intro.mp4"><b>▶ Watch the intro</b></a></p>
-
 ---
 
 d4st runs a stack of open-source scanners behind a single captured login session. The tools
