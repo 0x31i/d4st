@@ -2288,6 +2288,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # auth. Drive Playwright with the RESTORED session to walk the app's routes (JS route table +
     # routerLink) and capture the real /api/* XHR surface, then fold it into the frontier so the
     # scanners hit the authenticated API (the bearer header is already active from set_auth_header).
+    _harvest_urls: list[str] = []
     if session is not None and getattr(session, "session_storage", None):
         try:
             from .auth.harvest import harvest as _harvest_api
@@ -2295,6 +2296,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                                max_routes=int(os.environ.get("D4ST_HARVEST_ROUTES", "40")))
             _hf = _hv.get("frontier") or []
             if _hf:
+                _harvest_urls = list(_hf)
                 urls = sorted(set(urls) | set(_hf))
                 print(f"[harvest] authenticated API surface: {len(_hf)} endpoints over "
                       f"{len(_hv.get('routes_visited', []))} routes -> frontier", flush=True)
@@ -2469,6 +2471,32 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 findings += _authz
                 print(f"[api-authz] {len(_authz)} BOLA/mass-assignment finding(s)", flush=True)
             _prog.update("api-authz", findings, urls=len(urls), targets=len(targets))
+        # Harvest-driven authorization tests — the schema-less path. Most real SPAs expose NO
+        # OpenAPI spec (APP), so run_api_authz_tests above never fires. Instead replay the
+        # authenticated /api endpoints the harvest found under tampered identities (no-auth /
+        # bad-token / id-tamper) and diff against the authed baseline. READ-ONLY (GET only, no
+        # mutation) + throttled, so it is safe on live/production infra under any active profile;
+        # it finds broken authentication + IDOR that payload injection structurally cannot.
+        if _harvest_urls and session is not None and getattr(session, "session_storage", None):
+            _refresh_jwt("harvest-authz")
+            try:
+                from .auth.authz import run_authz
+                _hz = run_authz(session, target, _harvest_urls,
+                                delay=max(0.1, 1.0 / (pol.rps or 4)) if pol else 0.15)
+            except Exception as _hze:  # noqa: BLE001 - authz pass must never sink the scan
+                print(f"[authz] harvest-authz skipped: {_hze}", flush=True)
+                _hz = []
+            for _d in _hz:
+                findings.append(Finding(
+                    tool="authz", category=_d["type"], url=_d["url"], param=_d.get("method", ""),
+                    evidence=_d["detail"], verified=True,
+                    detection=f"authenticated authorization replay ({_d['type']})",
+                    confidence="firm" if _d["type"] != "idor-suspect" else "tentative",
+                    evidence_log=[_d.get("evidence", {})]))
+            if _hz:
+                print(f"[authz] {len(_hz)} authorization finding(s) from "
+                      f"{len(_harvest_urls)} harvested endpoint(s)", flush=True)
+            _prog.update("harvest-authz", findings, urls=len(urls), targets=len(targets))
         # verify (deterministic replay) the fast-detector findings now, while the target is
         # still healthy — sqlmap (section 5) may stress it afterward.
         findings = [verify_finding(f, cookie) for f in findings]
