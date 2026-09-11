@@ -2308,6 +2308,24 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     api_eps, vuln_libs = analyze_js(js_urls, cookie, host)
     urls = sorted(set(urls) | set(api_eps))
 
+    # SCOPE HYGIENE: keep only in-scope hosts. The headless crawl + XHR capture drag in third-party
+    # resources (CDNs like acrobatservices.adobe.com, the marketing site) that must NEVER be reported
+    # to the client as findings — passive/roster otherwise scans them (8 of 14 off-target on scan 1).
+    # Default scope = the target's EXACT host; D4ST_SCOPE_HOSTS widens it (comma list; a bare domain
+    # also matches its subdomains). Everything downstream (passive/roster/authz/PII) sees only in-scope.
+    _tgt_host = urlsplit(target).netloc.split("@")[-1].split(":")[0].lower()
+    _scope_env = os.environ.get("D4ST_SCOPE_HOSTS", "").strip()
+    _scope = [h.strip().lower() for h in _scope_env.split(",") if h.strip()] or [_tgt_host]
+
+    def _in_scope(u: str) -> bool:
+        h = urlsplit(u).netloc.split("@")[-1].split(":")[0].lower()
+        return any(h == s or h.endswith("." + s) for s in _scope)
+    _before = len(urls)
+    urls = [u for u in urls if _in_scope(u)]
+    if _before != len(urls):
+        print(f"[scope] restricted to {', '.join(_scope)}: kept {len(urls)}/{_before} URL(s) "
+              f"(dropped {_before - len(urls)} off-scope)", flush=True)
+
     # The crawl can outlive the session (a long headless crawl, a stray logout). Re-auth before
     # form discovery so fetch_forms parses the REAL authenticated forms, not the login page (the
     # exact failure DVWA exposed: dead session => every form looked like the login form).
