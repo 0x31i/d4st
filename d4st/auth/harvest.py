@@ -55,6 +55,29 @@ def harvest(session: Session, base: str, routes: list[str] | None = None, *,
             page.goto(origin, wait_until="networkidle", timeout=timeout_ms)  # bootstrap the SPA
         except Exception:
             pass
+
+        # Angular route table lives in the JS bundle — harvest non-parameterized route paths so we
+        # visit the whole app, not just what's linked. (Parameterized routes like patient/:id need
+        # an id, skipped here; the API calls off the pages we DO reach still expose those params.)
+        import re as _re
+        route_re = _re.compile(r"""path\s*:\s*['"]([A-Za-z0-9][A-Za-z0-9_\-/]*)['"]""")
+        try:
+            scripts = page.eval_on_selector_all("script[src]", "els => els.map(e => e.src)") or []
+        except Exception:
+            scripts = []
+        for src in scripts:
+            if origin in src and src.endswith(".js"):
+                try:
+                    txt = page.evaluate("async (u) => { const r = await fetch(u); return await r.text(); }", src)
+                except Exception:
+                    txt = ""
+                for m in set(route_re.findall(txt or "")):
+                    if ":" in m or m in ("", "**"):
+                        continue
+                    r2 = "/" + m.strip("/")
+                    if r2 and r2 not in visited and r2 not in to_visit:
+                        to_visit.append(r2)
+
         i = 0
         while to_visit and i < max_routes:
             route = to_visit.pop(0)
@@ -67,17 +90,19 @@ def harvest(session: Session, base: str, routes: list[str] | None = None, *,
                 page.wait_for_timeout(per_route_ms)
             except Exception:
                 continue
-            # discover more in-app routes from anchors (SPA client-side nav targets)
-            try:
-                hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.getAttribute('href'))") or []
-            except Exception:
-                hrefs = []
+            # discover more in-app routes: <a href> AND Angular [routerLink] (SPAs nav via the latter)
+            hrefs = []
+            for sel, attr in (("a[href]", "href"), ("[routerLink]", "routerLink")):
+                try:
+                    hrefs += page.eval_on_selector_all(sel, f"els => els.map(e => e.getAttribute('{attr}'))") or []
+                except Exception:
+                    pass
             for h in hrefs:
-                if not h:
+                if not h or not isinstance(h, str):
                     continue
                 if h.startswith(origin):
                     h = h[len(origin):]
-                if h.startswith("/") and " " not in h and h not in visited and h not in to_visit:
+                if h.startswith("/") and " " not in h and ":" not in h and h not in visited and h not in to_visit:
                     to_visit.append(h)
         browser.close()
 
