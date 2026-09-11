@@ -1,0 +1,29 @@
+# EHRM 3.0 (FHC staging) login recipe — Angular SPA, form login at /login.
+# Selectors confirmed by rendering the live login page:
+#   username -> input[formcontrolname=txtUserName]  (type=email, placeholder "User Name")
+#   password -> input[formcontrolname=txtPassword]
+#   submit   -> button[type=submit]                 (text "Login")
+# Creds come from env (EHRM_USERNAME / EHRM_PASSWORD) so they never live in this file.
+# A one-off run can override with:  auth capture -u <user> -w <pass>
+name: ehrm
+type: form
+base_url_env: D4ST_EHRM_URL
+login_url: "{base}/login"
+username_selector: "input[formcontrolname=txtUserName]"
+password_selector: "input[formcontrolname=txtPassword]"
+submit_selector: "button[type=submit]"
+username_env: EHRM_USERNAME
+password_env: EHRM_PASSWORD
+
+# Post-login marker — best-guess; finalize after the first successful capture reveals
+# the real landing page. Most EHR dashboards expose a logout control.
+success:
+  body_contains: "Logout"
+
+validity:
+  url: "{base}/"
+  body_contains: "Logout"
+
+totp:
+  enabled: false
+  # If MFA turns out to be TOTP:  enabled: true, seed_env: EHRM_TOTP_SEED, selector: "<otp input>"
