@@ -24,6 +24,7 @@ success:
 validity:
   url: "{base}/provider/new"
   body_contains: "Patient Search"
+  render: true          # SPA: the logged-in marker is client-rendered, so probe with a browser
 
 totp:
   enabled: false
