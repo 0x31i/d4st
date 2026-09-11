@@ -238,6 +238,8 @@ def blind_crawl(target: str, cookie: str, depth: int = 3, duration: str = "3m",
         args += politeness.katana_flags() if politeness else ["-c", "10"]
         if cookie:
             args += ["-H", f"Cookie: {cookie}"]
+        for _k, _v in _AUTH_HEADER.items():      # bearer/header auth (token-SPA APIs) — crawl authed
+            args += ["-H", f"{_k}: {_v}"]
         out = _run(args, timeout=1800)           # generous budget (headless is slow)
         urls |= {ln.strip() for ln in out.splitlines() if ln.strip().startswith("http")}
     return sorted(urls)
@@ -1884,7 +1886,7 @@ def _session_from_cookie(cookie: str, target: str) -> dict | None:
     if not cookies:
         return None
     return {"name": "keeper", "origin": target, "storage_state": {"cookies": cookies},
-            "headers": {}, "meta": {}, "captured_at": ""}
+            "headers": dict(_AUTH_HEADER), "meta": {}, "captured_at": ""}
 
 
 # Param-name signatures of a password/credential-CHANGE form. Fuzzing these can reset the account's
@@ -2158,7 +2160,8 @@ def _env_reauth():
 def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                    dom: bool = True, tools: bool = True, profile: str = "engagement",
                    zap: bool = True, reauth=None, session_probe: str = "",
-                   session_marker: str = "", jwt_refresh=None) -> dict:
+                   session_marker: str = "", jwt_refresh=None,
+                   auth_headers: dict | None = None) -> dict:
     """Full blind flow covering BOTH profiles: blatant injection (DVWA-style) AND the
     hardened-app profile (config/passive + vulnerable JS + API + DOM-based). Returns
     {urls, targets, findings} with findings verified.
@@ -2177,6 +2180,14 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
 
     policy = get_policy(profile)
     pol = policy.politeness
+
+    # Bearer/header auth from the captured session (e.g. APP's Authorization: Bearer <JWT>, lifted
+    # from sessionStorage at capture). Set globally NOW so every httpx probe (_base_headers), the
+    # katana crawl (-H), and the roster (via _session_from_cookie -> translators) run authenticated
+    # from the first request — not only after a JWT happens to be discovered mid-crawl.
+    if auth_headers:
+        set_auth_header(auth_headers)
+        print(f"[auth] header auth active: {', '.join(auth_headers.keys())}", flush=True)
 
     # Session keeper: a long unattended scan MUST survive session loss (idle timeout / rotation /
     # stray logout) or it silently degrades to scanning the login page. Probe validity at each
