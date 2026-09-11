@@ -47,9 +47,11 @@ class AuthProfile:
     def fmt(self, template: str, base: str) -> str:
         return template.replace("{base}", base)
 
-    def creds(self) -> tuple[str, str]:
-        user = os.environ.get(self.username_env) if self.username_env else None
-        pw = os.environ.get(self.password_env) if self.password_env else None
+    def creds(self, user_override: str | None = None,
+              pw_override: str | None = None) -> tuple[str, str]:
+        # precedence: explicit override (CLI flag) > env var > inline profile value
+        user = user_override or (os.environ.get(self.username_env) if self.username_env else None)
+        pw = pw_override or (os.environ.get(self.password_env) if self.password_env else None)
         return (user or self.username, pw or self.password)
 
     def validity_url(self, base: str) -> str:

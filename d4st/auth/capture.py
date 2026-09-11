@@ -33,12 +33,13 @@ def _apply_post_login_cookies(session: Session, profile: AuthProfile, base: str,
 
 def capture_scripted(profile: AuthProfile, base: str | None = None, *,
                      headless: bool = True, security: str | None = None,
+                     username: str | None = None, password: str | None = None,
                      timeout_ms: int = 30000) -> Session:
     from playwright.sync_api import sync_playwright
 
     base = profile.resolve_base(base)
     login_url = profile.fmt(profile.login_url, base)
-    user, pw = profile.creds()
+    user, pw = profile.creds(username, password)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)

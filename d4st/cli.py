@@ -108,8 +108,12 @@ def auth() -> None:
 @click.option("--interactive", "-i", is_flag=True, default=False,
               help="Headed browser; log in by hand (SSO / push MFA / CAPTCHA), then capture.")
 @click.option("--headed", is_flag=True, default=False, help="Run scripted capture with a visible browser.")
+@click.option("--username", "-u", default=None, help="Login username (overrides profile/env creds).")
+@click.option("--password", "-w", default=None,
+              help="Login password (overrides profile/env creds). NOTE: visible in shell history/ps — "
+                   "prefer the profile's *_env vars for anything you want to keep secret.")
 def auth_capture(profile: str, base: str | None, out: str, security: str | None,
-                 interactive: bool, headed: bool) -> None:
+                 interactive: bool, headed: bool, username: str | None, password: str | None) -> None:
     """Establish and persist a login session (the one-time set)."""
     from .auth.capture import capture_interactive, capture_scripted
     from .auth.profile import load_profile
@@ -119,7 +123,8 @@ def auth_capture(profile: str, base: str | None, out: str, security: str | None,
         if interactive:
             session = capture_interactive(prof, base, security=security)
         else:
-            session = capture_scripted(prof, base, headless=not headed, security=security)
+            session = capture_scripted(prof, base, headless=not headed, security=security,
+                                       username=username, password=password)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
     session.save(out)
