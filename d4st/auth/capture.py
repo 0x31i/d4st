@@ -41,11 +41,22 @@ def capture_scripted(profile: AuthProfile, base: str | None = None, *,
     login_url = profile.fmt(profile.login_url, base)
     user, pw = profile.creds(username, password)
 
+    origin = f"{urlsplit(base).scheme}://{urlsplit(base).netloc}"
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         ctx = browser.new_context()
         page = ctx.new_page()
-        page.goto(login_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        # SPA-friendly login: some single-page apps only build the login view after
+        # bootstrapping from the app root, so warm up the origin first, then land on
+        # the login URL and wait for the form to render before filling.
+        if origin.rstrip("/") != login_url.rstrip("/"):
+            try:
+                page.goto(origin, wait_until="networkidle", timeout=timeout_ms)
+            except Exception:
+                pass
+        page.goto(login_url, wait_until="networkidle", timeout=timeout_ms)
+        page.wait_for_selector(profile.username_selector, state="visible", timeout=timeout_ms)
         page.fill(profile.username_selector, user, timeout=timeout_ms)
         page.fill(profile.password_selector, pw, timeout=timeout_ms)
 
