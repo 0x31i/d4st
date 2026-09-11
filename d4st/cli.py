@@ -334,7 +334,7 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
             console.print(f"[yellow]JWT refresh unavailable[/yellow]: {exc}")
 
     result = run_engagement(target, cookie, host, depth=depth, profile=profile,
-                            auth_headers=sess.headers, jwt_refresh=jwt_refresh)
+                            auth_headers=sess.headers, jwt_refresh=jwt_refresh, session=sess)
     console.print(f"crawled {len(result['urls'])} urls · {result['targets']} injection targets")
     pol = result.get("policy", {})
     if pol:
