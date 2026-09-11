@@ -2161,7 +2161,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                    dom: bool = True, tools: bool = True, profile: str = "engagement",
                    zap: bool = True, reauth=None, session_probe: str = "",
                    session_marker: str = "", jwt_refresh=None,
-                   auth_headers: dict | None = None) -> dict:
+                   auth_headers: dict | None = None, session=None) -> dict:
     """Full blind flow covering BOTH profiles: blatant injection (DVWA-style) AND the
     hardened-app profile (config/passive + vulnerable JS + API + DOM-based). Returns
     {urls, targets, findings} with findings verified.
@@ -2282,6 +2282,24 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 urls = sorted(set(urls) | set(_r.discovered_urls))
         except Exception:  # noqa: BLE001,S112 - a discovery tool failing must not sink the scan
             continue
+
+    # Authenticated API-surface harvest (token-SPA crawl-reach lever): katana's browser can't carry
+    # sessionStorage, so a JWT-in-sessionStorage SPA login-walls the crawl and it finds nothing behind
+    # auth. Drive Playwright with the RESTORED session to walk the app's routes (JS route table +
+    # routerLink) and capture the real /api/* XHR surface, then fold it into the frontier so the
+    # scanners hit the authenticated API (the bearer header is already active from set_auth_header).
+    if session is not None and getattr(session, "session_storage", None):
+        try:
+            from .auth.harvest import harvest as _harvest_api
+            _hv = _harvest_api(session, target,
+                               max_routes=int(os.environ.get("D4ST_HARVEST_ROUTES", "40")))
+            _hf = _hv.get("frontier") or []
+            if _hf:
+                urls = sorted(set(urls) | set(_hf))
+                print(f"[harvest] authenticated API surface: {len(_hf)} endpoints over "
+                      f"{len(_hv.get('routes_visited', []))} routes -> frontier", flush=True)
+        except Exception as _hexc:  # noqa: BLE001
+            print(f"[harvest] skipped: {_hexc}", flush=True)
 
     # JS/API discovery: pull API routes out of JS so unlinked endpoints get tested too.
     js_urls = [u for u in urls if u.split("?")[0].endswith(".js")]
