@@ -280,8 +280,11 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
     sess = Session.load(session_path)
     host = urlsplit(target).hostname or ""
     cookie = sess.cookie_header(host)
+    # token-in-sessionStorage SPAs (bearer auth) can only be validated by a rendered browser
+    # probe — a raw GET sees the logged-out shell. render when the session carries sessionStorage.
     ok, note = is_valid(sess, sess.meta.get("validity_url") or target,
-                        sess.meta.get("validity_marker") or "Logout")
+                        sess.meta.get("validity_marker") or "Logout",
+                        render=bool(sess.session_storage))
     if not ok:
         raise click.ClickException(f"session invalid ({note}); re-capture before an engagement.")
 
@@ -307,7 +310,8 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
                       f"{'no attack traffic' if profile == 'passive-only' else 'no data mutation / no destructive endpoints / safe sqlmap'}")
     console.print(f"[green]session valid[/green] · crawling {target} blind...")
 
-    result = run_engagement(target, cookie, host, depth=depth, profile=profile)
+    result = run_engagement(target, cookie, host, depth=depth, profile=profile,
+                            auth_headers=sess.headers)
     console.print(f"crawled {len(result['urls'])} urls · {result['targets']} injection targets")
     pol = result.get("policy", {})
     if pol:
