@@ -131,6 +131,30 @@ VULN_META: dict[str, dict] = {
              "attacker in planning further attacks.",
         fix="Suppress verbose errors/banners, remove debug endpoints, and keep source/secrets out "
             "of responses."),
+    "broken-auth": dict(
+        title="Broken Authentication (Missing Authorization Check)", severity="critical",
+        cwe="CWE-306", owasp="A01:2021 Broken Access Control / API2:2023",
+        desc="An authenticated API endpoint returns real data when the bearer token is removed "
+             "entirely — the server does not enforce authentication on that route. Anyone on the "
+             "network can read the data unauthenticated; in healthcare this is direct PHI exposure.",
+        fix="Enforce authentication server-side on EVERY non-public route (deny-by-default). Do not "
+            "rely on the SPA to attach a token — the API must reject requests that lack a valid one."),
+    "broken-token-validation": dict(
+        title="Broken Token Validation", severity="high", cwe="CWE-347",
+        owasp="A01:2021 Broken Access Control / API2:2023 Broken Authentication",
+        desc="An endpoint accepts a structurally-valid but bogus/unsigned JWT and returns data — the "
+             "server is not verifying the token's signature or expiry, so an attacker can forge a "
+             "token and act as any user.",
+        fix="Verify the JWT signature against the trusted key and reject expired tokens and "
+            "alg=none/algorithm-confusion on every request before serving data."),
+    "idor-suspect": dict(
+        title="IDOR Suspect (Object-Level Authorization)", severity="high", cwe="CWE-639",
+        owasp="API1:2023 BOLA",
+        desc="Changing an object identifier in the request returned a different valid object. This "
+             "may indicate broken object-level authorization (cross-tenant/cross-patient data "
+             "access) and MUST be confirmed manually with a second account before reporting.",
+        fix="Enforce per-object ownership checks server-side on every request; never authorize on "
+            "authentication alone. Confirm whether the returned object belongs to another tenant."),
     "other": dict(
         title="Other Finding", severity="info", cwe="—", owasp="—",
         desc="A finding reported by a scanner that does not map to a standard category.",
