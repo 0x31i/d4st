@@ -15,14 +15,15 @@ submit_selector: "button[type=submit]"
 username_env: EHRM_USERNAME
 password_env: EHRM_PASSWORD
 
-# Post-login marker — best-guess; finalize after the first successful capture reveals
-# the real landing page. Most EHR dashboards expose a logout control.
+# Post-login: successful login routes to /provider/new (provider home) — confirmed live.
+# Markers taken from that authenticated page (stable UI, not user-specific).
 success:
-  body_contains: "Logout"
+  url_contains: "/provider"
+  body_contains: "Patient Search"
 
 validity:
-  url: "{base}/"
-  body_contains: "Logout"
+  url: "{base}/provider/new"
+  body_contains: "Patient Search"
 
 totp:
   enabled: false

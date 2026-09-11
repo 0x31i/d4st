@@ -67,10 +67,22 @@ def capture_scripted(profile: AuthProfile, base: str | None = None, *,
                 page.fill(sel, code, timeout=timeout_ms)
 
         page.click(profile.submit_selector, timeout=timeout_ms)
-        page.wait_for_load_state("networkidle", timeout=timeout_ms)
 
         marker = profile.success.get("body_contains")
         url_contains = profile.success.get("url_contains")
+        # SPA logins route client-side after an auth XHR that can settle just past
+        # networkidle — wait for the success signal(s) instead of checking once.
+        try:
+            if url_contains:
+                page.wait_for_url(f"**{url_contains}**", timeout=timeout_ms)
+            if marker:
+                page.wait_for_function(
+                    "m => document.body && document.body.innerText.includes(m)",
+                    arg=marker, timeout=timeout_ms)
+        except Exception:
+            pass
+        page.wait_for_load_state("networkidle", timeout=timeout_ms)
+
         body = page.content()
         ok = True
         if url_contains and url_contains not in page.url:
