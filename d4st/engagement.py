@@ -2646,6 +2646,17 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 # most likely to have expired. Re-auth right before it so ZAP scans authenticated
                 # (its cookie replacer only helps if the cookie it is handed is still valid).
                 cookie = _session.ensure("zap")
+                # ZAP scans authenticated only if the bearer is fresh — but ZAP runs LAST (hours in),
+                # long past a 30-min JWT's expiry. Re-mint the token right before ZAP so the replacer
+                # injects a VALID Authorization header (else the whole /api surface 401s under ZAP).
+                if jwt_refresh:
+                    try:
+                        _zjwt = jwt_refresh()
+                        if _zjwt:
+                            set_auth_header({"Authorization": f"Bearer {_zjwt}"})
+                            print("[zap] refreshed bearer before ZAP", flush=True)
+                    except Exception as _zje:  # noqa: BLE001 - refresh failure must not sink ZAP
+                        print(f"[zap] bearer refresh skipped: {_zje}", flush=True)
                 # Keep credential-change forms out of ZAP's frontier too — ZAP fills forms during
                 # its active scan and would otherwise reset the password ZAP itself logged in with.
                 _zap_frontier = [u for u in urls if urlsplit(u).path not in _cred_paths]
@@ -2865,6 +2876,21 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         "-config", "scanner.threadPerHost=2",       # fragile single-process targets
         "-config", "connection.timeoutInSecs=30",
     ]
+    # Bearer/header auth (token-auth APIs like APP): the Cookie replacer alone leaves the API
+    # scanned UNAUTHENTICATED — the bearer lives in Authorization, not Cookie — so ZAP would only
+    # ever hit 401s on the /api surface. Add a replacer entry per active auth header so ZAP attacks
+    # the AUTHENTICATED surface. Indexes 1+ (0 is the Cookie replacer above).
+    _hidx = 1
+    for _hk, _hv in (_AUTH_HEADER or {}).items():
+        auth_cfg += [
+            "-config", f"replacer.full_list({_hidx}).description=auth-{_hk}",
+            "-config", f"replacer.full_list({_hidx}).enabled=true",
+            "-config", f"replacer.full_list({_hidx}).matchtype=REQ_HEADER",
+            "-config", f"replacer.full_list({_hidx}).matchstr={_hk}",
+            "-config", f"replacer.full_list({_hidx}).regex=false",
+            "-config", f"replacer.full_list({_hidx}).replacement={_hv}",
+        ]
+        _hidx += 1
     mode = os.environ.get("D4ST_ZAP_MODE", "frontier")
 
     def _parse() -> list[Finding]:
