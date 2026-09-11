@@ -310,8 +310,31 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
                       f"{'no attack traffic' if profile == 'passive-only' else 'no data mutation / no destructive endpoints / safe sqlmap'}")
     console.print(f"[green]session valid[/green] · crawling {target} blind...")
 
+    # Token-auth SPA (bearer JWT in sessionStorage): the token is short-lived (APP ~30 min), so a
+    # long scan must re-mint it or it silently 401s mid-run. Wire a refresh that re-logs-in via the
+    # captured profile (creds from its *_env vars, e.g. APP_USERNAME/APP_PASSWORD) and returns the
+    # fresh token; run_engagement calls it before each heavy stage.
+    jwt_refresh = None
+    if sess.session_storage and sess.meta.get("profile"):
+        try:
+            from .auth.profile import load_profile
+            from .auth.capture import capture_scripted
+            _prof = load_profile(sess.meta["profile"])
+            _tkey = (_prof.token or {}).get("key")
+            if _tkey:
+                _base = f"{urlsplit(target).scheme}://{host}"
+
+                def _jwt_refresh() -> str:
+                    fresh = capture_scripted(_prof, _base)
+                    return fresh.session_storage.get(_tkey, "") or ""
+                jwt_refresh = _jwt_refresh
+                console.print("[green]JWT refresh armed[/green] (re-login on token expiry; "
+                              "needs the profile's cred env vars set)")
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]JWT refresh unavailable[/yellow]: {exc}")
+
     result = run_engagement(target, cookie, host, depth=depth, profile=profile,
-                            auth_headers=sess.headers)
+                            auth_headers=sess.headers, jwt_refresh=jwt_refresh)
     console.print(f"crawled {len(result['urls'])} urls · {result['targets']} injection targets")
     pol = result.get("policy", {})
     if pol:
