@@ -56,6 +56,15 @@ def _is_valid_rendered(session: Session, url: str, marker: str | None,
             browser = p.chromium.launch(headless=True)
             ctx = browser.new_context(storage_state=session.storage_state or None,
                                       ignore_https_errors=True)
+            # restore sessionStorage (storage_state omits it) + any bearer header
+            init = session.session_storage_init_script()
+            if init:
+                ctx.add_init_script(init)
+            if session.headers:
+                try:
+                    ctx.set_extra_http_headers(session.headers)
+                except Exception:
+                    pass
             page = ctx.new_page()
             # SPA warm-up: bootstrap the origin before deep-linking (same reason as capture).
             if origin.rstrip("/") != url.rstrip("/"):

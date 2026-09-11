@@ -20,6 +20,37 @@ from .session import Session
 from .totp import totp_from_env
 
 
+def _dump_session_storage(page) -> dict:
+    """Snapshot sessionStorage — Playwright's storage_state does NOT include it, and
+    token-auth SPAs (EHRM keeps its JWT here) are logged-out without it."""
+    try:
+        return page.evaluate(
+            "() => { const o = {}; for (let i = 0; i < sessionStorage.length; i++)"
+            " { const k = sessionStorage.key(i); o[k] = sessionStorage.getItem(k); } return o; }"
+        ) or {}
+    except Exception:
+        return {}
+
+
+def _apply_bearer(session: Session, profile: AuthProfile) -> None:
+    """Extract the auth token named by profile.token and set it as an HTTP header so the
+    HTTP-level scanners (ZAP/httpx/nuclei) replay it. sessionStorage first, then localStorage."""
+    tok = getattr(profile, "token", None) or {}
+    key = tok.get("key")
+    if not key:
+        return
+    val = None
+    if tok.get("storage", "session") == "session":
+        val = session.session_storage.get(key)
+    if val is None:  # fall back to localStorage (carried in storage_state.origins)
+        for o in session.storage_state.get("origins", []):
+            for item in o.get("localStorage", []):
+                if item.get("name") == key:
+                    val = item.get("value")
+    if val:
+        session.headers[tok.get("header", "Authorization")] = f"{tok.get('scheme', 'Bearer ')}{val}"
+
+
 def _apply_post_login_cookies(session: Session, profile: AuthProfile, base: str,
                               security: str | None) -> None:
     host = urlsplit(base).hostname or ""
@@ -97,14 +128,17 @@ def capture_scripted(profile: AuthProfile, base: str | None = None, *,
                 f"(url={page.url}); captured {len(state.get('cookies', []))} cookies anyway"
             )
 
+        sstore = _dump_session_storage(page)
         state = ctx.storage_state()
         browser.close()
 
     session = Session(name=profile.name, origin=base, storage_state=state,
+                      session_storage=sstore,
                       meta={"profile": profile.name, "mode": "scripted", "security": security or "",
                             "validity_url": profile.validity_url(base),
                             "validity_marker": profile.validity_marker() or ""})
     _apply_post_login_cookies(session, profile, base, security)
+    _apply_bearer(session, profile)
     return session
 
 
@@ -131,12 +165,15 @@ def capture_interactive(profile: AuthProfile, base: str | None = None, *,
             )
         else:
             page.wait_for_timeout(timeout_ms)
+        sstore = _dump_session_storage(page)
         state = ctx.storage_state()
         browser.close()
 
     session = Session(name=profile.name, origin=base, storage_state=state,
+                      session_storage=sstore,
                       meta={"profile": profile.name, "mode": "interactive", "security": security or "",
                             "validity_url": profile.validity_url(base),
                             "validity_marker": profile.validity_marker() or ""})
     _apply_post_login_cookies(session, profile, base, security)
+    _apply_bearer(session, profile)
     return session

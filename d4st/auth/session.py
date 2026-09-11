@@ -21,8 +21,9 @@ def _host(url: str) -> str:
 class Session:
     name: str
     origin: str = ""                       # base URL the session was captured against
-    storage_state: dict = field(default_factory=dict)  # raw Playwright storageState
-    headers: dict = field(default_factory=dict)         # extra headers to inject (e.g. Authorization)
+    storage_state: dict = field(default_factory=dict)  # raw Playwright storageState (cookies + localStorage)
+    headers: dict = field(default_factory=dict)         # extra headers to inject (e.g. Authorization: Bearer)
+    session_storage: dict = field(default_factory=dict) # sessionStorage {k:v} — storage_state OMITS this
     meta: dict = field(default_factory=dict)            # arbitrary (security level, profile, ...)
     captured_at: str = ""
 
@@ -63,12 +64,23 @@ class Session:
 
     # ----- persistence -------------------------------------------------------
 
+    def session_storage_init_script(self) -> str | None:
+        """A Playwright init-script that repopulates sessionStorage on every page load.
+        storage_state can't carry sessionStorage, so token-in-sessionStorage SPAs (EHRM)
+        need this to come back authenticated in a restored browser context."""
+        if not self.session_storage:
+            return None
+        data = json.dumps(self.session_storage)
+        return ("(() => { try { const d = " + data + "; "
+                "for (const k in d) { window.sessionStorage.setItem(k, d[k]); } } catch (e) {} })();")
+
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "origin": self.origin,
             "storage_state": self.storage_state,
             "headers": self.headers,
+            "session_storage": self.session_storage,
             "meta": self.meta,
             "captured_at": self.captured_at,
         }
@@ -80,6 +92,7 @@ class Session:
             origin=d.get("origin", ""),
             storage_state=d.get("storage_state", {}),
             headers=d.get("headers", {}),
+            session_storage=d.get("session_storage", {}),
             meta=d.get("meta", {}),
             captured_at=d.get("captured_at", ""),
         )
@@ -96,4 +109,5 @@ class Session:
     def summary(self) -> str:
         return (f"session {self.name!r} origin={self.origin} "
                 f"cookies={len(self.cookies)} headers={len(self.headers)} "
+                f"sessionStorage={len(self.session_storage)} "
                 f"captured={self.captured_at} meta={self.meta}")

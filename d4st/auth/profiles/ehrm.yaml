@@ -29,3 +29,12 @@ validity:
 totp:
   enabled: false
   # If MFA turns out to be TOTP:  enabled: true, seed_env: EHRM_TOTP_SEED, selector: "<otp input>"
+
+# EHRM keeps its auth as a Bearer JWT in sessionStorage (not cookies). Capture lifts
+# JWTToken -> "Authorization: Bearer <jwt>" so the HTTP scanners replay it, and restores
+# sessionStorage into the crawl/validity browser so the SPA comes back authenticated.
+token:
+  key: JWTToken
+  storage: session
+  header: Authorization
+  scheme: "Bearer "

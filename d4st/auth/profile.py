@@ -29,6 +29,7 @@ class AuthProfile:
     validity: dict = field(default_factory=dict)         # {url, body_contains}
     post_login_cookies: list[dict] = field(default_factory=list)  # [{name, value, path}]
     totp: dict = field(default_factory=dict)             # {enabled, seed_env, selector}
+    token: dict = field(default_factory=dict)            # {key, storage: session|local, header, scheme}
     raw: dict = field(default_factory=dict)
 
     # ----- resolution --------------------------------------------------------
@@ -66,7 +67,7 @@ def _from_dict(d: dict) -> AuthProfile:
     known = {
         "name", "type", "login_url", "username_selector", "password_selector",
         "submit_selector", "username", "password", "username_env", "password_env",
-        "success", "validity", "post_login_cookies", "totp",
+        "success", "validity", "post_login_cookies", "totp", "token",
     }
     kwargs = {k: v for k, v in d.items() if k in known}
     kwargs["raw"] = d
