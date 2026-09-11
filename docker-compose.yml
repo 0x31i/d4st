@@ -34,5 +34,14 @@ services:
       - ./results:/app/results    # engagement result JSONs
     ports:
       - "0.0.0.0:8810:8810"       # observability console
+    # Liveness = the d4st console answering on :8810. Overrides the ZAP base image's
+    # inherited HEALTHCHECK (which pings $ZAP_PORT — ZAP only runs during a scan, so it
+    # reported the idle appliance as "unhealthy").
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8810/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     # Scanning needs to reach the client dev env through the host's VPN. On Windows this
     # relies on WSL2 mirrored networking (see docs/deploy-windows.md). No extra caps needed.

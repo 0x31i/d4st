@@ -128,4 +128,10 @@ RUN pip install --no-cache-dir -e . \
     && python3 -m playwright install --with-deps chromium
 
 EXPOSE 8810
+
+# Override the ZAP base image's HEALTHCHECK (it pings $ZAP_PORT, which is only up during
+# a scan). The appliance's liveness signal is the d4st console answering on :8810.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS http://localhost:8810/ >/dev/null || exit 1
+
 CMD ["d4st", "serve", "--host", "0.0.0.0", "--port", "8810"]
