@@ -13,9 +13,15 @@ from .session import Session
 
 
 def is_valid(session: Session, url: str, marker: str | None,
-             timeout: float = 15.0) -> tuple[bool, str]:
+             timeout: float = 15.0, render: bool = False) -> tuple[bool, str]:
     """Return (ok, note). ok=True when the marker is present (or, if no marker given, when
-    the response is a 2xx that did not redirect to a login page)."""
+    the response is a 2xx that did not redirect to a login page).
+
+    ``render=True`` drives a headless browser with the captured session (cookies +
+    localStorage) instead of a raw HTTP GET — required for SPAs whose logged-in marker
+    is rendered client-side and never appears in the shell HTML."""
+    if render:
+        return _is_valid_rendered(session, url, marker, timeout)
     import httpx
     cookie = session.cookie_header(url)
     headers = {"Cookie": cookie} if cookie else {}
@@ -36,6 +42,51 @@ def is_valid(session: Session, url: str, marker: str | None,
     return True, f"ok {r.status_code} at {final}"
 
 
+def _is_valid_rendered(session: Session, url: str, marker: str | None,
+                       timeout: float = 15.0) -> tuple[bool, str]:
+    from urllib.parse import urlsplit
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:  # noqa: BLE001
+        return False, f"render probe unavailable ({exc}); install playwright"
+    origin = f"{urlsplit(url).scheme}://{urlsplit(url).netloc}"
+    tmo = int(timeout * 1000)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(storage_state=session.storage_state or None,
+                                      ignore_https_errors=True)
+            page = ctx.new_page()
+            # SPA warm-up: bootstrap the origin before deep-linking (same reason as capture).
+            if origin.rstrip("/") != url.rstrip("/"):
+                try:
+                    page.goto(origin, wait_until="networkidle", timeout=tmo)
+                except Exception:
+                    pass
+            page.goto(url, wait_until="networkidle", timeout=tmo)
+            final = page.url
+            if marker:
+                try:
+                    page.wait_for_function(
+                        "m => document.body && document.body.innerText.includes(m)",
+                        arg=marker, timeout=tmo)
+                    browser.close()
+                    return True, f"marker present (rendered) at {final}"
+                except Exception:
+                    browser.close()
+                    if "login" in final.lower():
+                        return False, f"redirected to login: {final}"
+                    return False, f"marker {marker!r} absent (rendered) at {final}"
+            browser.close()
+            if "login" in final.lower():
+                return False, f"redirected to login: {final}"
+            return True, f"ok (rendered) at {final}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"render probe error: {exc}"
+
+
 def probe_profile(session: Session, profile: AuthProfile, base: str,
                   timeout: float = 15.0) -> tuple[bool, str]:
-    return is_valid(session, profile.validity_url(base), profile.validity_marker(), timeout)
+    render = bool(profile.validity.get("render")) if isinstance(profile.validity, dict) else False
+    return is_valid(session, profile.validity_url(base), profile.validity_marker(),
+                    timeout, render=render)
