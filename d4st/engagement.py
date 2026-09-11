@@ -2636,7 +2636,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         else:
             import tempfile as _tf
             try:
-                _zap_to = int(os.environ.get("D4ST_ZAP_TIMEOUT", "2400") or "2400")
+                _zap_to = int(os.environ.get("D4ST_ZAP_TIMEOUT", "3600") or "3600")
                 # Feed ZAP the CONVERGED FRONTIER (default) so it active/passive-scans the exact
                 # surface the native stack discovered — no reliance on ZAP's own spider/browser.
                 # seed_url is only used by the legacy spider fallback (D4ST_ZAP_MODE=spider).
@@ -2961,8 +2961,20 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         #    only kills ZAP if it produces no output for D4ST_ZAP_STALL secs (genuinely stuck) or
         #    exceeds the D4ST_ZAP_TIMEOUT absolute backstop. So "ZAP is taking a while" is fine;
         #    only "ZAP is broken/hung" ends it.
-        budget = int(os.environ.get("D4ST_ZAP_ACTIVE_MINS", "0") or "0")   # 0 = unbounded
         _passive_min = int(os.environ.get("D4ST_ZAP_PASSIVE_MINS", "8") or "8")
+        # Active-scan budget (maxScanDurationInMins) is ZAP's OWN GRACEFUL depth cap: it stops
+        # active-scanning at this and then WRITES ITS REPORT. It MUST be finite and smaller than the
+        # hard backstop (timeout), or ZAP is still active-scanning when the watchdog hard-kills it —
+        # producing NO report (the scan-1 failure: unbounded active + 40-min backstop = killed at
+        # 40 min, 0 findings, recorded FAILED). Default: auto-bound to ~75% of the backstop minus
+        # passive+startup slack so ZAP always finishes gracefully and emits its report. Override with
+        # D4ST_ZAP_ACTIVE_MINS (explicit 0 = truly unbounded — only safe if you ALSO raise
+        # D4ST_ZAP_TIMEOUT well past the ruleset's real runtime).
+        _active_env = os.environ.get("D4ST_ZAP_ACTIVE_MINS")
+        if _active_env is not None and _active_env.strip():
+            budget = int(_active_env)
+        else:
+            budget = max(10, int(timeout / 60 * 0.75) - _passive_min)
         # Attack strength: 'medium' is right for a huge frontier (WAVSEP); a small target can
         # afford 'high' for maximum thoroughness. D4ST_ZAP_STRENGTH overrides.
         strength = os.environ.get("D4ST_ZAP_STRENGTH", "medium").lower()
