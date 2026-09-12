@@ -2620,16 +2620,26 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     _html = [u for u in urls if not u.split("?")[0].endswith(
         (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".map"))]
     _pii += _pii_scan(_html, cookie, cap=300, structured_only=True)
+    # Display the RAW disclosed value + full response proof by default (NGS: record everything,
+    # every finding needs its evidence). D4ST_PII_MASK=1 re-masks for a report leaving client control.
+    _pii_mask = os.environ.get("D4ST_PII_MASK") == "1"
     _pii_seen: set = set()
     for hit in _pii:
-        k = (hit.entity, hit.masked, hit.url.split("?")[0])
+        _val = (hit.masked if _pii_mask else (getattr(hit, "raw", "") or hit.masked))
+        k = (hit.entity, _val, hit.url.split("?")[0])
         if k in _pii_seen:
             continue
         _pii_seen.add(k)
+        _ctxt = getattr(hit, "context", "") or _val
+        _proof = [{
+            "label": "PROOF — PII disclosed in response body",
+            "request": {"method": "GET", "url": hit.url, "headers": {}, "body": ""},
+            "response": {"status": 200, "headers": {}, "body": _ctxt[:2500]},
+        }]
         findings.append(Finding(
             tool="pii", category="pii-disclosure", url=hit.url, param=hit.entity,
-            evidence=f"{hit.entity} disclosed: {hit.masked} (confidence {hit.score})",
-            verified=True))
+            evidence=f"{hit.entity} disclosed: {_val} (confidence {hit.score})",
+            verified=True, evidence_log=_proof, repro=f"curl -i '{hit.url}'"))
 
     _prog.update("pii", findings, urls=len(urls), targets=len(targets))
 
