@@ -40,8 +40,12 @@ def parse_trufflehog(text: str) -> list[dict]:
         except json.JSONDecodeError:
             continue
         if o.get("DetectorName") or o.get("Raw"):
+            _verified = bool(o.get("Verified"))
+            # a VERIFIED (live) secret is a proven credential = secret-disclosure (high); an
+            # unverified match (only seen when D4ST_TRUFFLEHOG_ALL=1) stays low info-disclosure.
             out.append({"tool": "trufflehog", "detector": o.get("DetectorName"),
-                        "verified": o.get("Verified"), "category": _INFO_DISCLOSURE})
+                        "verified": _verified,
+                        "category": "secret-disclosure" if _verified else _INFO_DISCLOSURE})
     return out
 
 
@@ -116,7 +120,16 @@ class TrufflehogAdapter(_DirScanner):
     binary = "trufflehog"
 
     def _args(self, d):
-        return ["trufflehog", "filesystem", d, "--json"]
+        # --only-verified: trufflehog live-validates each candidate against its real service and
+        # emits ONLY confirmed-live secrets. Without it, minified JS bundles produce hundreds of
+        # high-entropy FALSE POSITIVES (webpack hashes, base64 assets, minified identifiers) — 154
+        # on the EHRM chunks. A verified secret is a PROVEN live credential (undeniable finding);
+        # deterministic pattern secrets (connstring/API_KEY/SAS) are still caught by jsdisclosure.
+        # D4ST_TRUFFLEHOG_ALL=1 restores the noisy unverified firehose if an operator wants it.
+        import os
+        if os.environ.get("D4ST_TRUFFLEHOG_ALL") == "1":
+            return ["trufflehog", "filesystem", d, "--json"]
+        return ["trufflehog", "filesystem", d, "--json", "--only-verified"]
 
     def _parse(self, stdout):
         return parse_trufflehog(stdout)
