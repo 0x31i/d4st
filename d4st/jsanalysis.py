@@ -239,9 +239,25 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
 
     def _fetch(u: str):
         try:
-            return u, client.get(u).text
+            r = client.get(u)
+            return u, r.text, r.status_code, r.headers.get("content-type", "")
         except Exception:  # noqa: BLE001, S112
-            return u, None
+            return u, None, None, ""
+
+    def _js_proof(u, txt, status, ctype, needle):
+        """A request/response exchange showing the matched secret IN the bundle response — proof."""
+        ctx = ""
+        i = txt.find(needle[:60]) if needle else -1
+        if i >= 0:
+            ctx = "…" + txt[max(0, i - 140):i + len(needle) + 140] + "…"
+        else:
+            ctx = txt[:400]
+        return [{
+            "label": "PROOF — disclosed in JS bundle response body",
+            "request": {"method": "GET", "url": u, "headers": {}, "body": ""},
+            "response": {"status": status, "headers": {"content-type": ctype},
+                         "size": len(txt), "body": ctx[:2500]},
+        }]
 
     try:
         while queue:
@@ -255,7 +271,7 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
                 truncated = True
                 break
             batch = batch[:max_files - saved]
-            for u, txt in ThreadPoolExecutor(max_workers=workers).map(_fetch, batch):
+            for u, txt, status, ctype in ThreadPoolExecutor(max_workers=workers).map(_fetch, batch):
                 if txt is None:
                     continue
                 fn = os.path.join(out_dir, f"{idx:05d}_" + (u.rsplit("/", 1)[-1].split("?")[0] or "s"))
@@ -274,13 +290,17 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
                         seen_find.add(k)
                         findings.append({"category": "vulnerable-js-dependency", "url": u,
                                          "param": vl.library,
-                                         "detail": f"{vl.library} {vl.version}: {vl.detail}"})
+                                         "detail": f"{vl.library} {vl.version}: {vl.detail}",
+                                         "evidence_log": _js_proof(u, txt, status, ctype, vl.version),
+                                         "repro": f"curl -i '{u}'"})
                 for label, cat, ev in scan_js_secrets(txt, u):
                     k = (cat, ev)
                     if k not in seen_find:
                         seen_find.add(k)
                         findings.append({"category": cat, "url": u, "param": label,
-                                         "detail": f"{label} disclosed in JS: {ev}"})
+                                         "detail": f"{label} disclosed in JS: {ev}",
+                                         "evidence_log": _js_proof(u, txt, status, ctype, ev),
+                                         "repro": f"curl -i '{u}'"})
                 for ep in extract_endpoints(txt, u, host):
                     if ep not in seen_ep:
                         seen_ep.add(ep)

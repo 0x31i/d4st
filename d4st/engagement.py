@@ -2370,7 +2370,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                     tool="jsdisclosure", category=_d["category"], url=_d["url"],
                     param=_d.get("param", ""), evidence=_d["detail"], verified=True,
                     detection="JS content analysis", confidence="firm",
-                    evidence_log=[{"snippet": _d.get("detail", "")[:200]}]))
+                    evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
             print(f"[js] deep-scanned {_jn} JS bundle(s) (started from {len(_js_scoped)}, "
                   f"auto-expanded via chunk manifest) -> {len(_jf)} disclosure/dep finding(s), "
                   f"{len(_jeps_in)} new endpoint(s) [js_dir={_js_dir}]", flush=True)
@@ -2567,7 +2567,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                     evidence=_d["detail"], verified=True,
                     detection=f"authenticated authorization replay ({_d['type']})",
                     confidence="firm" if _d["type"] != "idor-suspect" else "tentative",
-                    evidence_log=[_d.get("evidence", {})]))
+                    evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
             if _hz:
                 print(f"[authz] {len(_hz)} authorization finding(s) from "
                       f"{len(_harvest_urls)} harvested endpoint(s)", flush=True)
