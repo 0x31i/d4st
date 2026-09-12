@@ -155,6 +155,21 @@ VULN_META: dict[str, dict] = {
              "access) and MUST be confirmed manually with a second account before reporting.",
         fix="Enforce per-object ownership checks server-side on every request; never authorize on "
             "authentication alone. Confirm whether the returned object belongs to another tenant."),
+    "secret-disclosure": dict(
+        title="Hardcoded Secret / Credential Disclosure", severity="high", cwe="CWE-798",
+        owasp="A07:2021 Identification and Authentication Failures",
+        desc="A secret — database connection string, API key, access token, or private key — is "
+             "hardcoded in client-delivered JavaScript, where any user can read it. A live DB "
+             "connection string or cloud key is often directly abusable.",
+        fix="Remove secrets from client code; keep them server-side. Rotate any exposed credential "
+            "immediately, scope keys to least privilege, and add secret-scanning to CI."),
+    "vulnerable-js-dependency": dict(
+        title="Vulnerable JavaScript Dependency", severity="medium", cwe="CWE-1104 / CWE-937",
+        owasp="A06:2021 Vulnerable and Outdated Components",
+        desc="The app ships a JavaScript library with a version that has known published "
+             "vulnerabilities (XSS, prototype pollution, ReDoS), reachable in the client.",
+        fix="Upgrade the library to a patched release; track dependencies with SCA (retire.js / "
+            "npm audit) and pin/patch known-vulnerable versions."),
     "other": dict(
         title="Other Finding", severity="info", cwe="—", owasp="—",
         desc="A finding reported by a scanner that does not map to a standard category.",
