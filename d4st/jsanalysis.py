@@ -155,7 +155,9 @@ _JS_SECRET_PATTERNS = [
         r"(?i)(?:user\s*id|uid)\s*=\s*[^;'\"<>\s]{2,40}\s*;\s*(?:password|pwd)\s*=\s*[^;'\"<>\s]{2,40}")),
     ("google-api-key", "secret-disclosure", re.compile(r"AIza[0-9A-Za-z_\-]{20,}")),
     ("aws-access-key", "secret-disclosure", re.compile(r"AKIA[0-9A-Z]{16}")),
-    ("private-key", "secret-disclosure", re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----")),
+    ("private-key", "secret-disclosure", re.compile(
+        r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----[\r\n]+[A-Za-z0-9+/=\s]{80,}"
+        r"-----END")),   # require real key BODY, not a bare format-marker string in a crypto lib
     ("azure-sas-endpoint", "info-disclosure", re.compile(
         r"(?i)getAccountSASToken|/api/SAS\b|[?&]sv=\d{4}-\d{2}-\d{2}&s[ir]=")),
     ("hardcoded-secret", "secret-disclosure", re.compile(
@@ -164,7 +166,17 @@ _JS_SECRET_PATTERNS = [
 ]
 _JS_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
 _EMAIL_ASSET_SUFFIX = (".png", ".jpg", ".jpeg", ".svg", ".woff", ".woff2", ".css", ".js", ".gif", ".ico")
-_EMAIL_NOISE_PREFIX = ("example@", "test@", "user@", "email@", "name@", "your@", "someone@", "sentry@")
+_EMAIL_NOISE_PREFIX = ("example@", "test@", "user@", "email@", "name@", "your@", "you@",
+                       "someone@", "sentry@", "john@", "jane@", "admin@example")
+_EMAIL_NOISE_DOMAIN = ("example.com", "example.org", "example.net", "domain.com", "email.com",
+                       "test.com", "sentry.io", "w3.org", "schema.org", "googleapis.com",
+                       "localhost", "yourdomain.com", "company.com", "mysite.com")
+
+# webpack/Angular lazily loads chunks — their filenames are string literals in the runtime/main
+# bundle, so we can discover the FULL chunk set (not just the ones the crawler happened to trigger)
+# by pulling every chunk-like .js reference out of each body and fetching it too.
+_CHUNK_REF_RE = re.compile(
+    r"(?:chunk|main|runtime|polyfills|vendor|scripts|common|styles)[.\-][A-Za-z0-9]{4,}\.js")
 
 
 def scan_js_secrets(js_text: str, url: str) -> list[tuple[str, str, str]]:
@@ -178,20 +190,26 @@ def scan_js_secrets(js_text: str, url: str) -> list[tuple[str, str, str]]:
     for m in _JS_EMAIL_RE.finditer(text):
         e = m.group(0)
         low = e.lower()
+        dom = low.rsplit("@", 1)[-1]
         if low.endswith(_EMAIL_ASSET_SUFFIX) or low.startswith(_EMAIL_NOISE_PREFIX):
             continue
-        if "@2x" in low or "@3x" in low or low.count("@") != 1:   # sprite@2x.png-style false hits
+        if dom in _EMAIL_NOISE_DOMAIN or "@2x" in low or "@3x" in low or low.count("@") != 1:
             continue
         out.append((e, "pii-disclosure", e))
     return out
 
 
 def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
-                       cap: int = 400, extra_headers: dict | None = None) -> tuple[int, list[dict]]:
-    """Download in-scope JS to out_dir (so run_roster's gitleaks/trufflehog scan REAL content) AND
-    scan each body for vuln-deps + secrets/PII. Returns (n_saved, [finding dict]). Read-only — the
-    JS was already fetched during the crawl; this just persists + inspects the bodies."""
+                       extra_headers: dict | None = None, workers: int = 8,
+                       max_files: int = 8000) -> tuple[int, list[dict], list[str], bool]:
+    """DEEP JS pass: download EVERY in-scope JS bundle (no cap) + auto-expand to the full lazy-loaded
+    chunk set discovered in the bundle bodies, saving each to out_dir (so run_roster's gitleaks/
+    trufflehog scan real content) and scanning every body for secrets/PII/vuln-deps + API endpoints.
+    Parallel fetch so 'scan everything' stays fast. Returns (n_saved, [finding], [endpoint], truncated).
+    max_files is a runaway backstop only — if hit it is REPORTED (truncated=True), never silent."""
     import os
+    from concurrent.futures import ThreadPoolExecutor
+    from urllib.parse import urljoin, urlsplit
 
     import httpx
     os.makedirs(out_dir, exist_ok=True)
@@ -200,39 +218,81 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
         hdr["Cookie"] = cookie
     if extra_headers:
         hdr.update({k: v for k, v in extra_headers.items() if k and v})
+    origin = ""
+    for u in js_urls:
+        p = urlsplit(u)
+        if p.scheme and p.netloc:
+            origin = f"{p.scheme}://{p.netloc}"
+            break
+
     findings: list[dict] = []
-    seen: set = set()
-    n = 0
-    for i, u in enumerate(js_urls[:cap]):
+    endpoints: list[str] = []
+    seen_find: set = set()
+    seen_ep: set = set()
+    seen_urls: set = set()
+    queue: list[str] = list(dict.fromkeys(js_urls))
+    saved = 0
+    idx = 0
+    truncated = False
+
+    client = httpx.Client(verify=False, follow_redirects=True, timeout=15, headers=hdr)
+
+    def _fetch(u: str):
         try:
-            r = httpx.get(u, headers=hdr, follow_redirects=True, timeout=15, verify=False)
-        except Exception:  # noqa: BLE001, S112 - one bad chunk must not sink the pass
-            continue
-        txt = r.text or ""
-        fn = os.path.join(out_dir, f"{i:04d}_" + (u.rsplit("/", 1)[-1].split("?")[0] or "s"))
-        if not fn.endswith(".js"):
-            fn += ".js"
-        try:
-            with open(fn, "w", encoding="utf-8") as fh:
-                fh.write(txt)
-            n += 1
+            return u, client.get(u).text
         except Exception:  # noqa: BLE001, S112
-            pass
-        for vl in detect_vuln_libs(txt, str(r.url)):
-            k = ("dep", vl.library, vl.version)
-            if k in seen:
-                continue
-            seen.add(k)
-            findings.append({"category": "vulnerable-js-dependency", "url": str(r.url),
-                             "param": vl.library, "detail": f"{vl.library} {vl.version}: {vl.detail}"})
-        for label, cat, ev in scan_js_secrets(txt, str(r.url)):
-            k = (cat, ev)
-            if k in seen:
-                continue
-            seen.add(k)
-            findings.append({"category": cat, "url": str(r.url), "param": label,
-                             "detail": f"{label} disclosed in JS: {ev}"})
-    return n, findings
+            return u, None
+
+    try:
+        while queue:
+            batch = [u for u in queue if u not in seen_urls]
+            queue = []
+            for u in batch:
+                seen_urls.add(u)
+            if not batch:
+                break
+            if saved >= max_files:
+                truncated = True
+                break
+            batch = batch[:max_files - saved]
+            for u, txt in ThreadPoolExecutor(max_workers=workers).map(_fetch, batch):
+                if txt is None:
+                    continue
+                fn = os.path.join(out_dir, f"{idx:05d}_" + (u.rsplit("/", 1)[-1].split("?")[0] or "s"))
+                idx += 1
+                if not fn.endswith(".js"):
+                    fn += ".js"
+                try:
+                    with open(fn, "w", encoding="utf-8") as fh:
+                        fh.write(txt)
+                    saved += 1
+                except Exception:  # noqa: BLE001, S112
+                    pass
+                for vl in detect_vuln_libs(txt, u):
+                    k = ("dep", vl.library, vl.version)
+                    if k not in seen_find:
+                        seen_find.add(k)
+                        findings.append({"category": "vulnerable-js-dependency", "url": u,
+                                         "param": vl.library,
+                                         "detail": f"{vl.library} {vl.version}: {vl.detail}"})
+                for label, cat, ev in scan_js_secrets(txt, u):
+                    k = (cat, ev)
+                    if k not in seen_find:
+                        seen_find.add(k)
+                        findings.append({"category": cat, "url": u, "param": label,
+                                         "detail": f"{label} disclosed in JS: {ev}"})
+                for ep in extract_endpoints(txt, u, host):
+                    if ep not in seen_ep:
+                        seen_ep.add(ep)
+                        endpoints.append(ep)
+                if origin:   # expand to lazy-loaded chunks referenced in this body
+                    for m in _CHUNK_REF_RE.finditer(txt):
+                        cu = urljoin(origin + "/", m.group(0))
+                        if cu not in seen_urls:
+                            queue.append(cu)
+    finally:
+        client.close()
+    return saved, findings, endpoints, truncated
 
 
 def analyze_js(js_urls: list[str], cookie: str, host: str,

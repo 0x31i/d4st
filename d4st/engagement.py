@@ -2325,10 +2325,8 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         except Exception as _hexc:  # noqa: BLE001
             print(f"[harvest] skipped: {_hexc}", flush=True)
 
-    # JS/API discovery: pull API routes out of JS so unlinked endpoints get tested too.
-    js_urls = [u for u in urls if u.split("?")[0].endswith(".js")]
-    api_eps, vuln_libs = analyze_js(js_urls, cookie, host)
-    urls = sorted(set(urls) | set(api_eps))
+    # (JS/API discovery + content disclosure scanning happens in the deep JS pass below, AFTER the
+    #  scope filter, so it downloads only in-scope bundles and expands to the full lazy-chunk set.)
 
     # SCOPE HYGIENE: keep only in-scope hosts. The headless crawl + XHR capture drag in third-party
     # resources (CDNs like acrobatservices.adobe.com, the marketing site) that must NEVER be reported
@@ -2360,18 +2358,25 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     if _js_scoped:
         try:
             from .jsanalysis import harvest_js_content
-            _jn, _jf = harvest_js_content(_js_scoped, cookie, host, _js_dir,
-                                          cap=int(os.environ.get("D4ST_JS_CAP", "400") or "400"),
-                                          extra_headers=dict(_AUTH_HEADER))
+            _jn, _jf, _jeps, _jtrunc = harvest_js_content(
+                _js_scoped, cookie, host, _js_dir, extra_headers=dict(_AUTH_HEADER),
+                max_files=int(os.environ.get("D4ST_JS_MAX", "8000") or "8000"))
+            # fold JS-discovered API endpoints back into the frontier (in-scope only)
+            _jeps_in = [u for u in _jeps if _in_scope(u)]
+            if _jeps_in:
+                urls = sorted(set(urls) | set(_jeps_in))
             for _d in _jf:
                 _js_findings.append(Finding(
                     tool="jsdisclosure", category=_d["category"], url=_d["url"],
                     param=_d.get("param", ""), evidence=_d["detail"], verified=True,
                     detection="JS content analysis", confidence="firm",
                     evidence_log=[{"snippet": _d.get("detail", "")[:200]}]))
-            if _jn:
-                print(f"[js] downloaded {_jn} in-scope JS file(s) -> content scan: "
-                      f"{len(_jf)} disclosure/dep finding(s) [js_dir={_js_dir}]", flush=True)
+            print(f"[js] deep-scanned {_jn} JS bundle(s) (started from {len(_js_scoped)}, "
+                  f"auto-expanded via chunk manifest) -> {len(_jf)} disclosure/dep finding(s), "
+                  f"{len(_jeps_in)} new endpoint(s) [js_dir={_js_dir}]", flush=True)
+            if _jtrunc:
+                print(f"[js] NOTE: hit the {os.environ.get('D4ST_JS_MAX', '8000')}-file runaway "
+                      f"backstop — raise D4ST_JS_MAX to scan more", flush=True)
         except Exception as _je:  # noqa: BLE001 - JS content scan must not sink the scan
             print(f"[js] content scan skipped: {_je}", flush=True)
 
