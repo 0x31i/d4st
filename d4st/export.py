@@ -50,12 +50,19 @@ def _fmt_side(d: dict) -> str:
 
 
 def _exchange_text(evlog) -> tuple[str, str]:
-    """Pull the first labeled request/response out of evidence_log into (request, response) text."""
+    """Render EVERY labeled request/response exchange in evidence_log into (request, response) text —
+    the full proof, not just the first exchange (NGS: record everything)."""
     if not isinstance(evlog, list):
         return "", ""
+    reqs, resps = [], []
     for ex in evlog:
         if isinstance(ex, dict) and (ex.get("request") or ex.get("response")):
-            return _fmt_side(ex.get("request")), _fmt_side(ex.get("response"))
+            lbl = ex.get("label", "")
+            hdr = f"### {lbl}\n" if lbl else ""
+            reqs.append(hdr + _fmt_side(ex.get("request")))
+            resps.append(hdr + _fmt_side(ex.get("response")))
+    if reqs or resps:
+        return "\n\n".join(r for r in reqs if r.strip()), "\n\n".join(r for r in resps if r.strip())
     for ex in evlog:  # fallback: JS snippet / other evidence blobs
         if isinstance(ex, dict) and ex.get("snippet"):
             return "", str(ex["snippet"])[:6000]
