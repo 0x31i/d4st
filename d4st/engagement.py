@@ -2190,6 +2190,93 @@ def _env_reauth():
     return _do
 
 
+def _redact_auth(headers: dict) -> dict:
+    """Show that a valid bearer/cookie WAS sent (proof) without printing the raw session secret.
+    D4ST_FULL_AUTH=1 prints the complete token for true Burp-parity when opsec allows."""
+    full = os.environ.get("D4ST_FULL_AUTH") == "1"
+    out = {}
+    for k, v in (headers or {}).items():
+        lk = k.lower()
+        if not full and lk == "authorization":
+            out[k] = (str(v)[:30] + "…<redacted — set D4ST_FULL_AUTH=1 to reveal>")
+        elif not full and lk == "cookie":
+            out[k] = "<redacted — set D4ST_FULL_AUTH=1 to reveal>"
+        else:
+            out[k] = v
+    return out
+
+
+def _raw_http_request(method: str, url: str, headers: dict, body: str = "") -> str:
+    p = urlsplit(url)
+    path = (p.path or "/") + (("?" + p.query) if p.query else "")
+    out = [f"{method} {path} HTTP/1.1", f"Host: {p.netloc}"]
+    for k, v in headers.items():
+        if k.lower() == "host":
+            continue
+        out.append(f"{k}: {v}")
+    return "\r\n".join(out) + "\r\n\r\n" + (body or "")
+
+
+def _raw_http_response(r) -> str:
+    out = [f"HTTP/1.1 {r.status_code} {getattr(r, 'reason_phrase', '') or ''}".rstrip()]
+    for k, v in r.headers.items():
+        out.append(f"{k}: {v}")
+    return "\r\n".join(out) + "\r\n\r\n" + (r.text or "")
+
+
+def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, rps: float = 4.0) -> int:
+    """GUARANTEE Burp-grade proof: replay each finding's request (authenticated) and record the
+    COMPLETE raw request + full response (status line + ALL headers + full body) as the finding's
+    primary evidence exchange — the standard Burp always provides. Deduped by (method,url); GET only
+    (never re-issues a state-changing request); rate-limited + capped. Auth-proof findings (authz)
+    are skipped so their no-bearer proof is preserved. Any native attack exchange (payload/reflection)
+    is kept AFTER the full capture. D4ST_FULL_CAPTURE=0 disables; D4ST_FULL_CAPTURE_CAP overrides cap."""
+    import time as _t
+
+    import httpx
+    hdr = dict(_AUTH_HEADER)
+    if cookie:
+        hdr["Cookie"] = cookie
+    delay = 1.0 / max(1.0, rps)
+    cap_body = int(os.environ.get("D4ST_FULL_CAPTURE_CAP", str(cap_body)) or cap_body)
+    cache: dict = {}
+    captured = 0
+    with httpx.Client(verify=False, follow_redirects=False, timeout=15) as c:
+        for f in findings:
+            url = getattr(f, "url", "") or ""
+            method = (getattr(f, "method", "") or "GET").upper()
+            if not url.startswith("http") or method != "GET" or getattr(f, "tool", "") == "authz":
+                continue
+            key = (method, url)
+            if key not in cache:
+                try:
+                    cache[key] = c.get(url, headers=hdr)
+                except Exception:  # noqa: BLE001
+                    cache[key] = None
+                _t.sleep(delay)
+            r = cache[key]
+            if r is None:
+                continue
+            _rt = (r.text or "")
+            _trunc = len(_rt) > cap_body
+            full = {"label": "FULL request / response (Burp-grade capture)",
+                    "request": {"method": "GET", "url": str(r.request.url),
+                                "headers": _redact_auth(dict(r.request.headers)), "body": "",
+                                "raw": _raw_http_request("GET", str(r.request.url),
+                                                         _redact_auth(dict(r.request.headers)))},
+                    "response": {"status": r.status_code, "headers": dict(r.headers),
+                                 "elapsed_ms": int(r.elapsed.total_seconds() * 1000) if r.elapsed else None,
+                                 "size": len(r.content),
+                                 "body": _rt[:cap_body] + ("\n…[truncated]" if _trunc else ""),
+                                 "raw": _raw_http_response(r)[:cap_body + 4000]}}
+            f.evidence_log = [full] + [e for e in (getattr(f, "evidence_log", None) or [])
+                                       if isinstance(e, dict)]
+            if not getattr(f, "repro", ""):
+                f.repro = f"curl -i '{url}'"
+            captured += 1
+    return captured
+
+
 def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                    dom: bool = True, tools: bool = True, profile: str = "engagement",
                    zap: bool = True, reauth=None, session_probe: str = "",
@@ -2813,11 +2900,23 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             f.confidence = f.confidence or c
             f.payload = f.payload or p
             f.repro = f.repro or r
+    # FULL request/response capture (Burp-grade proof, the standard Burp always provides): replay
+    # each finding's GET request authenticated and record the COMPLETE raw request + full response as
+    # the primary evidence. Read-only (GET only, deduped, rate-limited), so safe on live infra; the
+    # session is re-authed first. D4ST_FULL_CAPTURE=0 to disable.
+    if os.environ.get("D4ST_FULL_CAPTURE", "1") != "0":
+        try:
+            cookie = _session.ensure("full-capture")
+            _fc = capture_full_evidence(uniq, cookie, rps=(pol.rps if pol else 4.0))
+            print(f"[evidence] captured FULL request/response for {_fc} finding(s) "
+                  f"(complete raw req + full response headers/body)", flush=True)
+        except Exception as _fce:  # noqa: BLE001 - capture must never sink the scan
+            print(f"[evidence] full-capture pass skipped: {_fce}", flush=True)
+
     # EVIDENCE GUARANTEE (NGS: every finding needs its proof). No finding ships without a
-    # request/response block. Any finding whose detector didn't provide an exchange gets a minimal
-    # one synthesised from its own fields (url + payload + evidence/raw) so the report's
-    # REQUEST/RESPONSE + repro are NEVER empty. Backfills are counted + logged so a proofless
-    # detector stays visible and can be upgraded — but the finding is always evidenced.
+    # request/response block. Any finding whose detector didn't provide an exchange (and that
+    # full-capture couldn't replay — e.g. a POST-only finding) gets a minimal one synthesised from
+    # its own fields (url + payload + evidence/raw) so REQUEST/RESPONSE + repro are NEVER empty.
     _backfilled = 0
     for f in uniq:
         _has = any(isinstance(e, dict) and (e.get("request") or e.get("response")) and
