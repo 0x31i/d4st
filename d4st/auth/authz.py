@@ -159,11 +159,83 @@ def _tamper_id(url: str, param: str, value: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
 
 
+_PROBE_LABEL = {
+    "broken-auth": "PROOF — same request with the bearer REMOVED (unauthenticated)",
+    "broken-token-validation": "PROOF — same request with a BOGUS/invalid JWT",
+    "idor-suspect": "PROOF — same request with a TAMPERED id (authenticated)",
+}
+
+
+def _redact_headers(h: dict) -> dict:
+    """Show that auth WAS/WASN'T present (the whole proof) without leaking the full token."""
+    out = {}
+    for k, v in (h or {}).items():
+        lk = k.lower()
+        if lk == "authorization":
+            out[k] = (str(v)[:26] + "…<redacted>") if v else v
+        elif lk == "cookie":
+            out[k] = "<redacted>"
+        else:
+            out[k] = v
+    return out
+
+
+def _exchange(label: str, r) -> dict:
+    """Build a full labeled request/response exchange from an httpx Response — the evidence."""
+    req = getattr(r, "request", None)
+    try:
+        _elapsed = int(r.elapsed.total_seconds() * 1000)
+    except Exception:  # noqa: BLE001
+        _elapsed = None
+    return {
+        "label": label,
+        "request": {
+            "method": getattr(req, "method", "GET"),
+            "url": str(getattr(req, "url", "")),
+            "headers": _redact_headers(dict(getattr(req, "headers", {}) or {})),
+            "body": "",
+        },
+        "response": {
+            "status": getattr(r, "status_code", None),
+            "headers": dict(getattr(r, "headers", {}) or {}),
+            "elapsed_ms": _elapsed,
+            "size": len(getattr(r, "content", b"") or b""),
+            "body": (getattr(r, "text", "") or "")[:8000],
+        },
+    }
+
+
+def _curl(r) -> str:
+    """A copy-paste curl that reproduces the PROBE request (the one that proves the finding)."""
+    req = getattr(r, "request", None)
+    if req is None:
+        return ""
+    parts = [f"curl -i -X {req.method}"]
+    _skip = {"host", "content-length", "connection", "accept-encoding"}
+    for k, v in (dict(req.headers) or {}).items():
+        if k.lower() in _skip:
+            continue
+        if k.lower() == "authorization":
+            v = str(v)[:26] + "…"
+        parts.append(f"-H '{k}: {v}'")
+    parts.append(f"'{req.url}'")
+    return " ".join(parts)
+
+
 def _f(kind: str, severity: str, url: str, detail: str, base_r, probe_r, sensitivity: int = 1) -> dict:
+    # FULL PROOF: the authed baseline exchange (bearer present -> data) AND the tampered probe
+    # exchange (bearer removed / bad token / tampered id -> same or different data). The contrast
+    # between the two request/response pairs is the evidence an analyst/client needs.
+    ev_log = [
+        _exchange("Authenticated baseline (valid bearer)", base_r),
+        _exchange(_PROBE_LABEL.get(kind, "PROOF — tampered probe"), probe_r),
+    ]
     return {
         "type": kind, "name": kind, "severity": severity, "url": url, "method": "GET",
         "detail": detail, "category": "authorization", "verified": True,
         "sensitivity": sensitivity,  # 2=sensitive data, 1=data, 0=empty/likely-public — for ranking
+        "evidence_log": ev_log,
+        "repro": _curl(probe_r),
         "evidence": {
             "authed_status": getattr(base_r, "status_code", None),
             "probe_status": getattr(probe_r, "status_code", None),
