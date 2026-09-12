@@ -360,11 +360,12 @@ def parse_semgrep_json(text: str) -> list[dict]:
 
 
 def run_semgrep_js(js_urls: list[str], cookie: str, semgrep_bin: str = "semgrep",
-                   configs: list[str] | None = None, cap: int = 40) -> list[dict]:
-    """Fetch the app's JS bundles and run Semgrep's JS/XSS rulesets over them — catches
-    source->sink flows in code paths the runtime DOM pass never triggers. Runs Semgrep as a
-    subprocess (it needs py3.10+), so it is decoupled from this 3.9-capable package.
-    Returns [] if semgrep is absent (degrades gracefully)."""
+                   configs: list[str] | None = None, cap: int = 40,
+                   local_dir: str | None = None) -> list[dict]:
+    """Run Semgrep's JS/XSS rulesets over the app's JS — catches source->sink flows in code paths
+    the runtime DOM pass never triggers. If `local_dir` is given (the deep JS pass already
+    downloaded every bundle there), scan it directly with NO re-fetch; otherwise fetch js_urls.
+    Runs Semgrep as a subprocess (py3.10+), decoupled from this package. [] if semgrep absent."""
     import os
     import shutil
     import subprocess
@@ -377,6 +378,17 @@ def run_semgrep_js(js_urls: list[str], cookie: str, semgrep_bin: str = "semgrep"
     import os as _os
     _local = _os.path.join(_os.path.dirname(__file__), "rules", "dom-xss.yaml")
     configs = configs or ["p/javascript", "p/secrets", _local]
+    # Reuse the already-downloaded JS dir when provided — scans EVERY bundle, no re-fetch.
+    if local_dir and os.path.isdir(local_dir) and any(f.endswith(".js") for f in os.listdir(local_dir)):
+        args = [semgrep_bin, "--json", "--quiet", "--timeout", "30", "--metrics", "off"]
+        for c in configs:
+            args += ["--config", c]
+        args.append(local_dir)
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=900, check=False)
+        except Exception:  # noqa: BLE001
+            return []
+        return parse_semgrep_json(proc.stdout)
     headers = {"Cookie": cookie} if cookie else {}
     workdir = tempfile.mkdtemp(prefix="semgrep_js_")
     n = 0

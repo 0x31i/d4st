@@ -2633,16 +2633,14 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
 
     _prog.update("pii", findings, urls=len(urls), targets=len(targets))
 
-    # 3) vulnerable JS dependencies
-    for vl in vuln_libs:
-        findings.append(Finding(tool="jsanalysis", category="vulnerable-component", url=vl.url,
-                                param=vl.library, evidence=f"{vl.library} {vl.version}: {vl.detail}",
-                                verified=True))
+    # 3) vulnerable JS dependencies are now produced by the deep JS-content pass (harvest_js_content
+    #    over the full chunk set), folded into `findings` as vulnerable-js-dependency above.
 
     # 3b) Semgrep JS static analysis: source->sink flows in code the runtime DOM pass never
-    # triggers (belt-and-suspenders for DOM data-manipulation / XSS). No-op if semgrep absent.
+    # triggers (belt-and-suspenders for DOM data-manipulation / XSS). Runs over the JS the deep pass
+    # ALREADY downloaded (_js_dir) — no re-fetch. No-op if semgrep absent.
     from .jsanalysis import run_semgrep_js
-    for sg in run_semgrep_js(js_urls, cookie):
+    for sg in run_semgrep_js([], cookie, local_dir=_js_dir):
         findings.append(Finding(tool="semgrep", category=sg["category"], url=sg.get("path", ""),
                                 param=sg.get("check"), method="static",
                                 evidence=(sg.get("message") or "")[:120]))
