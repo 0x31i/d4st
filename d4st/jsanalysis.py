@@ -121,7 +121,10 @@ def extract_endpoints(js_text: str, base_url: str, host: str) -> list[str]:
 
 
 def detect_vuln_libs(js_text: str, url: str) -> list[VulnLib]:
-    hay = f"{url}\n{js_text[:4000]}"  # filename + banner region
+    # Scan the WHOLE bundle, not just the first 4 KB: a webpack/Angular chunk inlines its vendored
+    # libs anywhere in the body, so the version banner is rarely near the top (this is why Burp's
+    # "Vulnerable JavaScript dependency" class was missed — we only sniffed the banner region).
+    hay = f"{url}\n{js_text[:600000]}"
     found: list[VulnLib] = []
     seen: set = set()
     for lib, rx, floor, detail in _LIB_SIGNATURES:
@@ -138,6 +141,98 @@ def detect_vuln_libs(js_text: str, url: str) -> list[VulnLib]:
         except Exception:  # noqa: BLE001, S112
             continue
     return found
+
+
+# ----- JS CONTENT disclosure scanning (Burp parity: connstrings, emails, hardcoded keys) --------
+# These classes live in the SPA's chunk-*.js BODIES. The crawler reaches the chunks but nothing
+# scanned their content (run_roster's gitleaks/trufflehog need a populated js_dir, which nothing
+# filled). harvest_js_content() below downloads every in-scope chunk AND scans it for these.
+_JS_SECRET_PATTERNS = [
+    ("db-connection-string", "secret-disclosure", re.compile(
+        r"(?i)(?:server|data\s*source)\s*=\s*[^;'\"<>\s]{2,60}\s*;\s*"
+        r"(?:database|initial\s*catalog)\s*=\s*[^;'\"<>\s]{2,60}")),
+    ("db-connection-string", "secret-disclosure", re.compile(
+        r"(?i)(?:user\s*id|uid)\s*=\s*[^;'\"<>\s]{2,40}\s*;\s*(?:password|pwd)\s*=\s*[^;'\"<>\s]{2,40}")),
+    ("google-api-key", "secret-disclosure", re.compile(r"AIza[0-9A-Za-z_\-]{20,}")),
+    ("aws-access-key", "secret-disclosure", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("private-key", "secret-disclosure", re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----")),
+    ("azure-sas-endpoint", "info-disclosure", re.compile(
+        r"(?i)getAccountSASToken|/api/SAS\b|[?&]sv=\d{4}-\d{2}-\d{2}&s[ir]=")),
+    ("hardcoded-secret", "secret-disclosure", re.compile(
+        r"(?i)(?:api[_-]?key|client[_-]?secret|access[_-]?token|auth[_-]?token)"
+        r"\"?\s*[:=]\s*[\"']([A-Za-z0-9_\-]{16,})[\"']")),
+]
+_JS_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+_EMAIL_ASSET_SUFFIX = (".png", ".jpg", ".jpeg", ".svg", ".woff", ".woff2", ".css", ".js", ".gif", ".ico")
+_EMAIL_NOISE_PREFIX = ("example@", "test@", "user@", "email@", "name@", "your@", "someone@", "sentry@")
+
+
+def scan_js_secrets(js_text: str, url: str) -> list[tuple[str, str, str]]:
+    """Return [(label, category, evidence)] of secrets/PII disclosed in JS content — the Burp
+    'Database connection string / Email addresses / hardcoded key' classes. Read-only; caller dedups."""
+    text = js_text or ""
+    out: list[tuple[str, str, str]] = []
+    for label, cat, rx in _JS_SECRET_PATTERNS:
+        for m in rx.finditer(text):
+            out.append((label, cat, m.group(0)[:120]))
+    for m in _JS_EMAIL_RE.finditer(text):
+        e = m.group(0)
+        low = e.lower()
+        if low.endswith(_EMAIL_ASSET_SUFFIX) or low.startswith(_EMAIL_NOISE_PREFIX):
+            continue
+        if "@2x" in low or "@3x" in low or low.count("@") != 1:   # sprite@2x.png-style false hits
+            continue
+        out.append((e, "pii-disclosure", e))
+    return out
+
+
+def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
+                       cap: int = 400, extra_headers: dict | None = None) -> tuple[int, list[dict]]:
+    """Download in-scope JS to out_dir (so run_roster's gitleaks/trufflehog scan REAL content) AND
+    scan each body for vuln-deps + secrets/PII. Returns (n_saved, [finding dict]). Read-only — the
+    JS was already fetched during the crawl; this just persists + inspects the bodies."""
+    import os
+
+    import httpx
+    os.makedirs(out_dir, exist_ok=True)
+    hdr: dict = {}
+    if cookie:
+        hdr["Cookie"] = cookie
+    if extra_headers:
+        hdr.update({k: v for k, v in extra_headers.items() if k and v})
+    findings: list[dict] = []
+    seen: set = set()
+    n = 0
+    for i, u in enumerate(js_urls[:cap]):
+        try:
+            r = httpx.get(u, headers=hdr, follow_redirects=True, timeout=15, verify=False)
+        except Exception:  # noqa: BLE001, S112 - one bad chunk must not sink the pass
+            continue
+        txt = r.text or ""
+        fn = os.path.join(out_dir, f"{i:04d}_" + (u.rsplit("/", 1)[-1].split("?")[0] or "s"))
+        if not fn.endswith(".js"):
+            fn += ".js"
+        try:
+            with open(fn, "w", encoding="utf-8") as fh:
+                fh.write(txt)
+            n += 1
+        except Exception:  # noqa: BLE001, S112
+            pass
+        for vl in detect_vuln_libs(txt, str(r.url)):
+            k = ("dep", vl.library, vl.version)
+            if k in seen:
+                continue
+            seen.add(k)
+            findings.append({"category": "vulnerable-js-dependency", "url": str(r.url),
+                             "param": vl.library, "detail": f"{vl.library} {vl.version}: {vl.detail}"})
+        for label, cat, ev in scan_js_secrets(txt, str(r.url)):
+            k = (cat, ev)
+            if k in seen:
+                continue
+            seen.add(k)
+            findings.append({"category": cat, "url": str(r.url), "param": label,
+                             "detail": f"{label} disclosed in JS: {ev}"})
+    return n, findings
 
 
 def analyze_js(js_urls: list[str], cookie: str, host: str,

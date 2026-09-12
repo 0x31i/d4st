@@ -2348,6 +2348,33 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         print(f"[scope] restricted to {', '.join(_scope)}: kept {len(urls)}/{_before} URL(s) "
               f"(dropped {_before - len(urls)} off-scope)", flush=True)
 
+    # JS-CONTENT deep scan (Burp parity). The SPA's disclosure findings — DB connection strings,
+    # email addresses, hardcoded keys, vulnerable JS deps — live in the chunk-*.js BODIES. The crawl
+    # REACHES those chunks, but nothing scanned their content: run_roster's gitleaks/trufflehog scan
+    # D4ST_JS_DIR, which nothing ever populated, so every JS-disclosure class was missed. Download
+    # every in-scope .js to a shared dir (feeds those subprocess scanners real content) and scan the
+    # bodies here for secrets/PII/vuln-deps. Read-only — the JS was already fetched during the crawl.
+    _js_scoped = sorted({u for u in urls if u.split("?")[0].endswith(".js")})
+    _js_dir = os.environ.get("D4ST_JS_DIR", "") or tempfile.mkdtemp(prefix="d4st-js-")
+    _js_findings: list[Finding] = []
+    if _js_scoped:
+        try:
+            from .jsanalysis import harvest_js_content
+            _jn, _jf = harvest_js_content(_js_scoped, cookie, host, _js_dir,
+                                          cap=int(os.environ.get("D4ST_JS_CAP", "400") or "400"),
+                                          extra_headers=dict(_AUTH_HEADER))
+            for _d in _jf:
+                _js_findings.append(Finding(
+                    tool="jsdisclosure", category=_d["category"], url=_d["url"],
+                    param=_d.get("param", ""), evidence=_d["detail"], verified=True,
+                    detection="JS content analysis", confidence="firm",
+                    evidence_log=[{"snippet": _d.get("detail", "")[:200]}]))
+            if _jn:
+                print(f"[js] downloaded {_jn} in-scope JS file(s) -> content scan: "
+                      f"{len(_jf)} disclosure/dep finding(s) [js_dir={_js_dir}]", flush=True)
+        except Exception as _je:  # noqa: BLE001 - JS content scan must not sink the scan
+            print(f"[js] content scan skipped: {_je}", flush=True)
+
     # The crawl can outlive the session (a long headless crawl, a stray logout). Re-auth before
     # form discovery so fetch_forms parses the REAL authenticated forms, not the login page (the
     # exact failure DVWA exposed: dead session => every form looked like the login form).
@@ -2378,6 +2405,9 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     if not policy.fuzz_forms:
         active_targets = [t for t in active_targets if t.method != "POST"]
     findings: list[Finding] = []
+    # Fold in the JS-content disclosure findings (connstrings/emails/keys/vuln-deps) gathered above.
+    if _js_findings:
+        findings.extend(_js_findings)
 
     # Incremental progress checkpoint (crash-survivable observability): after each stage, rewrite
     # D4ST_PROGRESS_FILE with everything found so far + a stage timeline. So even a killed/hung
@@ -2488,7 +2518,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             _safe_urls = [u for u in (_materialize_url(t) for t in active_targets) if u] or \
                 [t.url for t in active_targets]
             findings += run_roster(target, _safe_urls, cookie, policy,
-                                   js_dir=os.environ.get("D4ST_JS_DIR", ""),
+                                   js_dir=_js_dir,
                                    level_override=health.sqlmap_level(policy.sqlmap_level),
                                    health=health, per_url_cap=_inject_cap, progress=_prog,
                                    base_findings=list(findings), api_surface=_api,
