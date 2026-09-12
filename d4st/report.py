@@ -170,6 +170,14 @@ VULN_META: dict[str, dict] = {
              "vulnerabilities (XSS, prototype pollution, ReDoS), reachable in the client.",
         fix="Upgrade the library to a patched release; track dependencies with SCA (retire.js / "
             "npm audit) and pin/patch known-vulnerable versions."),
+    "tls-configuration": dict(
+        title="TLS / Certificate Configuration", severity="medium", cwe="CWE-295 / CWE-326",
+        owasp="A02:2021 Cryptographic Failures",
+        desc="A TLS or certificate hygiene issue — an expired/invalid certificate or a deprecated "
+             "protocol (TLS 1.0/1.1) still enabled — weakens transport security and fails modern "
+             "compliance (PCI, HIPAA transmission security).",
+        fix="Keep certificates valid and auto-renewed; disable TLS 1.0/1.1 and weak ciphers; require "
+            "TLS 1.2+ with a strong cipher suite and HSTS."),
     "other": dict(
         title="Other Finding", severity="info", cwe="—", owasp="—",
         desc="A finding reported by a scanner that does not map to a standard category.",

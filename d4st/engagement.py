@@ -2587,6 +2587,19 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                                 param=pf.check, evidence=pf.detail, verified=True,
                                 evidence_log=_ev, detection="passive response analysis",
                                 confidence="firm"))
+    # TLS / certificate hygiene (Burp parity: "TLS certificate" + deprecated-protocol). Fast stdlib
+    # handshakes against the target host — read-only, no attack traffic. testssl.sh is too slow here.
+    try:
+        from .tlsscan import tls_scan
+        for _t in tls_scan(urlsplit(target).hostname or target, urlsplit(target).port or 443):
+            findings.append(Finding(
+                tool="tls", category=_t["category"], url=f"{urlsplit(target).scheme}://"
+                f"{urlsplit(target).hostname}", param=_t.get("param", ""), evidence=_t["detail"],
+                verified=True, detection="TLS handshake analysis",
+                confidence="firm" if "info" not in _t.get("param", "") else "tentative"))
+        print("[tls] certificate + protocol hygiene checked", flush=True)
+    except Exception as _te:  # noqa: BLE001 - TLS check must not sink the scan
+        print(f"[tls] skipped: {_te}", flush=True)
     _prog.update("passive", findings, urls=len(urls), targets=len(targets))
 
     # 2b) passive info-disclosure via CLI detectors (nuclei exposures/misconfig + PII/email
