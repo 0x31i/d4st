@@ -100,15 +100,37 @@ def _proc_cpu_seconds(pid: int) -> float | None:
                 continue
         return total
     except Exception:  # noqa: BLE001 - psutil missing or process gone; fall back to ps
+        # Tree-aware ps fallback: a wrapper like zap.sh is itself idle while its java CHILD burns
+        # CPU, so summing only `pid` would look hung. Walk the whole ps table and sum cputime for
+        # `pid` + every descendant — this is what lets the ZAP watchdog see the busy JVM without
+        # psutil installed (the exact bug that false-killed a healthy ZAP active scan).
         try:
-            out = subprocess.run(["ps", "-o", "cputime=", "-p", str(pid)],
-                                 capture_output=True, text=True, timeout=5).stdout.strip()
-            if not out:
-                return None
-            secs = 0
-            for part in out.replace("-", ":").split(":"):   # [dd-]hh:mm:ss or mm:ss
-                secs = secs * 60 + int(float(part))
-            return float(secs)
+            out = subprocess.run(["ps", "-eo", "pid=,ppid=,time="],
+                                 capture_output=True, text=True, timeout=5).stdout
+            cpu: dict[int, float] = {}
+            kids: dict[int, list[int]] = {}
+            for ln in out.splitlines():
+                parts = ln.split(None, 2)
+                if len(parts) < 3:
+                    continue
+                try:
+                    _pid, _ppid = int(parts[0]), int(parts[1])
+                except ValueError:
+                    continue
+                secs = 0.0
+                for p in parts[2].replace("-", ":").split(":"):   # [dd-]hh:mm:ss or mm:ss
+                    secs = secs * 60 + float(p)
+                cpu[_pid] = secs
+                kids.setdefault(_ppid, []).append(_pid)
+            total, stack, seen = 0.0, [pid], set()
+            while stack:
+                x = stack.pop()
+                if x in seen:
+                    continue
+                seen.add(x)
+                total += cpu.get(x, 0.0)
+                stack.extend(kids.get(x, []))
+            return total if seen & cpu.keys() else None
         except Exception:  # noqa: BLE001
             return None
 
@@ -3050,10 +3072,14 @@ jobs:
         # in-image, and the bind-mount point of out_dir on the dockerized path.
         args = _wrap(["zap.sh", f"-Xmx{_xmx}", "-cmd",
                       "-autorun", "/zap/wrk/plan.yaml", *auth_cfg], _cname)
-        # Stall watchdog, not a fixed clock: ZAP is dropped only if the CONTAINER goes both silent
-        # AND idle (genuinely hung) or hits the absolute backstop — never for being thorough/slow.
+        # Stall watchdog, not a fixed clock: ZAP is dropped only if it goes both silent AND idle
+        # (genuinely hung) or hits the absolute backstop — never for being thorough/slow. IN-IMAGE
+        # ZAP is a child PROCESS (zap.sh->java), not a sibling container, so watch its process TREE
+        # (container=None); only the dockerized-sibling path has a real container to poll. Passing
+        # the bogus 'd4st-zap-*' container name in-image made the CPU check no-op -> stdout-only ->
+        # false-killed a healthy scan (ZAP's -cmd progress goes to its log, not stdout).
         _zap_out, _reason = _run_stalled(args, stall_secs=_stall, ceiling_secs=timeout,
-                                         container=_cname)
+                                         container=(None if _in_image else _cname))
         if _reason != "completed":
             print(f"[zap] watchdog: {_reason}", flush=True)
         return _parse()
