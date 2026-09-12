@@ -2969,11 +2969,26 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         _KEEP_PER_INSTANCE = {"sql-injection", "xss", "command-injection", "file-inclusion", "rfi",
                               "ssrf", "xxe", "ssti", "open-redirect", "secret-disclosure",
                               "pii-disclosure", "bola", "idor-suspect", "broken-auth"}
+        # Category-sanity overrides: ZAP's CWE tags make the CWE classifier over-rate a few benign
+        # INFO alerts (a cross-domain CDN <script> becomes 'file-inclusion'=HIGH; housekeeping notes
+        # become injection-ish). Force these to their true low/info class so the deliverable isn't
+        # alarmist — Burp reports the same items as Info/Low.
+        _ZAP_CAT_OVERRIDE = [
+            (re.compile(r"cross-domain javascript source file inclusion", re.I), "misconfiguration"),
+            (re.compile(r"session management response|modern web application|user agent fuzzer|"
+                        r"re-examine cache|sub resource integrity|timestamp disclosure|"
+                        r"information disclosure - suspicious comments|elmah", re.I), "info-disclosure"),
+        ]
         out: list[Finding] = []
         _rep: dict[tuple, Finding] = {}
         _rep_urls: dict[tuple, set] = {}
         for n in normalize_zap(report):
             alert = n.raw or {}
+            _zname = str(alert.get("name", ""))
+            for _rx, _newcat in _ZAP_CAT_OVERRIDE:
+                if _rx.search(_zname):
+                    n.category = _newcat
+                    break
             inst = (alert.get("instances") or [{}])[0] if isinstance(alert.get("instances"), list) else {}
             attack = str(inst.get("attack") or "")
             zev = str(inst.get("evidence") or "")
