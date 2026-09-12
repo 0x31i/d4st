@@ -50,10 +50,18 @@ _SEVERITY = {"US_SSN": "low", "CREDIT_CARD": "low", "MEDICAL_LICENSE": "low",
 @dataclass
 class PiiHit:
     entity: str
-    masked: str          # value with all-but-last-4 masked; never the raw PII
+    masked: str          # value with all-but-last-4 masked
     score: float
     url: str
     severity: str = "info"
+    raw: str = ""        # the ACTUAL value — deliverable evidence (NGS: record everything)
+    context: str = ""    # response snippet around the match — the proof it was disclosed
+
+
+def _ctx(text: str, start: int, end: int, pad: int = 160) -> str:
+    """A window of the response around the PII match — shows it in context = proof."""
+    a, b = max(0, start - pad), min(len(text), end + pad)
+    return ("…" if a > 0 else "") + text[a:b] + ("…" if b < len(text) else "")
 
 
 def _mask(v: str) -> str:
@@ -136,7 +144,7 @@ class PiiScanner:
         seen: set = set()
         out: list[PiiHit] = []
         for h in hits:
-            k = (h.entity, h.masked)
+            k = (h.entity, h.raw or h.masked)
             if k in seen:
                 continue
             seen.add(k)
@@ -158,12 +166,14 @@ class PiiScanner:
             if r.entity_type == "CREDIT_CARD" and not _luhn(val):
                 continue   # format-only match without Luhn -> drop (kills the FPs)
             out.append(PiiHit(r.entity_type, _mask(val), round(float(r.score), 2), url,
-                              _SEVERITY.get(r.entity_type, "info")))
+                              _SEVERITY.get(r.entity_type, "info"),
+                              raw=val, context=_ctx(text, r.start, r.end)))
         # Presidio's email recognizer validates the TLD and misses non-standard ones
         # (.op / .local / .internal / .corp) — but an exposed email is exposed regardless.
         # Always union the format regex so internal/corporate emails are never missed.
         for m in self._RX["EMAIL_ADDRESS"].finditer(text[:200000]):
-            out.append(PiiHit("EMAIL_ADDRESS", _mask(m.group(0)), 0.6, url, "info"))
+            out.append(PiiHit("EMAIL_ADDRESS", _mask(m.group(0)), 0.6, url, "info",
+                              raw=m.group(0), context=_ctx(text, m.start(), m.end())))
         return out
 
     # --- minimal fallback (no Presidio): high-signal patterns only -----------------
@@ -180,7 +190,8 @@ class PiiScanner:
                 val = m.group(0)
                 if ent == "CREDIT_CARD" and not _luhn(val):
                     continue
-                out.append(PiiHit(ent, _mask(val), 0.6, url, _SEVERITY.get(ent, "info")))
+                out.append(PiiHit(ent, _mask(val), 0.6, url, _SEVERITY.get(ent, "info"),
+                                  raw=val, context=_ctx(text, m.start(), m.end())))
         return out
 
 
@@ -216,7 +227,7 @@ class ResponsePiiCollector:
         seen: set = set()
         out: list[PiiHit] = []
         for hh in self._hits:
-            k = (hh.entity, hh.masked, hh.url.split("?")[0])
+            k = (hh.entity, hh.raw or hh.masked, hh.url.split("?")[0])
             if k in seen:
                 continue
             seen.add(k)
