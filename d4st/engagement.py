@@ -2974,18 +2974,13 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
                                "raise D4ST_ZAP_TIMEOUT or check container memory)")
         with open(report_path, encoding="utf-8") as fh:
             report = json.load(fh)
-        # ZAP emits ONE finding per instance, so a config alert (CORS/CSP/cacheable/header) on 150
-        # URLs explodes into 150 findings — the raw 323 that makes a deliverable unreadable. Collapse
-        # site-wide CONFIG/INFO classes to ONE representative per (category, alert-name) with an
-        # "affects N endpoints" rollup (exactly how Burp dedups 511 instances -> 250 unique). Keep
-        # INJECTION / high-value classes per-endpoint — there each instance is a distinct real vuln.
-        _KEEP_PER_INSTANCE = {"sql-injection", "xss", "command-injection", "file-inclusion", "rfi",
-                              "ssrf", "xxe", "ssti", "open-redirect", "secret-disclosure",
-                              "pii-disclosure", "bola", "idor-suspect", "broken-auth"}
-        # Category-sanity overrides: ZAP's CWE tags make the CWE classifier over-rate a few benign
-        # INFO alerts (a cross-domain CDN <script> becomes 'file-inclusion'=HIGH; housekeeping notes
-        # become injection-ish). Force these to their true low/info class so the deliverable isn't
-        # alarmist — Burp reports the same items as Info/Low.
+        # REPORT ALL DATA: emit every ZAP instance as its OWN finding with its OWN per-instance
+        # request/response data. We do NOT collapse — an analyst wants each affected endpoint as a
+        # separate, fully-detailed item (readability grouping, if wanted, is a report-time VIEW that
+        # links back to every item, never a data-layer deletion). We still apply category-CORRECTNESS
+        # overrides: ZAP's CWE tags make the classifier over-rate a few benign alerts (a cross-domain
+        # CDN <script> becomes 'file-inclusion'=HIGH; housekeeping notes become injection-ish) — that
+        # is a mis-severity bug, not data, so we fix it while keeping every instance.
         _ZAP_CAT_OVERRIDE = [
             (re.compile(r"cross-domain javascript source file inclusion", re.I), "misconfiguration"),
             (re.compile(r"session management response|modern web application|user agent fuzzer|"
@@ -2993,8 +2988,6 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
                         r"information disclosure - suspicious comments|elmah", re.I), "info-disclosure"),
         ]
         out: list[Finding] = []
-        _rep: dict[tuple, Finding] = {}
-        _rep_urls: dict[tuple, set] = {}
         for n in normalize_zap(report):
             alert = n.raw or {}
             _zname = str(alert.get("name", ""))
@@ -3002,20 +2995,15 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
                 if _rx.search(_zname):
                     n.category = _newcat
                     break
-            inst = (alert.get("instances") or [{}])[0] if isinstance(alert.get("instances"), list) else {}
+            # bind THIS finding to ITS OWN instance (match by uri) so per-item data is accurate —
+            # the old code reused instances[0] for every row, losing per-endpoint request/response.
+            _insts = alert.get("instances") if isinstance(alert.get("instances"), list) else []
+            inst = next((i for i in _insts if i.get("uri") == n.url), (_insts[0] if _insts else {}))
             attack = str(inst.get("attack") or "")
             zev = str(inst.get("evidence") or "")
             desc = re.sub(r"<[^>]+>", " ", str(alert.get("desc", "") or "")).strip()[:500]
             solution = re.sub(r"<[^>]+>", " ", str(alert.get("solution", "") or "")).strip()[:400]
             name = str(alert.get("name", ""))
-            # dedup key: config/info classes collapse per (category, name); injection stays per (url,param)
-            if n.category in _KEEP_PER_INSTANCE:
-                key = (n.category, name, n.url, n.param or inst.get("param"))
-            else:
-                key = (n.category, name)
-            if key in _rep:
-                _rep_urls[key].add(n.url)
-                continue
             ev_log = []
             if attack or zev:
                 ev_log = [{
@@ -3031,27 +3019,14 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
                               "solution", "reference", "cweid", "wascid", "count", "instances")
                               if alert.get(k)}, indent=1, default=str)[:9000]
             conf = str(alert.get("confidence", ""))
-            f = Finding(
+            out.append(Finding(
                 tool="zap", category=n.category, url=n.url, param=n.param or inst.get("param"),
                 evidence=(name + (f" — {desc}" if desc else ""))[:600],
                 evidence_log=ev_log, raw_output=raw, payload=attack[:400], verified=True,
                 detection="zap active scan",
                 confidence=("firm" if conf in ("2", "3", "Medium", "High") else "tentative"),
-                verify_note=(f"Remediation (ZAP): {solution}" if solution else ""))
-            _rep[key] = f
-            _rep_urls[key] = {n.url}
-            out.append(f)
-        # fold the affected-endpoint rollup into each collapsed representative
-        _collapsed = 0
-        for key, f in _rep.items():
-            urls = sorted(u for u in _rep_urls[key] if u)
-            if len(urls) > 1:
-                _collapsed += len(urls) - 1
-                f.evidence = (f.evidence + f"  [affects {len(urls)} endpoints]")[:600]
-                f.evidence_log = (f.evidence_log or []) + [{"affected_endpoints": urls[:100]}]
-        if _collapsed:
-            print(f"[zap] deduped {_collapsed} per-instance duplicate(s) into "
-                  f"{len(out)} distinct finding(s)", flush=True)
+                verify_note=(f"Remediation (ZAP): {solution}" if solution else "")))
+        print(f"[zap] {len(out)} finding instance(s) (every endpoint kept as its own item)", flush=True)
         # Soft-404 guard: on catch-all/SPA-routing apps, ZAP's file-existence checks
         # (.env/.htaccess/Trace.axd/backup-file leaks) false-positive on the index page. Re-verify
         # each existence finding against the app's not-found fingerprint and drop the FPs. Findings
