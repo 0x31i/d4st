@@ -30,6 +30,30 @@ _BOGUS_JWT = (
 )
 _ID_IN_QUERY = re.compile(r"(^|[?&])([A-Za-z0-9_]*(?:id|Id|ID)[A-Za-z0-9_]*)=(\d+)")
 
+# Sensitivity markers used to RANK (never suppress) unauth-reachable endpoints, so an analyst sees
+# which "returns data without auth" hits actually leak sensitive data vs a by-design-public banner.
+_SENS_MARKERS = [
+    ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+    ("api-key", re.compile(r"AIza[0-9A-Za-z_\-]{10,}|AKIA[0-9A-Z]{12,}|sk_[A-Za-z0-9]{10,}")),
+    ("jwt/token", re.compile(r"eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}|\btoken\"?\s*[:=]")),
+    ("connection-string", re.compile(r"(?i)(connectionstring|data source=|initial catalog=|password=)")),
+    ("azure-acs-id", re.compile(r"8:acs:[0-9a-f\-]+")),
+    ("person-name", re.compile(r"(?i)\b(dr\.?|mr\.?|mrs\.?|ms\.?)\s+[A-Z][a-z]+|\"(userName|providerName|patientName|fullName)\"")),
+    ("ssn/dob", re.compile(r"\b\d{3}-\d{2}-\d{4}\b|\"(dob|dateOfBirth|ssn)\"")),
+]
+
+
+def _sensitivity(body: str) -> tuple[int, str]:
+    """Rank an unauth response by how sensitive its data is. Returns (rank, label). rank: 2=sensitive
+    markers present, 1=has non-trivial data, 0=empty/trivial (likely a by-design-public endpoint)."""
+    b = (body or "").strip()
+    if not b or b in ("[]", "[[]]", "{}", "null", '""'):
+        return 0, "empty/trivial response (likely intentionally public)"
+    hits = [name for name, rx in _SENS_MARKERS if rx.search(b)]
+    if hits:
+        return 2, "SENSITIVE DATA EXPOSED: " + ", ".join(sorted(set(hits)))
+    return 1, "non-empty data (no obvious sensitive markers — review)"
+
 
 def _auth_header_name(session: Session) -> str:
     for k in session.headers:
@@ -87,9 +111,11 @@ def run_authz(session: Session, base: str, urls: list[str], *,
                 na = c.get(url, headers=noauth)
                 time.sleep(delay)
                 if na.status_code < 400 and _similar(na.text, b_body):
+                    _rank, _label = _sensitivity(na.text)
                     findings.append(_f("broken-auth", "critical", url,
                                        f"endpoint returns {na.status_code} with data when the bearer "
-                                       f"is removed (authed baseline {base_r.status_code})", base_r, na))
+                                       f"is removed (authed baseline {base_r.status_code}) | {_label}",
+                                       base_r, na, sensitivity=_rank))
                     continue  # already broken; skip further checks on this one
             except Exception:
                 pass
@@ -133,10 +159,11 @@ def _tamper_id(url: str, param: str, value: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
 
 
-def _f(kind: str, severity: str, url: str, detail: str, base_r, probe_r) -> dict:
+def _f(kind: str, severity: str, url: str, detail: str, base_r, probe_r, sensitivity: int = 1) -> dict:
     return {
         "type": kind, "name": kind, "severity": severity, "url": url, "method": "GET",
         "detail": detail, "category": "authorization", "verified": True,
+        "sensitivity": sensitivity,  # 2=sensitive data, 1=data, 0=empty/likely-public — for ranking
         "evidence": {
             "authed_status": getattr(base_r, "status_code", None),
             "probe_status": getattr(probe_r, "status_code", None),
