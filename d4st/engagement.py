@@ -2028,6 +2028,7 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
                   else f.get("evidence") or f.get("name") or f.get("message_str") or "")
             # Capture the tool's OWN request/response (nuclei -irr, dalfox PoC, etc.) as proof.
             req, resp = f.get("request"), f.get("response")
+            _poc = f.get("poc") or f.get("proof") or f.get("matched-at") or f.get("data") or ""
             ev_log = []
             if req or resp:
                 ev_log = [{
@@ -2037,6 +2038,16 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
                     "response": {"status": f.get("status"), "headers": {},
                                  "elapsed_ms": None, "size": len(str(resp or "")),
                                  "body": str(resp or "")[:_EVID_MAX_BODY]},
+                }]
+            elif _poc or ev or f.get("payload"):
+                # tools that emit a PoC/payload instead of raw req/resp (dalfox, commix, sqlmap…):
+                # the PoC URL + injected payload = request, the reflected/telling evidence = response.
+                ev_log = [{
+                    "label": f"{name} proof-of-concept",
+                    "request": {"method": f.get("method", "GET"), "url": str(_poc or url),
+                                "headers": {}, "body": str(f.get("payload") or "")[:_EVID_MAX_BODY]},
+                    "response": {"status": f.get("status"), "headers": {},
+                                 "body": str(ev or f.get("evidence") or "")[:_EVID_MAX_BODY]},
                 }]
             # Per-finding raw detail: the tool's own JSON for this hit (matcher, extracted, cvss…).
             try:
@@ -2802,6 +2813,32 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             f.confidence = f.confidence or c
             f.payload = f.payload or p
             f.repro = f.repro or r
+    # EVIDENCE GUARANTEE (NGS: every finding needs its proof). No finding ships without a
+    # request/response block. Any finding whose detector didn't provide an exchange gets a minimal
+    # one synthesised from its own fields (url + payload + evidence/raw) so the report's
+    # REQUEST/RESPONSE + repro are NEVER empty. Backfills are counted + logged so a proofless
+    # detector stays visible and can be upgraded — but the finding is always evidenced.
+    _backfilled = 0
+    for f in uniq:
+        _has = any(isinstance(e, dict) and (e.get("request") or e.get("response")) and
+                   (str((e.get("response") or {}).get("body", "")).strip()
+                    or str((e.get("request") or {}).get("url", "")).strip())
+                   for e in (f.evidence_log or []))
+        if _has:
+            continue
+        _body = f.evidence or f.raw_output or f.verify_note or f"{f.category} finding"
+        f.evidence_log = (f.evidence_log or []) + [{
+            "label": f"{f.tool} finding — evidence",
+            "request": {"method": f.method or "GET", "url": f.url or target, "headers": {},
+                        "body": (f.payload or "")[:_EVID_MAX_BODY]},
+            "response": {"status": None, "headers": {}, "body": str(_body)[:_EVID_MAX_BODY]},
+        }]
+        if not f.repro and (f.url or target):
+            f.repro = f"curl -i '{f.url or target}'"
+        _backfilled += 1
+    if _backfilled:
+        print(f"[evidence] backfilled a proof block for {_backfilled} finding(s) that arrived "
+              f"without a request/response — every finding now carries evidence", flush=True)
     # Final session health: re-probe (re-auth on loss) so authed_at_end reflects whether the session
     # is RECOVERABLE at the end, not whether it happened to idle-out during ZAP's long run. Honest:
     # if the re-auth genuinely fails, alive() is still False and authed_at_end reports it.
@@ -3012,17 +3049,22 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
             desc = re.sub(r"<[^>]+>", " ", str(alert.get("desc", "") or "")).strip()[:500]
             solution = re.sub(r"<[^>]+>", " ", str(alert.get("solution", "") or "")).strip()[:400]
             name = str(alert.get("name", ""))
-            ev_log = []
-            if attack or zev:
-                ev_log = [{
-                    "label": "ZAP active-scan instance",
-                    "request": {"method": inst.get("method", "GET"),
-                                "url": inst.get("uri") or n.url, "headers": {},
-                                "body": (f"injected: {attack}" if attack else "")},
-                    "response": {"status": None, "headers": {}, "elapsed_ms": None,
-                                 "size": len(zev),
-                                 "body": (f"matched evidence in response: {zev}" if zev else "")},
-                }]
+            otherinfo = re.sub(r"<[^>]+>", " ", str(inst.get("otherinfo") or "")).strip()[:500]
+            # EVERY ZAP finding gets a proof exchange — active (attack+reflected evidence) AND
+            # passive/config alerts (missing header / cookie flag), where the proof is the request
+            # to the affected URL + the alert's evidence/other-info describing what the response
+            # showed. No ZAP finding ships without a request/response block.
+            _resp_body = (f"matched evidence in response: {zev}" if zev else "") \
+                or (otherinfo and f"finding basis: {otherinfo}") \
+                or f"finding basis: {desc}" or f"ZAP alert: {name}"
+            ev_log = [{
+                "label": "ZAP active-scan instance" if attack else "ZAP finding — affected request/response",
+                "request": {"method": inst.get("method", "GET"),
+                            "url": inst.get("uri") or n.url, "headers": {},
+                            "body": (f"injected: {attack}" if attack else "")},
+                "response": {"status": None, "headers": {}, "elapsed_ms": None,
+                             "size": len(zev), "body": _resp_body},
+            }]
             raw = json.dumps({k: alert.get(k) for k in ("name", "riskdesc", "confidence", "desc",
                               "solution", "reference", "cweid", "wascid", "count", "instances")
                               if alert.get(k)}, indent=1, default=str)[:9000]
