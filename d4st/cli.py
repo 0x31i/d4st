@@ -475,10 +475,13 @@ def update(status: bool, components: tuple) -> None:
 @click.option("--concise", is_flag=True, default=False,
               help="Cap giant response bodies / raw output on medium/low/info findings "
                    "(critical & high keep full evidence).")
+@click.option("--format", "fmt", default="auto",
+              help="Report format(s): comma list of html,xlsx,csv,pdf (or 'all'). Default 'auto' "
+                   "= infer from the --out extension. Files share the --out basename.")
 @click.option("--open", "open_it", is_flag=True, default=False, help="Open the report after writing.")
 def report(source: str, out: str, target: str, client: str | None, scope: str | None,
            window: str | None, prepared_by: str | None, ref: str | None, logo: str | None,
-           when: str | None, from_db: bool, concise: bool, open_it: bool) -> None:
+           when: str | None, from_db: bool, concise: bool, fmt: str, open_it: bool) -> None:
     """Render a client-grade HTML report from a scan result JSON (or a store scan id with
     --from-db). Light, print/PDF-ready (Cmd-P -> Save as PDF): cover page, executive summary,
     scope & methodology, findings index, MAX-DETAIL findings with full request/response
@@ -498,18 +501,45 @@ def report(source: str, out: str, target: str, client: str | None, scope: str | 
             result = _json.load(fh)
     rmeta = {k: v for k, v in dict(client=client, scope=scope, window=window,
              prepared_by=prepared_by, ref=ref, logo=logo, when=when).items() if v is not None}
-    html = build_report(result, target=target, meta=rmeta, concise=concise)
     n = len(result.get("findings", []))
-    if out.lower().endswith(".pdf"):
-        from .report import render_pdf
-        render_pdf(html, out)
+    base = os.path.splitext(out)[0]
+    if fmt.strip().lower() == "auto":
+        fmts = ["pdf"] if out.lower().endswith(".pdf") else \
+               ["csv"] if out.lower().endswith(".csv") else \
+               ["xlsx"] if out.lower().endswith((".xlsx", ".xls")) else ["html"]
+    elif fmt.strip().lower() == "all":
+        fmts = ["html", "xlsx", "csv", "pdf"]
     else:
-        with open(out, "w", encoding="utf-8") as fh:
-            fh.write(html)
-    console.print(f"[green]report[/green] -> {out}  ({n} findings{', concise' if concise else ''})")
-    if open_it:
+        fmts = [x.strip().lower() for x in fmt.split(",") if x.strip()]
+    _html = None
+    written = []
+    for fm in fmts:
+        if fm in ("html", "pdf") and _html is None:
+            _html = build_report(result, target=target, meta=rmeta, concise=concise)
+        if fm == "html":
+            p = base + ".html"
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(_html)
+        elif fm == "pdf":
+            from .report import render_pdf
+            p = base + ".pdf"
+            render_pdf(_html, p)
+        elif fm == "xlsx":
+            from .export import to_xlsx
+            p = base + ".xlsx"
+            to_xlsx(result, p, meta={**rmeta, "target": target})
+        elif fm == "csv":
+            from .export import to_csv
+            p = base + ".csv"
+            to_csv(result, p)
+        else:
+            continue
+        written.append(p)
+    console.print(f"[green]report[/green] -> {', '.join(written)}  ({n} findings"
+                  f"{', concise' if concise else ''})")
+    if open_it and written:
         import webbrowser
-        webbrowser.open(f"file://{os.path.abspath(out)}")
+        webbrowser.open(f"file://{os.path.abspath(written[0])}")
 
 
 @main.command()
