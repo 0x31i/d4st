@@ -120,6 +120,28 @@ def capture_scripted(profile: AuthProfile, base: str | None = None, *,
             ok = False
         if marker and marker not in body:
             ok = False
+        # ROBUST auth-success fallback (kills the transient-redirect false failure): a token-auth
+        # SPA can route through an INTERMEDIATE page (e.g. /config/userConfig, a first-login step)
+        # before the marker page, or render the marker a beat after our one-shot check — a transient
+        # that wrongly failed an otherwise-successful login. The ground truth is the auth TOKEN: if
+        # the profile's token key is present in sessionStorage/localStorage and we are OFF the login
+        # page, authentication unquestionably succeeded. Accept it even if the page-marker didn't
+        # match, and give the SPA a short grace poll for the token to appear.
+        if not ok:
+            tkey = (getattr(profile, "token", None) or {}).get("key")
+            tstore = (getattr(profile, "token", None) or {}).get("storage", "session")
+            store_obj = "localStorage" if str(tstore).startswith("local") else "sessionStorage"
+            on_login = "/login" in (page.url or "").lower()
+            if tkey and not on_login:
+                try:
+                    page.wait_for_function(
+                        "a => !!window[a.s] && !!window[a.s].getItem(a.k)",
+                        arg={"s": store_obj, "k": tkey}, timeout=8000)
+                    ok = True
+                    print(f"[capture] success via {store_obj}.{tkey} present at {page.url} "
+                          f"(page-marker not required — transient-redirect tolerant)", flush=True)
+                except Exception:  # noqa: BLE001
+                    pass
         if not ok:
             state = ctx.storage_state()
             browser.close()
