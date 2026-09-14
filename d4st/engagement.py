@@ -2074,28 +2074,49 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
 
 
 class _Progress:
-    """Incremental checkpoint writer: after every stage, atomically rewrite a JSON file with
-    everything found so far + a stage timeline. So a scan that is killed / crashes / hangs still
-    leaves an observable, up-to-date record of what it accomplished (instead of losing the whole
-    in-memory run). Enabled by D4ST_PROGRESS_FILE. Cheap (a few hundred findings), best-effort
-    (never raises into the scan)."""
+    """Incremental checkpoint writer + LIVE console reporter. After every stage it (1) prints a
+    clean, timestamped one-line status a human can watch while the scan runs unattended — elapsed
+    time, the stage that just finished, the running finding tally + delta-since-last-stage, and the
+    URL/target counts — and (2) atomically rewrites a JSON checkpoint so a killed/crashed/hung scan
+    still leaves an observable record. Console output is on by default; D4ST_QUIET=1 silences it and
+    the JSON file is written only when D4ST_PROGRESS_FILE is set. Best-effort (never raises)."""
 
     def __init__(self, path: str):
         self.path = path
         self.t0 = time.monotonic()
         self.timeline: list[dict] = []
+        self.last_n = 0
+        self.step = 0
+        self.console = os.environ.get("D4ST_QUIET", "") != "1"
+
+    @staticmethod
+    def _clock(secs: float) -> str:
+        m, s = divmod(int(secs), 60)
+        h, m = divmod(m, 60)
+        return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
     def update(self, stage: str, findings: list, *, urls: int = 0, targets: int = 0,
                note: str = "") -> None:
+        elapsed = round(time.monotonic() - self.t0)
+        n = len(findings)
+        delta = n - self.last_n
+        self.step += 1
+        self.timeline.append({"stage": stage, "elapsed_s": elapsed,
+                              "cumulative_findings": n, "note": note})
+        # LIVE line — aligned so a `tail -f` reads like a dashboard even without Claude driving.
+        if self.console:
+            d = f"+{delta}" if delta else "  "
+            extra = f"  {note}" if note else ""
+            print(f"[{self._clock(elapsed)}] ▸ {self.step:>2}. {stage:<20} "
+                  f"findings {n:>4} ({d:>3})   urls {urls:<5} targets {targets:<4}{extra}",
+                  flush=True)
+        self.last_n = n
         if not self.path:
             return
-        elapsed = round(time.monotonic() - self.t0)
-        self.timeline.append({"stage": stage, "elapsed_s": elapsed,
-                              "cumulative_findings": len(findings), "note": note})
         rec = {
             "status": "in-progress", "last_stage": stage, "elapsed_s": elapsed,
             "urls": urls, "targets": targets,
-            "n_findings": len(findings),
+            "n_findings": n,
             "by_category": dict(_Counter(getattr(f, "category", "") for f in findings)),
             "by_tool": dict(_Counter(getattr(f, "tool", "") for f in findings)),
             "timeline": self.timeline,
@@ -2108,6 +2129,27 @@ class _Progress:
             os.replace(tmp, self.path)
         except Exception:  # noqa: BLE001,S110 - progress writing must never break the scan
             pass
+
+    def banner(self, target: str, scope: list, session: str, profile: str) -> None:
+        if not self.console:
+            return
+        print("\n" + "=" * 78, flush=True)
+        print(f"  d4st engagement  —  {target}", flush=True)
+        print(f"  scope={','.join(scope)}  profile={profile}  session={'yes' if session else 'no'}",
+              flush=True)
+        print("  live stage progress follows (set D4ST_QUIET=1 to silence)", flush=True)
+        print("=" * 78, flush=True)
+
+    def summary(self, findings: list) -> None:
+        if not self.console:
+            return
+        elapsed = round(time.monotonic() - self.t0)
+        cats = _Counter(getattr(f, "category", "") for f in findings)
+        print("\n" + "=" * 78, flush=True)
+        print(f"  SCAN COMPLETE in {self._clock(elapsed)}  —  {len(findings)} finding(s)", flush=True)
+        for cat, cnt in sorted(cats.items(), key=lambda kv: -kv[1]):
+            print(f"    {cnt:>4}  {cat}", flush=True)
+        print("=" * 78 + "\n", flush=True)
 
 
 class SessionKeeper:
@@ -2296,6 +2338,17 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     from .dom import dom_probe
     from .passive import passive_scan
     from .safety import get_policy, is_auth_endpoint, is_state_changing
+
+    # Keep the live console readable: the target's self-signed/mismatched cert otherwise floods the
+    # log with one urllib3 InsecureRequestWarning PER REQUEST (thousands), burying every real
+    # progress line. We scan intentionally with verify=False, so silence just this warning class.
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:  # noqa: BLE001
+        pass
+    import warnings as _warnings
+    _warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
     policy = get_policy(profile)
     pol = policy.politeness
@@ -2515,6 +2568,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # D4ST_PROGRESS_FILE with everything found so far + a stage timeline. So even a killed/hung
     # scan leaves a readable record of what it got done.
     _prog = _Progress(os.environ.get("D4ST_PROGRESS_FILE", ""))
+    _prog.banner(target, _scope, cookie or (auth_headers and "header") or "", policy.name)
     _prog.update("crawl+discovery", findings, urls=len(urls), targets=len(targets),
                  note=f"{len(active_targets)} active targets")
 
@@ -3067,6 +3121,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # if the re-auth genuinely fails, alive() is still False and authed_at_end reports it.
     if _session.enabled:
         _session.ensure("final")
+    _prog.summary(uniq)
     return {
         "urls": urls, "targets": len(targets),
         "findings": [f.__dict__ for f in uniq],
