@@ -40,6 +40,67 @@ def create_app(db_path: str | None = None):
     def con():
         return store.connect(dbp)
 
+    # ---- LIVE progress (running scans, before they're ingested) --------------------------------
+    # A running scan and this server are SEPARATE processes with separate env, so they cannot share
+    # D4ST_PROGRESS_FILE. They CAN agree on a path derived from the shared DB location: the engagement
+    # writes <dir(D4ST_DB)>/progress/<scan>.json after every stage; the console reads that directory.
+    # This makes an in-flight scan appear in the console (with a live stage/finding feed) the moment
+    # it starts — not only after it finishes and is ingested.
+    import glob as _glob
+    import json as _j
+    import os as _os
+    import time as _time
+
+    def _progress_dir() -> str:
+        base = _os.path.dirname(dbp) if dbp else "."
+        return _os.environ.get("D4ST_PROGRESS_DIR") or _os.path.join(base or ".", "progress")
+
+    def _live_records() -> list[dict]:
+        d = _progress_dir()
+        out = []
+        if not _os.path.isdir(d):
+            return out
+        now = _time.time()
+        for fp in _glob.glob(_os.path.join(d, "*.json")):
+            try:
+                rec = _j.loads(open(fp, encoding="utf-8").read())
+            except Exception:  # noqa: BLE001
+                continue
+            rec["id"] = rec.get("id") or _os.path.splitext(_os.path.basename(fp))[0]
+            rec["_fresh"] = (now - float(rec.get("updated_at") or 0)) < 300
+            out.append(rec)
+        return out
+
+    def _live_record(scan_id: str) -> dict | None:
+        return next((r for r in _live_records() if r["id"] == scan_id), None)
+
+    def _synth_overview(rec: dict) -> dict:
+        """Build a scan-overview shape from a live progress record for a not-yet-ingested scan."""
+        from .report import _meta_for
+        sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+        for cat, n in (rec.get("by_category") or {}).items():
+            s = _meta_for(cat).get("severity", "info")
+            sev[s] = sev.get(s, 0) + n
+        return {"id": rec["id"], "target": rec.get("target", ""), "profile": rec.get("profile", "engagement"),
+                "created_at": int(rec.get("started_at") or rec.get("updated_at") or 0),
+                "status": rec.get("status", "in-progress"), "n_findings": rec.get("n_findings", 0),
+                "urls_count": rec.get("urls", 0), "targets_count": rec.get("targets", 0),
+                "sev_critical": sev["critical"], "sev_high": sev["high"], "sev_medium": sev["medium"],
+                "sev_low": sev["low"], "sev_info": sev["info"], "engines": [], "reauths": 0,
+                "authed_at_end": None, "sqlmap_level": None}
+
+    def _synth_findings(rec: dict) -> list[dict]:
+        from .report import _meta_for
+        rows = []
+        for i, f in enumerate(rec.get("findings") or []):
+            cat = f.get("category", "other")
+            rows.append({"id": f"live-{i}", "tool": f.get("tool", ""), "category": cat,
+                         "url": f.get("url", ""), "param": f.get("param", ""),
+                         "method": f.get("method", "GET"), "severity": _meta_for(cat).get("severity", "info"),
+                         "vtitle": _meta_for(cat).get("title", cat), "verified": f.get("verified"),
+                         "confidence": f.get("confidence", ""), "triage_status": "open"})
+        return rows
+
     def _require_scan(c, scan_id: str) -> dict:
         s = store.scan_overview(c, scan_id)
         if not s:
@@ -53,14 +114,24 @@ def create_app(db_path: str | None = None):
     @app.get("/api/scans")
     def scans():
         with con() as c:
-            return JSONResponse(store.list_scans(c))
+            stored = store.list_scans(c)
+        stored_ids = {s["id"] for s in stored}
+        # prepend any live/just-finished scan not yet in the DB, so a running scan is visible NOW
+        live = [_synth_overview(r) for r in _live_records()
+                if r["_fresh"] and r["id"] not in stored_ids]
+        return JSONResponse(live + stored)
 
     @app.get("/api/scans/{scan_id}")
     def scan_overview(scan_id: str):
         with con() as c:
-            s = _require_scan(c, scan_id)
-            s["engines"] = store.probes(c, scan_id)
-            return JSONResponse(s)
+            s = store.scan_overview(c, scan_id)
+            if s:
+                s["engines"] = store.probes(c, scan_id)
+                return JSONResponse(s)
+        rec = _live_record(scan_id)          # not ingested yet — synthesize from the live checkpoint
+        if rec:
+            return JSONResponse(_synth_overview(rec))
+        raise HTTPException(404, "scan not found")
 
     @app.get("/api/scans/{scan_id}/findings")
     def findings(scan_id: str, severity: str = Query(None), category: str = Query(None),
@@ -68,11 +139,13 @@ def create_app(db_path: str | None = None):
                  q: str = Query(None), sort: str = Query("severity"), dir: str = Query("asc"),
                  page: int = Query(0, ge=0), size: int = Query(100, ge=1, le=5000)):
         with con() as c:
-            _require_scan(c, scan_id)
-            rows = store.query_findings(c, scan_id, severity=severity, category=category,
-                                        tool=tool, verified=verified, triage=triage, q=q,
-                                        sort=sort, direction=dir, limit=size, offset=page * size)
-            return JSONResponse(rows)
+            if store.scan_overview(c, scan_id):
+                rows = store.query_findings(c, scan_id, severity=severity, category=category,
+                                            tool=tool, verified=verified, triage=triage, q=q,
+                                            sort=sort, direction=dir, limit=size, offset=page * size)
+                return JSONResponse(rows)
+        rec = _live_record(scan_id)          # live findings straight from the checkpoint
+        return JSONResponse(_synth_findings(rec) if rec else [])
 
     @app.get("/api/findings/{fid}")
     def finding(fid: int):
@@ -144,9 +217,10 @@ def create_app(db_path: str | None = None):
         """Live-scan feed: if an in-progress checkpoint file exists (D4ST_PROGRESS_FILE,
         written by run_engagement after every stage), return it so the console can stream
         stages/findings/timeline in real time. Otherwise report the stored terminal status."""
-        import json as _j
-        import os as _os
-        pf = _os.environ.get("D4ST_PROGRESS_FILE")
+        rec = _live_record(scan_id)          # shared progress dir (dir(D4ST_DB)/progress)
+        if rec:
+            return JSONResponse(rec)
+        pf = _os.environ.get("D4ST_PROGRESS_FILE")   # legacy: same-process env file
         if pf and _os.path.exists(pf):
             try:
                 return JSONResponse(_j.loads(open(pf, encoding="utf-8").read()))

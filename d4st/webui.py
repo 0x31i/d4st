@@ -498,12 +498,22 @@ function rbody(){
   document.getElementById("rawn").textContent=rows.length;
 }
 // ---------- LIVE ----------
+function clk(s){s=s||0;const m=Math.floor(s/60),ss=s%60;return(m?m+"m":"")+ss+"s";}
 async function pollLive(){
   try{const l=await api(`/api/scans/${encodeURIComponent(SCAN)}/live`);
     const bar=document.getElementById("livebar");
-    if(l&&l.status==="in-progress"){bar.innerHTML=`<div class="livebar"><span class="live"><span class="p"></span></span> live · stage ${esc(l.last_stage||"?")} · ${l.n_findings||0} findings · ${l.elapsed_s||0}s`+
-      (l.urls?` · ${l.urls} urls`:"")+`</div>`;}
-    else{bar.innerHTML="";clearInterval(livtimer);selectScan(SCAN);}
+    if(l&&l.status==="in-progress"){
+      bar.innerHTML=`<div class="livebar"><span class="live"><span class="p"></span></span> live · stage <b>${esc(l.last_stage||"?")}</b> · <b>${l.n_findings||0}</b> findings · ${clk(l.elapsed_s)}`+
+        (l.urls?` · ${l.urls} urls`:"")+(l.targets?` · ${l.targets} targets`:"")+`</div>`;
+      // LIVE-GROW: when the finding count changes, refresh the header tally + the current tab so
+      // the analyst watches findings land in real time (not just a one-line status).
+      if((l.n_findings||0)!==(OV.n_findings||0)){
+        OV.n_findings=l.n_findings; const dn=document.getElementById("donutn"); if(dn)dn.textContent=l.n_findings;
+        if(TAB==="findings"||TAB==="overview"){
+          try{FINDINGS=await api(`/api/scans/${encodeURIComponent(SCAN)}/findings?size=2000`);switchTab(TAB);}catch(e){}
+        }
+      }
+    } else {bar.innerHTML="";clearInterval(livtimer);selectScan(SCAN);}  // finished → reload from DB
   }catch(e){}
 }
 document.getElementById("exportbtn").onclick=e=>{e.stopPropagation();document.getElementById("exportmenu").classList.toggle("on");};
