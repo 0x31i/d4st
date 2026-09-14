@@ -535,7 +535,9 @@ pre{font-family:var(--mono);font-size:12px;line-height:1.6;background:var(--code
   box-shadow:inset 0 0 0 1px var(--code-line)}
 pre.payload{background:#1a1206;color:#ffcf8b;box-shadow:inset 0 0 0 1px #3a2a10}
 pre.repro{background:#08140d;color:#9ff0c0;box-shadow:inset 0 0 0 1px #14311f}
-.proof{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:6px}
+.proof{display:flex;flex-direction:column;gap:14px;margin-top:6px}
+.pane{min-width:0}
+.proof pre{max-height:560px;overflow:auto}
 .pane .plbl{font-size:10px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;color:var(--ink3);margin-bottom:7px;display:flex;justify-content:space-between}
 .pane .plbl span{color:var(--accent)}
 .exlabel{font-size:12.5px;font-weight:700;color:var(--ink2);margin:16px 0 8px}
@@ -573,6 +575,7 @@ pre.repro{background:#08140d;color:#9ff0c0;box-shadow:inset 0 0 0 1px #14311f}
   .nobreak{page-break-before:avoid!important;break-before:avoid!important}
   .block,.proof,.pane,.callout,.statc,.riskrow,.reason,.remedy{page-break-inside:avoid;break-inside:avoid}
   pre{white-space:pre-wrap}
+  .proof pre{max-height:none;overflow:visible}   /* PDF keeps the full body, no scroll clipping */
   @page{size:A4}
 }
 """
