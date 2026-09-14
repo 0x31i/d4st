@@ -2269,9 +2269,9 @@ def _redact_auth(headers: dict) -> dict:
     for k, v in (headers or {}).items():
         lk = k.lower()
         if not full and lk == "authorization":
-            out[k] = (str(v)[:30] + "…<redacted — set D4ST_FULL_AUTH=1 to reveal>")
+            out[k] = (str(v)[:30] + "…<redacted - set D4ST_FULL_AUTH=1 to reveal>")
         elif not full and lk == "cookie":
-            out[k] = "<redacted — set D4ST_FULL_AUTH=1 to reveal>"
+            out[k] = "<redacted - set D4ST_FULL_AUTH=1 to reveal>"
         else:
             out[k] = v
     return out
