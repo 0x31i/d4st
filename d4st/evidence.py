@@ -27,9 +27,9 @@ def redact_headers(h: dict) -> dict:
     for k, v in (h or {}).items():
         lk = k.lower()
         if lk == "authorization" and not full:
-            out[k] = (str(v)[:26] + "…<redacted — D4ST_FULL_AUTH=1 to reveal>") if v else v
+            out[k] = (str(v)[:26] + "…<redacted - D4ST_FULL_AUTH=1 to reveal>") if v else v
         elif lk == "cookie" and not full:
-            out[k] = "<redacted — D4ST_FULL_AUTH=1 to reveal>"
+            out[k] = "<redacted - D4ST_FULL_AUTH=1 to reveal>"
         else:
             out[k] = v
     return out

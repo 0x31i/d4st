@@ -89,7 +89,7 @@ def _row(i: int, f: dict) -> list:
     return [i, _dd(m["title"]), f.get("category", ""), m["severity"], f.get("confidence") or "",
             _verified_str(f.get("verified")), f.get("tool", ""), f.get("url", ""),
             f.get("method", "GET"), f.get("param") or "", f.get("payload") or "", desc,
-            _dd(m["fix"]), m["cwe"], _dd(m["owasp"]), f.get("detection") or "", req, resp,
+            _dd(m["fix"]), _dd(m["cwe"]), _dd(m["owasp"]), f.get("detection") or "", req, resp,
             f.get("repro") or ""]
 
 
