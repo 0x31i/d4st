@@ -58,7 +58,7 @@ def _exchange_text(evlog) -> tuple[str, str]:
     for ex in evlog:
         if isinstance(ex, dict) and (ex.get("request") or ex.get("response")):
             lbl = ex.get("label", "")
-            hdr = f"### {lbl}\n" if lbl else ""
+            hdr = f"### {_dd(lbl)}\n" if lbl else ""   # de-dash the d4st exchange label (prose), not the data
             reqs.append(hdr + _fmt_side(ex.get("request")))
             resps.append(hdr + _fmt_side(ex.get("response")))
     if reqs or resps:
