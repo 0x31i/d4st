@@ -81,6 +81,25 @@ def check_response(url: str, status: int, headers: dict, body: str,
     if "referrer-policy" not in h:
         add("referer-leakage", _MISCONFIG, "no Referrer-Policy (cross-domain referer leakage)")
 
+    # MIME-sniffing protection
+    if "x-content-type-options" not in h:
+        add("no-nosniff", _MISCONFIG,
+            "no X-Content-Type-Options: nosniff (browsers may MIME-sniff responses)")
+
+    # Permissions-Policy (feature-policy) — restrict powerful browser features
+    if "permissions-policy" not in h and "feature-policy" not in h:
+        add("no-permissions-policy", _MISCONFIG,
+            "no Permissions-Policy header (camera/mic/geolocation not restricted)")
+
+    # Technology / version disclosure — .NET/IIS leaks these; fingerprints the stack for an attacker
+    for hdr in ("server", "x-powered-by", "x-aspnet-version", "x-aspnetmvc-version", "x-generator"):
+        val = h.get(hdr, "")
+        # only report when it discloses a VERSION or a specific product+version (bare "cloudflare"/"nginx"
+        # with no version is low-signal noise; a version string or ASP.NET header is the real leak)
+        if val and (hdr.startswith("x-aspnet") or any(ch.isdigit() for ch in val)):
+            add(f"version-disclosure-{hdr}", _INFO,
+                f"technology/version disclosed in '{hdr}: {val}' header")
+
     # Cacheable HTTPS response with a session-ish cookie present
     cc = h.get("cache-control", "").lower()
     if _is_https(url) and set_cookies and not any(x in cc for x in ("no-store", "no-cache", "private")):

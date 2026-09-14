@@ -230,6 +230,56 @@ def run_verb_tampering(session, base: str, urls: list[str], *,
     return findings
 
 
+# ---------------------------------------------------- host-header injection ----
+_HHI_HOST = "d4st-hhi-probe.example.org"
+
+
+def run_host_header_injection(session, base: str, urls: list[str], *,
+                              delay: float = 0.2, timeout: float = 12.0, max_urls: int = 25,
+                              throttle=None) -> list[dict]:
+    """Send requests with a poisoned Host / X-Forwarded-Host and see if the attacker value comes
+    back in a redirect Location, an absolute URL in the body, or a Set-Cookie domain. Reflection
+    means host-header injection — the root of password-reset poisoning, web-cache poisoning, and
+    routing-based SSRF. READ-ONLY GET; throttled."""
+    import httpx
+    from urllib.parse import urlsplit as _us
+
+    from .safety import pace
+    origin = f"{_us(base).scheme}://{_us(base).netloc}"
+    cand = [u for u in urls if u.startswith(origin)][:max_urls]
+    if not cand:
+        return []
+    authed = _authed_headers(session, base)
+    findings: list[dict] = []
+    with httpx.Client(verify=False, follow_redirects=False, timeout=timeout) as c:
+        for u in cand:
+            for hdr in ("Host", "X-Forwarded-Host"):
+                try:
+                    r = c.get(u, headers={**authed, hdr: _HHI_HOST})
+                    pace(throttle, delay, r.status_code)
+                except Exception:  # noqa: BLE001
+                    continue
+                loc = r.headers.get("location", "")
+                setck = " ".join(r.headers.get_list("set-cookie")) if hasattr(r.headers, "get_list") else ""
+                where = ("redirect Location" if _HHI_HOST in loc else
+                         "Set-Cookie domain" if _HHI_HOST in setck else
+                         "response body" if _HHI_HOST in (r.text or "") else "")
+                if where:
+                    findings.append({
+                        "type": "host-header-injection", "name": "host-header-injection",
+                        "severity": "medium", "url": u, "method": "GET",
+                        "category": "host-header-injection", "verified": True,
+                        "detail": f"a poisoned '{hdr}: {_HHI_HOST}' request header is reflected back in "
+                                  f"the {where} — host-header injection. Enables password-reset-link "
+                                  f"poisoning, web-cache poisoning, and routing-based SSRF depending on "
+                                  f"how the app uses the host value.",
+                        "evidence_log": [exchange(f"PROOF — poisoned {hdr} reflected in {where}", r)],
+                        "repro": curl(r),
+                    })
+                    return findings  # one solid proof is enough; avoid flooding
+    return findings
+
+
 # ---------------------------------------------------- secret live-validation ----
 _KEY_KINDS = [
     ("google-api-key", re.compile(r"AIza[0-9A-Za-z_\-]{20,}")),
