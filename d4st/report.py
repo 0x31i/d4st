@@ -538,6 +538,7 @@ pre.repro{background:#08140d;color:#9ff0c0;box-shadow:inset 0 0 0 1px #14311f}
 .proof{display:flex;flex-direction:column;gap:14px;margin-top:6px}
 .pane{min-width:0}
 .proof pre{max-height:560px;overflow:auto}
+.body-print{display:none}   /* screen shows the full scrollable body; print swaps in the excerpt */
 .pane .plbl{font-size:10px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;color:var(--ink3);margin-bottom:7px;display:flex;justify-content:space-between}
 .pane .plbl span{color:var(--accent)}
 .exlabel{font-size:12.5px;font-weight:700;color:var(--ink2);margin:16px 0 8px}
@@ -575,7 +576,9 @@ pre.repro{background:#08140d;color:#9ff0c0;box-shadow:inset 0 0 0 1px #14311f}
   .nobreak{page-break-before:avoid!important;break-before:avoid!important}
   .block,.proof,.pane,.callout,.statc,.riskrow,.reason,.remedy{page-break-inside:avoid;break-inside:avoid}
   pre{white-space:pre-wrap}
-  .proof pre{max-height:none;overflow:visible}   /* PDF keeps the full body, no scroll clipping */
+  .proof pre{max-height:none;overflow:visible}   /* no scroll clipping in print */
+  .body-screen{display:none}                     /* PDF: hide the full body… */
+  .body-print{display:block}                     /* …and show the relevant excerpt instead */
   @page{size:A4}
 }
 """
@@ -604,13 +607,91 @@ def _cap(text: str, limit: int | None) -> tuple[str, str]:
     return text[:limit], f"\n\n[… {len(text) - limit:,} more bytes omitted in concise mode — see the full report for complete evidence]"
 
 
-def _render_exchange(ex: dict, body_cap: int | None = None) -> str:
+# Smart excerpt for the PRINT/PDF body (screen keeps the full scrollable body). Anchors on the parts
+# of the body that actually prove the finding — the payload, the disclosed value, the sensitive
+# marker — and collapses the rest, so a printed report shows relevant evidence instead of a mile of
+# minified JS. Full bodies always remain in the xlsx/csv export.
+_EXC_FULL_MAX = 1400      # bodies at/below this print whole
+_EXC_CTX = 550            # chars of context around each anchor match
+_EXC_HEAD, _EXC_TAIL = 480, 280   # head/tail shown when nothing anchors
+
+
+def _needles(f: dict) -> list[str]:
+    """Anchors to locate the relevant body region: the payload, the tested param, and notable
+    tokens (emails, API keys, quoted JSON fields, long hex, Azure ACS ids) named in the finding."""
+    import re
+    nds: list[str] = []
+    for k in ("payload", "param"):
+        v = f.get(k)
+        if v:
+            nds.append(str(v))
+    ev = " ".join(str(f.get(k) or "") for k in ("evidence", "verify_note", "detail"))
+    for rx in (r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
+               r"AIza[0-9A-Za-z_\-]{10,}|AKIA[0-9A-Z]{12,}|sk_[A-Za-z0-9]{10,}",
+               r"\"([A-Za-z0-9_]{6,})\"", r"\b[0-9a-f]{16,}\b", r"8:acs:[0-9a-f\-]+"):
+        for m in re.findall(rx, ev):
+            nds.append(m if isinstance(m, str) else m[0])
+    # de-dup, keep only anchors long enough to be specific
+    seen, out = set(), []
+    for n in nds:
+        n = (n or "").strip()
+        if len(n) >= 4 and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _smart_excerpt(text: str, needles: list[str]) -> tuple[str, bool]:
+    """Return (excerpted_text, was_shortened). Small bodies pass through. Larger bodies are cut to a
+    window around each anchor (merged), with '⋯ N chars omitted ⋯' markers; if nothing anchors, a
+    head+tail slice is shown."""
+    t = text or ""
+    if len(t) <= _EXC_FULL_MAX:
+        return t, False
+    low = t.lower()
+    spans: list[list[int]] = []
+    for nd in needles or []:
+        i = low.find(nd.lower())
+        if i >= 0:
+            spans.append([max(0, i - _EXC_CTX), min(len(t), i + len(nd) + _EXC_CTX)])
+    if not spans:
+        omitted = len(t) - _EXC_HEAD - _EXC_TAIL
+        if omitted <= 0:
+            return t, False
+        return (t[:_EXC_HEAD] + f"\n\n      ⋯ {omitted:,} chars omitted — full body in the xlsx/csv "
+                f"export ⋯\n\n" + t[-_EXC_TAIL:], True)
+    spans.sort()
+    merged = [spans[0]]
+    for s, e in spans[1:]:
+        if s <= merged[-1][1] + 100:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    out, prev = [], 0
+    for s, e in merged:
+        if s > prev:
+            gap = s - prev
+            out.append(f"      ⋯ {gap:,} {'leading ' if prev == 0 else ''}chars omitted ⋯\n")
+        out.append(t[s:e])
+        prev = e
+    if prev < len(t):
+        out.append(f"\n      ⋯ {len(t) - prev:,} trailing chars omitted — full body in the "
+                   f"xlsx/csv export ⋯")
+    return "".join(out), True
+
+
+def _render_exchange(ex: dict, body_cap: int | None = None, needles: list[str] | None = None,
+                     excerpt: bool = True) -> str:
+    """Render one request/response pane pair. On SCREEN the full body shows in a scroll box; for
+    PRINT/PDF a smart excerpt (anchored on the finding's proof markers) is shown instead, unless
+    `excerpt` is off. Small bodies render once for both."""
     req, resp = ex.get("request", {}) or {}, ex.get("response", {}) or {}
+    needles = needles or []
+
     rl = f"{req.get('method', 'GET')} {req.get('url', '')}"
-    reqtxt = f"<span class='req'>{_esc(rl)}</span>\n" + _esc(_fmt_headers(req.get("headers")))
-    if req.get("body"):
-        rb, rbnote = _cap(str(req["body"]), body_cap)
-        reqtxt += "\n\n" + _esc(rb) + rbnote
+    req_prefix = f"<span class='req'>{_esc(rl)}</span>\n" + _esc(_fmt_headers(req.get("headers")))
+    req_body = str(req.get("body") or "")
+
     st = resp.get("status")
     stcls = f"st{str(st)[0]}" if st else "st2"
     meta = []
@@ -618,20 +699,36 @@ def _render_exchange(ex: dict, body_cap: int | None = None) -> str:
         meta.append(f"{resp['elapsed_ms']} ms")
     if resp.get("size") is not None:
         meta.append(f"{resp['size']} B")
-    trunc = "\n\n[response truncated]" if resp.get("truncated") else ""
-    body, bnote = _cap(str(resp.get("body", "")), body_cap)
-    resptxt = (f"<span class='{stcls}'>HTTP {_esc(st) if st is not None else '—'}</span>  "
-               f"<span class='mt'>{_esc(' · '.join(meta))}</span>\n"
-               + _esc(_fmt_headers(resp.get("headers"))) + "\n\n" + _esc(body) + bnote + trunc)
+    resp_prefix = (f"<span class='{stcls}'>HTTP {_esc(st) if st is not None else '—'}</span>  "
+                   f"<span class='mt'>{_esc(' · '.join(meta))}</span>\n"
+                   + _esc(_fmt_headers(resp.get("headers"))))
+    resp_body = str(resp.get("body", "") or "")
+    if resp.get("truncated"):
+        resp_body += "\n\n[response truncated]"
+
+    def _pane(label: str, sub: str, prefix: str, body: str) -> str:
+        shown, bnote = _cap(body, body_cap)          # concise-mode cap first (no-op in full mode)
+        full = prefix + (("\n\n" + _esc(shown) + bnote) if shown else "")
+        plbl = f"<div class='plbl'>{label}<span>{sub}</span></div>"
+        exbody, cut = (("", False) if not excerpt else _smart_excerpt(shown, needles))
+        if not cut:
+            return f"<div class='pane'>{plbl}<pre>{full}</pre></div>"
+        # screen = full scrollable body; print/PDF = the relevant excerpt (toggled by @media print)
+        exfull = prefix + "\n\n" + _esc(exbody) + bnote
+        return (f"<div class='pane'>{plbl}"
+                f"<pre class='body-screen'>{full}</pre>"
+                f"<pre class='body-print'>{exfull}</pre></div>")
+
     label = ex.get("label")
     lblhtml = f"<div class='exlabel'>▸ {_esc(label)}</div>" if label else ""
     return (lblhtml + "<div class='proof'>"
-            f"<div class='pane'><div class='plbl'>Request<span>attack</span></div><pre>{reqtxt}</pre></div>"
-            f"<div class='pane'><div class='plbl'>Response<span>evidence</span></div><pre>{resptxt}</pre></div>"
-            "</div>")
+            + _pane("Request", "attack", req_prefix, req_body)
+            + _pane("Response", "evidence", resp_prefix, resp_body)
+            + "</div>")
 
 
-def _render_finding(f: dict, anchor: str, nobreak: bool = False, concise: bool = False) -> str:
+def _render_finding(f: dict, anchor: str, nobreak: bool = False, concise: bool = False,
+                    excerpt: bool = True) -> str:
     """MAX DETAIL: render every field the pipeline captured for this finding.
     In concise mode, medium/low/info findings cap giant response bodies + raw output;
     critical/high always keep full evidence."""
@@ -689,7 +786,8 @@ def _render_finding(f: dict, anchor: str, nobreak: bool = False, concise: bool =
         for i, ex in enumerate(exlog):
             if len(exlog) > 1:
                 parts.append(f"<div class='exchsep'>exchange {i + 1} of {len(exlog)}</div>")
-            parts.append(_render_exchange(ex, body_cap=body_cap))
+            parts.append(_render_exchange(ex, body_cap=body_cap, needles=_needles(f),
+                                          excerpt=excerpt))
         blocks.append("<div class='block'><div class='h'>Proof — request / response "
                       f"({len(exlog)} exchange{'s' if len(exlog) != 1 else ''})</div>" + "".join(parts) + "</div>")
     elif not payload:
@@ -722,11 +820,15 @@ def _render_finding(f: dict, anchor: str, nobreak: bool = False, concise: bool =
 
 
 def build_report(result: dict, target: str = "", meta: dict | None = None,
-                 concise: bool = False) -> str:
+                 concise: bool = False, excerpt: bool = True) -> str:
     """Render a scan result dict into a self-contained, client-grade HTML report.
 
     `meta` (report_meta) fills the cover / methodology: client, logo, scope, window,
     prepared_by, ref, confidential, when, profile.
+
+    `excerpt` (default on): on screen the full request/response body shows in a scroll box; when
+    PRINTED to PDF, a smart excerpt anchored on the finding's proof markers is shown instead, so the
+    PDF stays manageable. Full bodies are always preserved in the xlsx/csv exports.
     """
     meta = meta or {}
     findings = result.get("findings", []) or []
@@ -866,7 +968,8 @@ def build_report(result: dict, target: str = "", meta: dict | None = None,
         detail_parts.append(f"<h3 class='{gh_cls}' id='f-{cat}'>{_esc(m['title'])}"
                             f"<span class='gc'>{len(items)} instance{'s' if len(items) != 1 else ''}</span></h3>")
         for ii, f in enumerate(items):
-            detail_parts.append(_render_finding(f, f"f-{cat}-{ii}", nobreak=(ii == 0), concise=concise))
+            detail_parts.append(_render_finding(f, f"f-{cat}-{ii}", nobreak=(ii == 0),
+                                                concise=concise, excerpt=excerpt))
     findings_html = f"""
     <section class="section pad">
       <div class="eyebrow"><span class="num">04</span> Detailed Findings <span class="rule"></span></div>
