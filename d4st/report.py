@@ -384,6 +384,25 @@ def _esc(s) -> str:
     return _html.escape(str(s if s is not None else ""))
 
 
+def _dedash(s: str) -> str:
+    """Replace em / en / horizontal-bar dashes with a plain hyphen in PROSE (a spaced ' — '
+    becomes ' - '). Keeps the report from reading machine-written."""
+    return s.replace("—", "-").replace("–", "-").replace("―", "-")
+
+
+def _dedash_prose(html: str) -> str:
+    """De-dash the report's narrative, but leave <pre> blocks (captured request/response evidence,
+    payloads, curl repros) byte-for-byte intact — evidence is data, not prose."""
+    import re
+    out, i = [], 0
+    for m in re.finditer(r"<pre\b[^>]*>.*?</pre>", html, re.S):
+        out.append(_dedash(html[i:m.start()]))
+        out.append(m.group(0))            # evidence body — untouched
+        i = m.end()
+    out.append(_dedash(html[i:]))
+    return "".join(out)
+
+
 # ---- theme: modern, editorial, print-first client deliverable ----
 _CSS = r"""
 :root{
@@ -1010,7 +1029,7 @@ def build_report(result: dict, target: str = "", meta: dict | None = None,
         reflects the vulnerability class and observed impact; no aggregate letter grade is assigned.</p>
     </section>"""
 
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+    return _dedash_prose(f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Security Assessment — {_esc(host)}</title>
 <style>{_CSS}</style></head><body><div class="report">
@@ -1021,7 +1040,7 @@ def build_report(result: dict, target: str = "", meta: dict | None = None,
   {findings_html}
   {appendix_html}
   <div class="footer">d4st · {_esc(client)} · {_esc(meta.get('ref') or host)} · confidential</div>
-</div><script>{_JS}</script></body></html>"""
+</div><script>{_JS}</script></body></html>""")
 
 
 def render_pdf(html: str, out_path: str | None = None) -> bytes:
