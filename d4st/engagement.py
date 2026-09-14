@@ -2088,6 +2088,21 @@ class _Progress:
         self.last_n = 0
         self.step = 0
         self.console = os.environ.get("D4ST_QUIET", "") != "1"
+        self.target = ""
+        self.profile = ""
+        # SHARED live-progress path the web console reads: <dir(D4ST_DB)>/progress/<id>.json.
+        # Derived from D4ST_DB (or D4ST_PROGRESS_DIR) so the separate `serve` process finds it
+        # without sharing this scan's env. id = host+pid → stable + unique per run.
+        self._started = time.time()
+        try:
+            db = os.environ.get("D4ST_DB", "")
+            pdir = os.environ.get("D4ST_PROGRESS_DIR") or \
+                os.path.join(os.path.dirname(db) if db else ".", "progress")
+            os.makedirs(pdir, exist_ok=True)
+            self.scan_id = f"live-{os.getpid()}"
+            self.shared = os.path.join(pdir, self.scan_id + ".json")
+        except Exception:  # noqa: BLE001
+            self.scan_id, self.shared = "", ""
 
     @staticmethod
     def _clock(secs: float) -> str:
@@ -2111,26 +2126,36 @@ class _Progress:
                   f"findings {n:>4} ({d:>3})   urls {urls:<5} targets {targets:<4}{extra}",
                   flush=True)
         self.last_n = n
-        if not self.path:
-            return
-        rec = {
-            "status": "in-progress", "last_stage": stage, "elapsed_s": elapsed,
-            "urls": urls, "targets": targets,
-            "n_findings": n,
+        self._write(self._record("in-progress", stage, elapsed, n, urls, targets, findings))
+
+    def _record(self, status, stage, elapsed, n, urls, targets, findings) -> dict:
+        return {
+            "id": self.scan_id, "target": self.target, "profile": self.profile,
+            "status": status, "last_stage": stage, "elapsed_s": elapsed,
+            "started_at": self._started, "updated_at": time.time(),
+            "urls": urls, "targets": targets, "n_findings": n,
             "by_category": dict(_Counter(getattr(f, "category", "") for f in findings)),
             "by_tool": dict(_Counter(getattr(f, "tool", "") for f in findings)),
             "timeline": self.timeline,
             "findings": [f.__dict__ for f in findings],
         }
-        try:  # atomic write so a reader never sees a half-written file
-            tmp = self.path + ".tmp"
-            with open(tmp, "w") as fh:
-                json.dump(rec, fh, default=str)
-            os.replace(tmp, self.path)
-        except Exception:  # noqa: BLE001,S110 - progress writing must never break the scan
-            pass
+
+    def _write(self, rec: dict) -> None:
+        # write BOTH the explicit D4ST_PROGRESS_FILE (if set) and the shared console dir, atomically
+        for dest in (self.path, self.shared):
+            if not dest:
+                continue
+            try:
+                tmp = dest + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(rec, fh, default=str)
+                os.replace(tmp, dest)
+            except Exception:  # noqa: BLE001,S110 - progress writing must never break the scan
+                pass
 
     def banner(self, target: str, scope: list, session: str, profile: str) -> None:
+        self.target = target
+        self.profile = profile
         if not self.console:
             return
         print("\n" + "=" * 78, flush=True)
@@ -2141,9 +2166,13 @@ class _Progress:
         print("=" * 78, flush=True)
 
     def summary(self, findings: list) -> None:
+        elapsed = round(time.monotonic() - self.t0)
+        # mark the shared/console record COMPLETE so the web console stops showing it as live
+        self._write(self._record("complete", "done", elapsed, len(findings),
+                                 self.timeline[-1].get("urls", 0) if self.timeline else 0,
+                                 0, findings))
         if not self.console:
             return
-        elapsed = round(time.monotonic() - self.t0)
         cats = _Counter(getattr(f, "category", "") for f in findings)
         print("\n" + "=" * 78, flush=True)
         print(f"  SCAN COMPLETE in {self._clock(elapsed)}  —  {len(findings)} finding(s)", flush=True)
