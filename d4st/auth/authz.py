@@ -17,7 +17,6 @@ rather than guessed at from a single session.
 from __future__ import annotations
 
 import re
-import time
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from .session import Session
@@ -72,9 +71,12 @@ def _similar(a: str, b: str) -> bool:
 
 
 def run_authz(session: Session, base: str, urls: list[str], *,
-              delay: float = 0.15, timeout: float = 12.0, max_endpoints: int = 300) -> list[dict]:
+              delay: float = 0.15, timeout: float = 12.0, max_endpoints: int = 300,
+              throttle=None) -> list[dict]:
     """Return a list of authorization findings (dicts). Read-only; throttled by `delay`."""
     import httpx
+
+    from ..safety import pace
 
     origin = f"{urlsplit(base).scheme}://{urlsplit(base).netloc}"
     api = [u for u in urls if u.startswith(origin) and "/api/" in u.lower()][:max_endpoints]
@@ -100,7 +102,7 @@ def run_authz(session: Session, base: str, urls: list[str], *,
                 base_r = c.get(url, headers=authed)
             except Exception:
                 continue
-            time.sleep(delay)
+            pace(throttle, delay, base_r.status_code)
             # only reason about endpoints that actually serve data when authed
             if base_r.status_code >= 400:
                 continue
@@ -109,7 +111,7 @@ def run_authz(session: Session, base: str, urls: list[str], *,
             # 1) no-auth: should be rejected
             try:
                 na = c.get(url, headers=noauth)
-                time.sleep(delay)
+                pace(throttle, delay, na.status_code)
                 if na.status_code < 400 and _similar(na.text, b_body):
                     _rank, _label = _sensitivity(na.text)
                     findings.append(_f("broken-auth", "critical", url,
@@ -123,7 +125,7 @@ def run_authz(session: Session, base: str, urls: list[str], *,
             # 2) bad-token: signature/expiry must be validated
             try:
                 bt = c.get(url, headers=badtok)
-                time.sleep(delay)
+                pace(throttle, delay, bt.status_code)
                 if bt.status_code < 400 and _similar(bt.text, b_body):
                     findings.append(_f("broken-token-validation", "high", url,
                                        f"endpoint returns {bt.status_code} with data for a bogus/"
@@ -138,7 +140,7 @@ def run_authz(session: Session, base: str, urls: list[str], *,
                 if tampered and tampered != url:
                     try:
                         it = c.get(tampered, headers=authed)
-                        time.sleep(delay)
+                        pace(throttle, delay, it.status_code)
                         if it.status_code < 400 and len(it.text) > 0 and not _similar(it.text, b_body):
                             findings.append(_f("idor-suspect", "high", tampered,
                                                f"changing {m.group(2)} from {m.group(3)} returned a "
@@ -146,6 +148,80 @@ def run_authz(session: Session, base: str, urls: list[str], *,
                                                f"another tenant's data (manual confirm)", base_r, it))
                     except Exception:
                         pass
+    return findings
+
+
+def run_authz_matrix(session_a: Session, session_b: Session, base: str, urls: list[str], *,
+                     delay: float = 0.2, timeout: float = 12.0, max_endpoints: int = 300,
+                     throttle=None) -> list[dict]:
+    """TWO-ACCOUNT horizontal access-control test (OWASP API1 BOLA / API5 BFLA) — the definitive
+    check a single-session scan structurally cannot do. For each endpoint account A can read, replay
+    the SAME request (A's resource ids in the path/query) with account B's token. If B receives A's
+    data, one user can read another's records — a real IDOR/BOLA, not a suspicion.
+
+    READ-ONLY: GET only, throttled, capped. Both sessions are the tester's own authorized low-priv
+    accounts. The proof is the contrast: A's token -> A's data, B's token -> the SAME data."""
+    import httpx
+
+    from ..safety import pace
+
+    origin = f"{urlsplit(base).scheme}://{urlsplit(base).netloc}"
+    api = [u for u in urls if u.startswith(origin) and "/api/" in u.lower()][:max_endpoints]
+    if not api:
+        return []
+
+    hb = _auth_header_name(session_b)
+    a_hdr = dict(session_a.headers)
+    if session_a.cookie_header(base):
+        a_hdr["Cookie"] = session_a.cookie_header(base)
+    # B's identity: B's bearer + B's cookie, but everything else (accept etc.) from A
+    b_hdr = {k: v for k, v in a_hdr.items() if k.lower() not in ("authorization", "cookie")}
+    for k, v in (session_b.headers or {}).items():
+        if k.lower() == "authorization":
+            b_hdr[hb] = v
+    if session_b.cookie_header(base):
+        b_hdr["Cookie"] = session_b.cookie_header(base)
+
+    findings: list[dict] = []
+    seen: set[str] = set()
+    with httpx.Client(verify=False, follow_redirects=False, timeout=timeout) as c:
+        for url in api:
+            # only endpoints that look object-scoped (carry an id) are BOLA-interesting; endpoints
+            # with no id return the caller's OWN collection and would false-positive as "shared".
+            has_id = bool(_ID_IN_QUERY.search(url)) or bool(re.search(r"/\d{2,}(?:/|$)", url))
+            if url in seen or not has_id:
+                continue
+            seen.add(url)
+            try:
+                ra = c.get(url, headers=a_hdr)
+                pace(throttle, delay, ra.status_code)
+            except Exception:  # noqa: BLE001
+                continue
+            if ra.status_code >= 400 or not (ra.text or "").strip():
+                continue
+            try:
+                rb = c.get(url, headers=b_hdr)
+                pace(throttle, delay, rb.status_code)
+            except Exception:  # noqa: BLE001
+                continue
+            # B sees A's object: 200 + substantively the same body = horizontal priv-esc (BOLA)
+            if rb.status_code < 400 and _similar(rb.text, ra.text) and (rb.text or "").strip():
+                _rank, _label = _sensitivity(rb.text)
+                findings.append({
+                    "type": "bola-cross-account", "name": "bola-cross-account",
+                    "severity": "critical", "url": url, "method": "GET",
+                    "category": "broken-object-level-authorization", "verified": True,
+                    "sensitivity": _rank,
+                    "detail": f"account B retrieved account A's object at this endpoint "
+                              f"({rb.status_code}, body matches A's) — one authenticated user can read "
+                              f"another user's data (horizontal BOLA/IDOR). {_label}",
+                    "evidence_log": [
+                        _exchange("Account A — owner (A's token) returns A's object", ra),
+                        _exchange("PROOF — Account B (different user's token) returns the SAME object", rb)],
+                    "repro": _curl(rb),
+                    "evidence": {"a_status": ra.status_code, "b_status": rb.status_code,
+                                 "b_snippet": (rb.text or "")[:400]},
+                })
     return findings
 
 

@@ -101,6 +101,58 @@ class Politeness:
         return f
 
 
+class AdaptiveThrottle:
+    """A live, per-request backoff governor. TargetHealth pings BETWEEN stages; this reacts INSIDE
+    a stage: when the server answers 429 (rate-limited) or 503 (overloaded), the inter-request delay
+    doubles (up to a cap); a run of healthy 2xx/3xx/4xx responses lets it decay back toward the base.
+    Strictly protective — it only ever SLOWS the scan, never speeds it past the base delay. Shared
+    across the active depth stages so they collectively ease off a straining target.
+
+    Usage:  t = AdaptiveThrottle(base_delay=0.15)
+            t.wait(); r = client.get(u); t.record(r.status_code)
+    """
+
+    def __init__(self, base_delay: float = 0.15, cap: float = 5.0, on_backoff=None):
+        self.base = max(0.0, float(base_delay))
+        self.delay = self.base
+        self.cap = float(cap)
+        self.backoffs = 0
+        self._healthy_streak = 0
+        self._on_backoff = on_backoff   # optional callback(status, new_delay) for logging
+
+    def record(self, status: int | None) -> None:
+        if status in (429, 503):
+            self.delay = min(self.cap, max(self.base, self.delay) * 2 or 0.25)
+            self.backoffs += 1
+            self._healthy_streak = 0
+            if self._on_backoff:
+                try:
+                    self._on_backoff(status, self.delay)
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            # decay: after several clean responses, relax one step toward the base delay
+            self._healthy_streak += 1
+            if self._healthy_streak >= 5 and self.delay > self.base:
+                self.delay = max(self.base, self.delay / 2)
+                self._healthy_streak = 0
+
+    def wait(self) -> None:
+        if self.delay > 0:
+            time.sleep(self.delay)
+
+
+def pace(throttle, delay: float, status: int | None = None) -> None:
+    """Uniform inter-request pacing for the active depth stages. With a shared AdaptiveThrottle it
+    records the just-seen status (backing off on 429/503) and waits its adaptive delay; without one
+    it falls back to a fixed sleep. Lets every module pace identically with one call."""
+    if throttle is not None:
+        throttle.record(status)
+        throttle.wait()
+    elif delay:
+        time.sleep(delay)
+
+
 # Named profiles.
 POLITE = Politeness(rps=2.0, concurrency=2, delay_ms=250)      # fragile / lockout-prone infra
 ENGAGEMENT = Politeness(rps=12.0, concurrency=6, delay_ms=0)   # normal engagement (bounded parallel)

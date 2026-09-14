@@ -2294,7 +2294,6 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     'staging'/'aggressive' are for disposable targets. Auth endpoints (login/logout/reset) are
     NEVER actively tested under any profile, so the scan cannot lock accounts."""
     from .dom import dom_probe
-    from .jsanalysis import analyze_js
     from .passive import passive_scan
     from .safety import get_policy, is_auth_endpoint, is_state_changing
 
@@ -2670,6 +2669,103 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[authz] {len(_hz)} authorization finding(s) from "
                       f"{len(_harvest_urls)} harvested endpoint(s)", flush=True)
             _prog.update("harvest-authz", findings, urls=len(urls), targets=len(targets))
+
+        # ------------------------------------------------------------------ ACTIVE DEPTH SUITE ----
+        # Human-tester depth that a generic DAST/Burp scan does not reach — all READ-ONLY GET (safe
+        # under any profile; write-method BFLA and secret live-checks are opt-in only). A single
+        # AdaptiveThrottle is shared across the stages so they collectively ease off a target that
+        # answers 429/503 (protective — it only ever slows). Each stage maps its dict findings to
+        # Finding objects; category drives severity via the report KB (added there).
+        if session is not None and getattr(session, "session_storage", None):
+            from .safety import AdaptiveThrottle
+            _base_delay = max(0.1, 1.0 / (pol.rps or 4)) if pol else 0.15
+            _thr = AdaptiveThrottle(base_delay=_base_delay,
+                                    on_backoff=lambda s, d: print(
+                                        f"[throttle] target answered {s} — backing off to "
+                                        f"{d:.2f}s between requests", flush=True))
+
+            def _as_findings(dicts, tool):
+                out = []
+                for _d in dicts or []:
+                    out.append(Finding(
+                        tool=tool, category=_d.get("category") or _d.get("type") or "other",
+                        url=_d.get("url", target), param=_d.get("method", ""),
+                        method=_d.get("method", "GET"), evidence=_d.get("detail", ""),
+                        verified=bool(_d.get("verified")),
+                        detection=f"{tool} active test", confidence="firm",
+                        evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
+                return out
+
+            # JWT attack suite — forge alg:none / sig-strip / weak-secret and replay vs a live oracle
+            _refresh_jwt("jwt-attacks")
+            try:
+                from .jwtattacks import run_jwt_attacks
+                _jw = run_jwt_attacks(session, target, urls, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_jw, "jwt")
+                if _jw:
+                    print(f"[jwt] {len(_jw)} token-integrity finding(s) (forged-token replay)", flush=True)
+            except Exception as _je:  # noqa: BLE001
+                print(f"[jwt] skipped: {_je}", flush=True)
+            _prog.update("jwt-attacks", findings, urls=len(urls), targets=len(targets))
+
+            # Verb / method tampering (BFLA) — SAFE read-only methods by default
+            try:
+                from .activetests import run_verb_tampering
+                _vt = run_verb_tampering(session, target, urls, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_vt, "verbtamper")
+                if _vt:
+                    print(f"[verb] {len(_vt)} method/verb access-control finding(s)", flush=True)
+            except Exception as _ve:  # noqa: BLE001
+                print(f"[verb] skipped: {_ve}", flush=True)
+            _prog.update("verb-tampering", findings, urls=len(urls), targets=len(targets))
+
+            # CORS exploitability — reflected-Origin + credentials => verified exploitable/benign
+            try:
+                from .activetests import run_cors_checks
+                _co = run_cors_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_co, "cors")
+                if _co:
+                    print(f"[cors] {len(_co)} CORS finding(s) (exploitability-verified)", flush=True)
+            except Exception as _coe:  # noqa: BLE001
+                print(f"[cors] skipped: {_coe}", flush=True)
+            _prog.update("cors", findings, urls=len(urls), targets=len(targets))
+
+            # SignalR / WebSocket realtime-channel testing (broken-auth on the socket)
+            try:
+                from .wstests import run_ws_tests
+                _ws = run_ws_tests(session, target, urls, js_dir=_js_dir, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_ws, "websocket")
+                if _ws:
+                    print(f"[ws] {len(_ws)} SignalR/WebSocket finding(s)", flush=True)
+            except Exception as _wse:  # noqa: BLE001
+                print(f"[ws] skipped: {_wse}", flush=True)
+            _prog.update("websocket", findings, urls=len(urls), targets=len(targets))
+
+            # Two-account horizontal BOLA matrix — fires only when a 2nd session is supplied via
+            # D4ST_AUTHZ_SESSION_B (path to a second captured session JSON). Inert otherwise.
+            _sb_path = os.environ.get("D4ST_AUTHZ_SESSION_B", "")
+            if _sb_path and os.path.exists(_sb_path):
+                try:
+                    from .auth.session import Session as _Sess
+                    from .auth.authz import run_authz_matrix
+                    _sb = _Sess.load(_sb_path) if hasattr(_Sess, "load") else None
+                    if _sb is None:
+                        import json as _json
+                        _sb = _Sess(**_json.load(open(_sb_path)))  # noqa: S506
+                    _mx = run_authz_matrix(session, _sb, target, urls, delay=_base_delay, throttle=_thr)
+                    findings += _as_findings(_mx, "authz-matrix")
+                    print(f"[authz-matrix] two-account BOLA test: {len(_mx)} cross-account "
+                          f"finding(s)", flush=True)
+                except Exception as _mxe:  # noqa: BLE001
+                    print(f"[authz-matrix] skipped: {_mxe}", flush=True)
+                _prog.update("authz-matrix", findings, urls=len(urls), targets=len(targets))
+            else:
+                print("[authz-matrix] no 2nd account (set D4ST_AUTHZ_SESSION_B=<session.json> to "
+                      "run the horizontal BOLA matrix)", flush=True)
+
+            if _thr.backoffs:
+                print(f"[throttle] adaptive backoff engaged {_thr.backoffs}x during the depth suite "
+                      f"(target showed rate-limiting/stress)", flush=True)
         # verify (deterministic replay) the fast-detector findings now, while the target is
         # still healthy — sqlmap (section 5) may stress it afterward.
         findings = [verify_finding(f, cookie) for f in findings]
@@ -2900,6 +2996,23 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             f.confidence = f.confidence or c
             f.payload = f.payload or p
             f.repro = f.repro or r
+    # Secret IMPACT assessment: elevate any disclosed key (JS/secret findings) from "found" to scoped
+    # impact. Static by default; D4ST_SECRET_VALIDATE=1 does a live restriction check. Runs on the
+    # deduped set so a key disclosed in many bundles yields one impact finding.
+    try:
+        from .activetests import assess_secrets
+        _si = assess_secrets(uniq)
+        for _d in _si:
+            uniq.append(Finding(
+                tool="secret-assess", category=_d.get("category", "secret-disclosure"),
+                url=_d.get("url", target), param="", method="GET", evidence=_d.get("detail", ""),
+                verified=bool(_d.get("verified")), detection="secret impact assessment",
+                confidence="firm", evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
+        if _si:
+            print(f"[secret] {len(_si)} disclosed-key impact assessment(s)", flush=True)
+    except Exception as _sie:  # noqa: BLE001
+        print(f"[secret] impact assessment skipped: {_sie}", flush=True)
+
     # FULL request/response capture (Burp-grade proof, the standard Burp always provides): replay
     # each finding's GET request authenticated and record the COMPLETE raw request + full response as
     # the primary evidence. Read-only (GET only, deduped, rate-limited), so safe on live infra; the

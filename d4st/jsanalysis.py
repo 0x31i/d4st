@@ -120,6 +120,59 @@ def extract_endpoints(js_text: str, base_url: str, host: str) -> list[str]:
     return out
 
 
+# --- Angular/SPA route + API-callsite mining -------------------------------------------------
+# The crawl clicks what's linked; a SPA's FULL route table + the API paths its code calls live in
+# the JS. Mine both so authz/JWT/method-tamper test the whole surface, not just what katana reached.
+#  - route defs: Angular `path: 'patients/:id'`, `{path:"admin"}`, routerLink="/x" — client views.
+#  - API call-sites: http.get/post/put/delete('...'), $http, fetch('/api/...'), axios(...) — endpoints.
+_ROUTE_DEF_RE = re.compile(r"""[\{,]\s*path\s*:\s*(?:"|')([^"']*)(?:"|')""", re.IGNORECASE)
+_ROUTERLINK_RE = re.compile(r"""routerLink\s*=\s*(?:"|')([^"']+)(?:"|')""")
+_HTTP_CALL_RE = re.compile(
+    r"""(?:\.(?:get|post|put|patch|delete|request)|\$http|fetch|axios)\s*\(\s*"""
+    r"""(?:"|'|`)([^"'`]{2,200})(?:"|'|`)""",
+    re.IGNORECASE,
+)
+
+
+def extract_routes_and_callsites(js_text: str, base_url: str, host: str) -> tuple[list[str], list[str]]:
+    """Return (api_urls, client_routes). api_urls are same-host absolute URLs pulled from
+    http.get/post/fetch/axios call-sites (testable endpoints, folded into the scan frontier);
+    client_routes are Angular route paths (context for the report, not fetched)."""
+    want_host = (host or "").rsplit("@", 1)[-1].split(":")[0].lower()
+    api: list[str] = []
+    routes: list[str] = []
+    seen_api: set = set()
+    seen_rt: set = set()
+
+    for m in _HTTP_CALL_RE.finditer(js_text or ""):
+        raw = (m.group(1) or "").strip()
+        if not raw or raw.startswith(("http://www.w3", "https://www.w3", "data:", "//cdn")):
+            continue
+        # only keep things that look like server paths/URLs (skip template ids, css selectors)
+        if not (raw.startswith(("/", "http", "./", "../")) or _API_HINT.search(raw)):
+            continue
+        url = urljoin(base_url, _norm_route(raw))
+        h = (urlsplit(url).hostname or want_host).lower()
+        if want_host and h != want_host:
+            continue
+        if url in seen_api:
+            continue
+        seen_api.add(url)
+        api.append(url)
+
+    for rx in (_ROUTE_DEF_RE, _ROUTERLINK_RE):
+        for m in rx.finditer(js_text or ""):
+            r = (m.group(1) or "").strip()
+            if not r or r in ("", "**", "/") or r.startswith(("http", "mailto:", "javascript:")):
+                continue
+            if r in seen_rt:
+                continue
+            seen_rt.add(r)
+            routes.append(r)
+    api.sort(key=lambda u: (not bool(_API_HINT.search(u)), u))
+    return api, routes
+
+
 def detect_vuln_libs(js_text: str, url: str) -> list[VulnLib]:
     # Scan the WHOLE bundle, not just the first 4 KB: a webpack/Angular chunk inlines its vendored
     # libs anywhere in the body, so the version banner is rarely near the top (this is why Burp's
@@ -302,6 +355,14 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
                                          "evidence_log": _js_proof(u, txt, status, ctype, ev),
                                          "repro": f"curl -i '{u}'"})
                 for ep in extract_endpoints(txt, u, host):
+                    if ep not in seen_ep:
+                        seen_ep.add(ep)
+                        endpoints.append(ep)
+                # Angular route table + http.get/post/fetch/axios call-sites: the API paths the
+                # SPA's code calls that were never linked/crawled — fold them into the frontier so
+                # authz/JWT/method-tamper reach the whole surface (client routes are context only).
+                _api_calls, _routes = extract_routes_and_callsites(txt, u, host)
+                for ep in _api_calls:
                     if ep not in seen_ep:
                         seen_ep.add(ep)
                         endpoints.append(ep)
