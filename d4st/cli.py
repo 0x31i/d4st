@@ -371,6 +371,92 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
             console.print(f"[yellow]store ingest skipped[/yellow]: {e}")
 
 
+def _ensure_session(auth: dict, target: str) -> str:
+    """Capture a fresh session from the auth profile+creds (or reuse a still-valid stored one).
+    Returns the session file path. This is the auto-glue that removes the manual `auth capture` step."""
+    from urllib.parse import urlsplit
+
+    from .auth.capture import capture_interactive, capture_scripted
+    from .auth.profile import load_profile
+    from .auth.session import Session
+    from .auth.validity import is_valid
+
+    sess_path = auth["session"]
+    base = f"{urlsplit(target).scheme}://{urlsplit(target).hostname}"
+    # reuse a fresh existing session if allowed (skips a slow browser login)
+    if auth.get("reuse_if_fresh") and os.path.exists(sess_path):
+        try:
+            s = Session.load(sess_path)
+            ok, _ = is_valid(s, s.meta.get("validity_url") or target,
+                             s.meta.get("validity_marker") or "Logout",
+                             render=bool(s.session_storage))
+            if ok:
+                console.print(f"[green]reusing valid session[/green] {sess_path}")
+                return sess_path
+        except Exception:  # noqa: BLE001
+            pass
+    if not auth.get("profile"):
+        raise click.ClickException(f"no valid session at {sess_path} and no auth.profile to capture one")
+    prof = load_profile(auth["profile"])
+    console.print(f"[cyan]capturing session[/cyan] via {auth['profile']} → {sess_path}")
+    if auth.get("interactive"):
+        s = capture_interactive(prof, base)
+    else:
+        s = capture_scripted(prof, base, username=auth.get("username"), password=auth.get("password"))
+    os.makedirs(os.path.dirname(sess_path) or ".", exist_ok=True)
+    s.save(sess_path)
+    console.print(f"[green]captured[/green] {s.summary()}")
+    return sess_path
+
+
+@main.command()
+@click.argument("config_path", type=click.Path(exists=True))
+@click.option("--preflight-only", is_flag=True, default=False,
+              help="Resolve config + capture session + print the readiness checklist, then stop.")
+def run(config_path: str, preflight_only: bool) -> None:
+    """Run a full engagement from a single engagement.yaml — the easy button for a new target.
+
+    Auto-captures the session from the declared auth profile+creds, exports every D4ST_* tuning knob
+    from the config (no hand-set env vars), wires the second account for the BOLA matrix if present,
+    then scans. `d4st run --preflight-only` stops after the readiness check.
+    """
+    from . import engagement_config as ec
+
+    cfg = ec.load(config_path)
+    applied = ec.apply_env(cfg)
+    console.print(f"[bold]engagement[/bold] {cfg['client']} → {cfg['target']}  "
+                  f"[dim](profile {cfg['profile']}, scope {', '.join(cfg['scope'])})[/dim]")
+    for k, v in applied.items():
+        console.print(f"  [dim]{k}={v}[/dim]")
+
+    session_path = _ensure_session(cfg["auth"], cfg["target"])
+    if cfg["auth"].get("second"):
+        sb = _ensure_session(cfg["auth"]["second"], cfg["target"])
+        os.environ["D4ST_AUTHZ_SESSION_B"] = os.path.abspath(sb)
+        console.print(f"[green]two-account BOLA matrix armed[/green] (2nd session {sb})")
+
+    if preflight_only:
+        console.print("[green]preflight OK[/green] — config resolved, session captured, env exported. "
+                      "Drop --preflight-only to scan.")
+        return
+
+    # hand off to the existing, fully-wired engagement flow (JWT refresh, keeper, ingest all intact)
+    engagement.callback(target=cfg["target"], session_path=session_path, depth=cfg["depth"],
+                        profile=cfg["profile"], out_path=cfg["output"])
+
+
+@main.command("init-config")
+@click.option("--out", "-o", default="engagement.yaml", help="Where to write the template.")
+def init_config(out: str) -> None:
+    """Write a commented engagement.yaml template to fill in for a new target."""
+    from . import engagement_config as ec
+    if os.path.exists(out):
+        raise click.ClickException(f"{out} already exists — refusing to overwrite")
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(ec.EXAMPLE)
+    console.print(f"[green]wrote[/green] {out} — edit it, then run: d4st run {out}")
+
+
 def _scan_id_for(out_path: str | None, target: str) -> str:
     """Stable scan id: the -o filename stem if given, else a slug of the target host."""
     from urllib.parse import urlsplit
