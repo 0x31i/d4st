@@ -135,20 +135,36 @@ def _sign_hs(header: dict, payload: dict, secret: str, alg: str) -> str:
     return f"{h}.{p}.{_b64url(sig)}"
 
 
-def _pick_oracle(c, urls: list[str], authed: dict, origin: str, delay: float, throttle=None):
-    """Find an authed GET endpoint that returns 200 with non-trivial data — our acceptance oracle."""
+def _pick_oracle(c, urls: list[str], authed: dict, origin: str, delay: float, throttle=None,
+                 hname: str = "Authorization"):
+    """Find an AUTH-GATED GET oracle: returns 200+data WITH the real bearer AND 401/403 WITHOUT it.
+
+    Gating is the whole point — a forged token "accepted" only proves broken JWT VALIDATION if the
+    endpoint actually requires a valid token. An unauthenticated-open endpoint (like a public config
+    route) returns data regardless of the token, so testing forged tokens there is confounded with
+    broken-auth and would be a false positive. We therefore reject any endpoint that also serves data
+    with no Authorization header, and only use a genuinely protected one as the forge oracle."""
     from .safety import pace
+    noauth = {k: v for k, v in authed.items() if k.lower() not in ("authorization", "cookie")}
     api = [u for u in urls if u.startswith(origin) and "/api/" in u.lower()]
     api = api or [u for u in urls if u.startswith(origin)]
-    for u in api[:60]:
+    for u in api[:120]:
         try:
             r = c.get(u, headers=authed)
             pace(throttle, delay, r.status_code)
         except Exception:  # noqa: BLE001
             continue
         body = (r.text or "").strip()
-        if r.status_code == 200 and body and body not in ("[]", "{}", "null", '""'):
+        if not (r.status_code == 200 and body and body not in ("[]", "{}", "null", '""')):
+            continue
+        try:                          # gate check: must be REJECTED with no bearer
+            n = c.get(u, headers=noauth)
+            pace(throttle, delay, n.status_code)
+        except Exception:  # noqa: BLE001
+            continue
+        if n.status_code in (401, 403):          # genuinely auth-gated → valid oracle
             return u, r
+        # else: endpoint serves data unauthenticated (broken-auth, handled by authz) → skip, not a JWT oracle
     return None, None
 
 
@@ -193,7 +209,7 @@ def run_jwt_attacks(session: Session, base: str, urls: list[str], *,
 
     findings: list[dict] = []
     with httpx.Client(verify=False, follow_redirects=False, timeout=timeout) as c:
-        oracle_url, base_r = _pick_oracle(c, urls, authed, origin, delay, throttle)
+        oracle_url, base_r = _pick_oracle(c, urls, authed, origin, delay, throttle, hname)
         if not oracle_url:
             return []
         base_body = base_r.text
