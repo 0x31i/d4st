@@ -47,6 +47,16 @@ automated scan tier of a commercial suite. It does not replace a human doing man
 - **Verified findings.** Findings are normalized to a common schema and replayed through a
   deterministic verify pass that holds suspected false positives, so you triage confirmed
   results.
+- **Authenticated attack depth, not just scanning.** Behind the login it runs the tests a human
+  does by hand: a JWT attack suite (alg:none, signature stripping, `kid`/`jku` injection, weak-
+  secret cracking), SignalR/WebSocket broken-auth, CORS exploitability (reflected-origin + creds),
+  HTTP verb/method tampering (BFLA), host-header injection, and a two-account horizontal BOLA/IDOR
+  matrix — the classes a generic scanner structurally misses.
+- **Evidence on every finding.** Each finding carries the full request/response exchange plus a
+  copy-paste `curl` repro — Burp-grade proof, guaranteed (a finding never ships without it).
+- **One config per engagement.** `d4st init` records a login once in a browser and writes the
+  auth profile + a single `engagement.yaml`; `d4st run engagement.yaml` captures the session,
+  exports every tuning knob, and scans. New target to first scan in one flow, no env-var wrangling.
 - **Safe on live infra.** The default `safe-deep` policy throttles requests, never mutates data,
   skips destructive or notifying endpoints, and uses non-corrupting injection techniques. It
   still runs the full roster at full depth. Pace and depth are separate settings.
@@ -66,8 +76,9 @@ current roster:
 | **JS / secrets** | jsluice, semgrep, trufflehog, gitleaks, retire.js-lite dependency check |
 | **API / GraphQL** | schemathesis, jwt_tool, graphw00f |
 | **Active detection** | OWASP ZAP (active), nuclei (`-dast`), sqlmap, ghauri, dalfox, commix, SSTImap, crlfuzz, nosqli, openredirex, dotdotpwn, interactsh (OAST) |
-| **TLS / infra** | testssl.sh |
-| **Verify / report** | deterministic replay verifier, client-grade HTML/PDF report, SQLite observability console |
+| **Auth / access-control depth** | JWT attack suite (alg:none · sig-strip · kid/jku · weak-secret crack), SignalR/WebSocket broken-auth, CORS exploitability, verb/method tampering (BFLA), host-header injection, two-account BOLA/IDOR matrix, disclosed-secret impact validation |
+| **TLS / infra** | testssl.sh, stdlib cert/protocol check, security-header + tech/version-disclosure passive checks |
+| **Verify / report** | deterministic replay verifier, full req/resp evidence capture, client-grade HTML/PDF + xlsx/csv report, SQLite observability console with live in-flight scan monitoring |
 
 ## Quick start (Docker)
 
@@ -80,7 +91,20 @@ docker compose up -d
 docker compose exec d4st d4st selftest    # verify every tool -> parser path is healthy
 ```
 
-Capture a session, then run an authenticated engagement:
+Onboard a new target in one flow — `d4st init` records the login in a browser (once), detects the
+session token, and writes both the auth profile and a single `engagement.yaml`:
+
+```bash
+d4st init                                 # prompts for client + target, opens a browser to log in
+export APP_USERNAME=… APP_PASSWORD=…      # creds referenced by the generated config
+d4st run engagement.yaml                  # auto-captures the session, exports every knob, scans
+d4st run engagement.yaml --preflight-only # dry readiness check (reachability, bearer, scope) first
+```
+
+`engagement.yaml` declares the whole run — target, scope, auth, scan profile, tuning, an optional
+second account for the BOLA matrix, and egress — so nothing lives in scattered environment variables.
+
+<details><summary>Manual path (no config file)</summary>
 
 ```bash
 # capture the login once (headed the first time for SSO / MFA):
@@ -89,10 +113,12 @@ docker compose exec d4st d4st auth capture -p <profile> -b https://app.example.c
 
 # blind authenticated engagement (crawl -> discover -> scan -> verify -> report):
 docker compose exec d4st d4st engagement -t https://app.example.com \
-  -s sessions/app.json --profile safe-deep -o results/app.json
+  -s sessions/app.json --profile engagement -o results/app.json
 ```
+</details>
 
-Watch it live in the console at `http://localhost:8810`, then render the client report:
+Watch it live in the console at `http://localhost:8810` — a running scan shows up immediately with a
+per-stage progress feed and findings that grow in real time. Then render the client report:
 
 ```bash
 docker compose exec d4st d4st report app --from-db --client "Example Corp" -o results/app.pdf
@@ -104,7 +130,11 @@ See [`docs/deploy-windows.md`](docs/deploy-windows.md) for running on a Windows 
 
 | Command | Purpose |
 |---------|---------|
-| `d4st auth capture` | Establish and persist a login session (form / SSO / TOTP). |
+| `d4st init` | Guided onboarding: record the login in a browser, generate the auth profile + a ready `engagement.yaml`. |
+| `d4st run <engagement.yaml>` | Run a full engagement from one config file (auto-captures session, exports all tuning, scans). `--preflight-only` for a dry readiness check. |
+| `d4st init-config` | Write a blank commented `engagement.yaml` template to fill in by hand. |
+| `d4st auth init <login-url>` | Record-to-configure: log in once, auto-detect selectors + token, write the auth profile. |
+| `d4st auth capture` | Establish and persist a login session from an existing profile (form / SSO / TOTP). |
 | `d4st engagement` | Blind authenticated engagement: crawl, discover forms/CSRF, scan, verify, report. |
 | `d4st report` | Render a client-grade HTML/PDF report from a result JSON or the store. |
 | `d4st serve` | Start the web console (live scan observability and findings). |
