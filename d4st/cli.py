@@ -132,6 +132,56 @@ def auth_capture(profile: str, base: str | None, out: str, security: str | None,
     console.print(f"saved -> {out}")
 
 
+@auth.command("init")
+@click.argument("login_url")
+@click.option("--name", "-n", default=None, help="Profile name (default: the target host).")
+@click.option("--base", "-b", default=None, help="Base URL (default: the login URL's origin).")
+@click.option("--out", "-o", default=None, help="Where to write the profile YAML "
+              "(default: d4st/auth/profiles/<name>.yaml).")
+@click.option("--session", "-s", "session_out", default=None,
+              help="Also save the captured session here (default: sessions/<name>.json).")
+def auth_init(login_url: str, name: str | None, base: str | None, out: str | None,
+              session_out: str | None) -> None:
+    """Record-to-configure: open a browser, LOG IN ONCE, and d4st auto-writes the auth profile.
+
+    Watches which fields you type in and the button you click, detects the bearer token by diffing
+    storage, and generates a ready profile — no hand-writing CSS selectors. Needs a display (run it
+    locally, not on a headless box).
+    """
+    import yaml
+    from urllib.parse import urlsplit
+
+    from .auth.recorder import record_login
+
+    nm = name or re.sub(r"[^a-z0-9]+", "", (urlsplit(login_url).hostname or "site").split(".")[0].lower()) or "site"
+    try:
+        profile, session = record_login(login_url, nm, base)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(f"login recording failed: {exc}") from exc
+
+    out = out or os.path.join("d4st", "auth", "profiles", f"{nm}.yaml")
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    with open(out, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(profile, fh, sort_keys=False)
+    console.print(f"[green]profile written[/green] -> {out}")
+    console.print(f"  username_selector: {profile['username_selector']}")
+    console.print(f"  password_selector: {profile['password_selector']}")
+    console.print(f"  submit_selector:   {profile['submit_selector']}")
+    if profile.get("token"):
+        console.print(f"  token:             {profile['token']['key']} "
+                      f"({profile['token']['storage']}Storage → {profile['token']['header']})")
+    else:
+        console.print("  token:             none detected (cookie-session app)")
+    console.print(f"  creds via env:     {profile['username_env']} / {profile['password_env']}")
+
+    session_out = session_out or os.path.join("sessions", f"{nm}.json")
+    os.makedirs(os.path.dirname(session_out) or ".", exist_ok=True)
+    session.save(session_out)
+    console.print(f"[green]session captured[/green] -> {session_out}")
+    console.print(f"[dim]next: set {profile['username_env']}/{profile['password_env']}, then "
+                  f"`d4st run` with an engagement.yaml pointing auth.profile at {out}[/dim]")
+
+
 @auth.command("check")
 @click.option("--session", "-s", "session_path", required=True, help="Captured session JSON.")
 @click.option("--profile", "-p", default=None, help="Profile for the validity URL/marker.")
