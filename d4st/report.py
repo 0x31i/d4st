@@ -178,6 +178,94 @@ VULN_META: dict[str, dict] = {
              "compliance (PCI, HIPAA transmission security).",
         fix="Keep certificates valid and auto-renewed; disable TLS 1.0/1.1 and weak ciphers; require "
             "TLS 1.2+ with a strong cipher suite and HSTS."),
+    # --- JWT attack suite (token integrity) ---
+    "jwt-alg-none": dict(
+        title="JWT Signature Bypass — alg:none Accepted", severity="critical", cwe="CWE-347",
+        owasp="A02:2021 Cryptographic Failures / API2:2023 Broken Authentication",
+        desc="The server accepted a token whose header declares no signature (alg:none) and returned "
+             "authenticated data. An attacker can forge a token for ANY user or role — complete "
+             "authentication bypass.",
+        fix="Reject alg=none and any algorithm not on an explicit allow-list; verify the signature "
+            "against the trusted key on every request before serving data."),
+    "jwt-signature-strip": dict(
+        title="JWT Signature Not Required", severity="critical", cwe="CWE-347",
+        owasp="A02:2021 Cryptographic Failures / API2:2023",
+        desc="The server accepted a token with its signature stripped or removed entirely — token "
+             "integrity is not enforced, so any token can be forged.",
+        fix="Require and verify a valid signature on every token; reject 2-segment/empty-signature tokens."),
+    "jwt-signature-not-verified": dict(
+        title="JWT Signature Not Verified", severity="critical", cwe="CWE-347",
+        owasp="A02:2021 Cryptographic Failures / API2:2023",
+        desc="A token with a valid structure but a corrupted signature was accepted — the server does "
+             "not verify the signature, so forged tokens are trusted.",
+        fix="Verify the JWT signature against the trusted key and reject any token that fails."),
+    "jwt-weak-secret": dict(
+        title="JWT Signed with a Weak/Default Secret", severity="critical", cwe="CWE-521 / CWE-347",
+        owasp="A02:2021 Cryptographic Failures / A07:2021",
+        desc="The HMAC signing secret is a weak/default value recovered offline. With the secret an "
+             "attacker mints validly-signed tokens for any user or role — full authentication bypass "
+             "and privilege escalation.",
+        fix="Rotate to a long, random, high-entropy signing secret stored in a secret manager; "
+            "consider asymmetric (RS256/ES256) signing so the signing key never reaches clients."),
+    "jwt-kid-injection": dict(
+        title="JWT kid Header Injection", severity="high", cwe="CWE-91 / CWE-347",
+        owasp="A03:2021 Injection / API2:2023",
+        desc="The token's kid (key id) header is attacker-influenceable (path traversal / SQLi), which "
+             "can coerce the server into signing/verifying with an attacker-chosen key.",
+        fix="Treat kid as untrusted input: validate against an allow-list of key ids; never use it in "
+            "a file path or SQL query."),
+    "jwt-key-header": dict(
+        title="JWT Embeds a Key Reference (jku/x5u/jwk)", severity="medium", cwe="CWE-347",
+        owasp="A02:2021 Cryptographic Failures",
+        desc="The token header carries a key-reference parameter (jku/x5u/x5c/jwk). If the server "
+             "fetches or trusts it, an attacker can supply their own key (key confusion / SSRF).",
+        fix="Ignore embedded key references; verify only against pre-configured trusted keys."),
+    # --- CORS ---
+    "cors-credentialed-reflection": dict(
+        title="Exploitable CORS — Reflected Origin with Credentials", severity="high",
+        cwe="CWE-942", owasp="A05:2021 Security Misconfiguration",
+        desc="The server reflects an arbitrary Origin AND allows credentials, so any attacker-"
+             "controlled website can make authenticated cross-origin requests and read the victim's "
+             "responses — a genuinely exploitable misconfiguration, not a benign header.",
+        fix="Never reflect the Origin with Access-Control-Allow-Credentials:true. Allow only an "
+            "explicit trusted-origin allow-list; disallow credentials for wildcarded responses."),
+    "cors-origin-reflection": dict(
+        title="CORS Reflects Arbitrary Origin", severity="medium", cwe="CWE-942",
+        owasp="A05:2021 Security Misconfiguration",
+        desc="The server reflects an arbitrary request Origin without credentials — cross-origin reads "
+             "of non-credentialed responses are possible.",
+        fix="Restrict Access-Control-Allow-Origin to an explicit trusted allow-list."),
+    "cors-null-origin": dict(
+        title="CORS Allows the 'null' Origin", severity="medium", cwe="CWE-942",
+        owasp="A05:2021 Security Misconfiguration",
+        desc="The server allows the 'null' Origin (sandboxed iframes, redirects, local files), which "
+             "attacker contexts can present to make cross-origin reads.",
+        fix="Never allow-list the 'null' origin; use an explicit trusted-origin allow-list."),
+    # --- verb/method BFLA ---
+    "broken-access-control": dict(
+        title="Broken Access Control (Verb/Method Tampering)", severity="high", cwe="CWE-285 / CWE-650",
+        owasp="A01:2021 Broken Access Control / API5:2023 BFLA",
+        desc="Authorization is enforced inconsistently across HTTP methods — an endpoint rejects one "
+             "method unauthenticated but accepts another (HEAD/case-variant/alternate verb), allowing "
+             "the access control to be bypassed by changing the method.",
+        fix="Apply authorization uniformly to ALL methods (deny-by-default); do not gate on an exact "
+            "verb string. Return 405 for unsupported methods and 401/403 consistently."),
+    "broken-object-level-authorization": dict(
+        title="Broken Object-Level Authorization (Cross-Account BOLA/IDOR)", severity="critical",
+        cwe="CWE-639", owasp="API1:2023 BOLA / A01:2021",
+        desc="A second authenticated account retrieved the first account's object at the same endpoint "
+             "— one user can read another user's data. Confirmed with two accounts (not a suspicion). "
+             "In healthcare this is direct cross-patient PHI access.",
+        fix="Enforce per-object ownership checks server-side on every request; authorize on the "
+            "resource owner, never on authentication alone."),
+    # --- websocket / realtime ---
+    "websocket-hub-exposed": dict(
+        title="Realtime/WebSocket Hub Exposed", severity="info", cwe="CWE-16",
+        owasp="A05:2021 Security Misconfiguration",
+        desc="A SignalR/WebSocket hub is reachable. Recorded for completeness; the live socket may "
+             "warrant manual message-flow review.",
+        fix="Ensure the realtime channel enforces the same authentication/authorization as the HTTP "
+            "API and validates every inbound message."),
     "other": dict(
         title="Other Finding", severity="info", cwe="—", owasp="—",
         desc="A finding reported by a scanner that does not map to a standard category.",
