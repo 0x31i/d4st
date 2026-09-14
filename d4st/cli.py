@@ -507,6 +507,71 @@ def init_config(out: str) -> None:
     console.print(f"[green]wrote[/green] {out} — edit it, then run: d4st run {out}")
 
 
+@main.command("init")
+@click.option("--client", prompt="Client name", help="Client label for the report + file slugs.")
+@click.option("--target", prompt="Target base URL", help="e.g. https://app.example.com")
+@click.option("--login-url", default=None, help="Login page URL (default: <target>/login).")
+@click.option("--profile", "scan_profile", default="engagement", help="Scan policy.")
+@click.option("--record/--no-record", default=True,
+              help="Open a browser and record the login now to auto-generate the auth profile.")
+@click.option("--auth-profile", default=None,
+              help="Use an EXISTING auth profile instead of recording (path or bundled name).")
+@click.option("--out", "-o", default="engagement.yaml", help="Where to write the engagement config.")
+def init(client: str, target: str, login_url: str | None, scan_profile: str,
+         record: bool, auth_profile: str | None, out: str) -> None:
+    """Guided onboarding: record the login (or point at a profile), then write a ready
+    engagement.yaml. New target → scanning in one flow.  Afterwards:  d4st run <out>."""
+    import re as _re
+    from urllib.parse import urlsplit
+
+    import yaml
+
+    if os.path.exists(out):
+        raise click.ClickException(f"{out} already exists — refusing to overwrite")
+    host = urlsplit(target).hostname or ""
+    if not host:
+        raise click.ClickException(f"target is not a valid URL: {target!r}")
+    slug = _re.sub(r"[^a-z0-9]+", "", host.split(".")[0].lower()) or "site"
+
+    if record and not auth_profile:
+        from .auth.recorder import record_login
+        lu = login_url or target.rstrip("/") + "/login"
+        console.print(f"[cyan]recording login[/cyan] at {lu} — a browser will open; log in once.")
+        try:
+            profile, session = record_login(lu, slug, f"{urlsplit(target).scheme}://{host}")
+        except Exception as exc:  # noqa: BLE001
+            raise click.ClickException(f"login recording failed: {exc}") from exc
+        auth_profile = os.path.join("d4st", "auth", "profiles", f"{slug}.yaml")
+        os.makedirs(os.path.dirname(auth_profile), exist_ok=True)
+        with open(auth_profile, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(profile, fh, sort_keys=False)
+        sp = os.path.join("sessions", f"{slug}.json")
+        os.makedirs("sessions", exist_ok=True)
+        session.save(sp)
+        console.print(f"[green]auth profile[/green] -> {auth_profile}  ·  [green]session[/green] -> {sp}")
+        user_env, pass_env = profile["username_env"], profile["password_env"]
+    else:
+        if not auth_profile:
+            raise click.ClickException("either --record or --auth-profile is required")
+        user_env, pass_env = f"{slug.upper()}_USERNAME", f"{slug.upper()}_PASSWORD"
+
+    cfg = {
+        "client": client, "target": target, "scope": [host], "profile": scan_profile, "depth": 3,
+        "output": f"results/{slug}.json",
+        "auth": {"profile": auth_profile, "username_env": user_env, "password_env": pass_env,
+                 "session": f"sessions/{slug}.json", "reuse_if_fresh": True},
+        "tuning": {"full_capture": True, "js_max": 8000, "secret_validate": False,
+                   "method_tamper_writes": False},
+        "egress": {"verify_ips": "auto"},
+        "report": {"client": client, "ref": ""},
+    }
+    with open(out, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(cfg, fh, sort_keys=False)
+    console.print(f"[green]wrote engagement config[/green] -> {out}")
+    console.print(f"[dim]next: export {user_env}/{pass_env}, then:  d4st run {out}"
+                  f"   (or dry-check:  d4st run {out} --preflight-only)[/dim]")
+
+
 def _scan_id_for(out_path: str | None, target: str) -> str:
     """Stable scan id: the -o filename stem if given, else a slug of the target host."""
     from urllib.parse import urlsplit
