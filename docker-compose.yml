@@ -19,6 +19,9 @@ services:
     build: .
     container_name: d4st
     restart: unless-stopped
+    # tini as PID 1 so long-running scans that spawn/kill helper procs (ZAP, sqlmap, katana)
+    # get their children reaped — prevents the zombie pile-up when `d4st serve` is PID 1.
+    init: true
     environment:
       # SQLite observability store (persisted on the host via the ./data mount)
       D4ST_DB: /data/d4st.db
