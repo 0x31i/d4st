@@ -2730,6 +2730,17 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[cors] skipped: {_coe}", flush=True)
             _prog.update("cors", findings, urls=len(urls), targets=len(targets))
 
+            # Host-header injection (password-reset/cache poisoning / routing SSRF)
+            try:
+                from .activetests import run_host_header_injection
+                _hh = run_host_header_injection(session, target, urls, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_hh, "hostheader")
+                if _hh:
+                    print(f"[hostheader] {len(_hh)} host-header-injection finding(s)", flush=True)
+            except Exception as _hhe:  # noqa: BLE001
+                print(f"[hostheader] skipped: {_hhe}", flush=True)
+            _prog.update("host-header", findings, urls=len(urls), targets=len(targets))
+
             # SignalR / WebSocket realtime-channel testing (broken-auth on the socket)
             try:
                 from .wstests import run_ws_tests

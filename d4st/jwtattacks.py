@@ -107,13 +107,18 @@ def _crack_hs(signing_input: str, sig_b64: str, alg: str) -> str | None:
     except Exception:  # noqa: BLE001
         return None
     words = list(_WEAK_SECRETS)
-    wl = os.environ.get("D4ST_JWT_WORDLIST")
-    if wl and os.path.exists(wl):
-        try:
-            with open(wl, encoding="utf-8", errors="ignore") as fh:
-                words += [ln.strip() for ln in fh if ln.strip()]
-        except Exception:  # noqa: BLE001
-            pass
+    # bundled curated list (d4st/data/jwt_secrets.txt) + operator override D4ST_JWT_WORDLIST
+    _bundled = os.path.join(os.path.dirname(__file__), "data", "jwt_secrets.txt")
+    for wl in (_bundled, os.environ.get("D4ST_JWT_WORDLIST")):
+        if wl and os.path.exists(wl):
+            try:
+                with open(wl, encoding="utf-8", errors="ignore") as fh:
+                    words += [ln.strip() for ln in fh
+                              if ln.strip() and not ln.lstrip().startswith("#")]
+            except Exception:  # noqa: BLE001
+                pass
+    seen_w: set[str] = set()
+    words = [w for w in words if not (w in seen_w or seen_w.add(w))]
     for secret in words:
         got = hmac.new(secret.encode(), signing_input.encode(), digestmod).digest()
         if hmac.compare_digest(got, want):

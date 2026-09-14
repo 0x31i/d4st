@@ -259,6 +259,14 @@ VULN_META: dict[str, dict] = {
         fix="Enforce per-object ownership checks server-side on every request; authorize on the "
             "resource owner, never on authentication alone."),
     # --- websocket / realtime ---
+    "host-header-injection": dict(
+        title="Host Header Injection", severity="medium", cwe="CWE-644 / CWE-20",
+        owasp="A03:2021 Injection / A05:2021 Security Misconfiguration",
+        desc="A poisoned Host / X-Forwarded-Host request header is reflected in a redirect, cookie, or "
+             "response body. Depending on how the app uses the host value this enables password-reset-"
+             "link poisoning, web-cache poisoning, or routing-based SSRF.",
+        fix="Never build absolute URLs or reset links from the request Host header; use a configured "
+            "canonical hostname and validate Host against an allow-list at the edge."),
     "websocket-hub-exposed": dict(
         title="Realtime/WebSocket Hub Exposed", severity="info", cwe="CWE-16",
         owasp="A05:2021 Security Misconfiguration",
