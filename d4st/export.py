@@ -76,14 +76,21 @@ def _ordered(findings: list[dict]) -> list[dict]:
                                            f.get("category", ""), f.get("url", "")))
 
 
+def _dd(s: str) -> str:
+    """De-dash prose cells (em/en/bar dash → hyphen). NOT applied to Request/Response/Repro/Payload
+    columns, which are captured data and stay verbatim."""
+    return (s or "").replace("—", "-").replace("–", "-").replace("―", "-")
+
+
 def _row(i: int, f: dict) -> list:
     m = _meta_for(f.get("category", "other"))
     req, resp = _exchange_text(f.get("evidence_log"))
-    desc = (m["desc"] + ((" — " + f["evidence"]) if f.get("evidence") else "")).strip()
-    return [i, m["title"], f.get("category", ""), m["severity"], f.get("confidence") or "",
+    desc = _dd((m["desc"] + ((" - " + f["evidence"]) if f.get("evidence") else "")).strip())
+    return [i, _dd(m["title"]), f.get("category", ""), m["severity"], f.get("confidence") or "",
             _verified_str(f.get("verified")), f.get("tool", ""), f.get("url", ""),
             f.get("method", "GET"), f.get("param") or "", f.get("payload") or "", desc,
-            m["fix"], m["cwe"], m["owasp"], f.get("detection") or "", req, resp, f.get("repro") or ""]
+            _dd(m["fix"]), m["cwe"], _dd(m["owasp"]), f.get("detection") or "", req, resp,
+            f.get("repro") or ""]
 
 
 def to_csv(result: dict, path: str) -> int:
