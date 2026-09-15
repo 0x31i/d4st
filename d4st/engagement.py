@@ -2295,6 +2295,23 @@ def _raw_http_response(r) -> str:
     return "\r\n".join(out) + "\r\n\r\n" + (r.text or "")
 
 
+def _is_synthetic_exchange(e: dict) -> bool:
+    """A placeholder exchange with no real captured response — e.g. a ZAP passive alert rendered as
+    status=None with an empty header set and a 'finding basis:' pseudo-body. These are superseded once
+    a real capture exists. A genuine attack exchange (numeric status, or real response headers, or an
+    injected request body) is NOT synthetic and is preserved."""
+    resp = e.get("response") or {}
+    req = e.get("request") or {}
+    if isinstance(resp.get("status"), int):
+        return False                      # real HTTP status -> genuine
+    if resp.get("headers"):
+        return False                      # captured real headers -> genuine
+    if str(req.get("body") or "").strip():
+        return False                      # carried an injected/attack request body -> keep
+    body = str(resp.get("body") or "").lstrip()
+    return (body == "" or body.startswith(("finding basis:", "matched evidence", "ZAP alert:")))
+
+
 def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, rps: float = 4.0) -> int:
     """GUARANTEE Burp-grade proof: replay each finding's request (authenticated) and record the
     COMPLETE raw request + full response (status line + ALL headers + full body) as the finding's
@@ -2312,7 +2329,10 @@ def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, r
     cap_body = int(os.environ.get("D4ST_FULL_CAPTURE_CAP", str(cap_body)) or cap_body)
     cache: dict = {}
     captured = 0
-    with httpx.Client(verify=False, follow_redirects=False, timeout=15) as c:
+    # follow_redirects=True so a URL that 30x-redirects (e.g. the SPA root '/') yields the REAL
+    # final response (200 + HTML + body) rather than an empty 0-byte redirect. The redirect chain is
+    # recorded in the request note so the proof shows '302 -> 200', not a bare empty response.
+    with httpx.Client(verify=False, follow_redirects=True, timeout=15) as c:
         for f in findings:
             url = getattr(f, "url", "") or ""
             method = (getattr(f, "method", "") or "GET").upper()
@@ -2330,22 +2350,150 @@ def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, r
                 continue
             _rt = (r.text or "")
             _trunc = len(_rt) > cap_body
+            # redirect chain (if any) so the capture is honest about how we reached the final response
+            _hops = [f"{h.status_code} {h.request.method} {h.request.url}" for h in (r.history or [])]
+            _chain = ("redirect chain: " + " -> ".join(_hops) + f" -> {r.status_code}\n") if _hops else ""
             full = {"label": "FULL request / response (Burp-grade capture)",
                     "request": {"method": "GET", "url": str(r.request.url),
                                 "headers": _redact_auth(dict(r.request.headers)), "body": "",
-                                "raw": _raw_http_request("GET", str(r.request.url),
-                                                         _redact_auth(dict(r.request.headers)))},
+                                "raw": _chain + _raw_http_request("GET", str(r.request.url),
+                                                                  _redact_auth(dict(r.request.headers)))},
                     "response": {"status": r.status_code, "headers": dict(r.headers),
                                  "elapsed_ms": int(r.elapsed.total_seconds() * 1000) if r.elapsed else None,
                                  "size": len(r.content),
                                  "body": _rt[:cap_body] + ("\n…[truncated]" if _trunc else ""),
                                  "raw": _raw_http_response(r)[:cap_body + 4000]}}
-            f.evidence_log = [full] + [e for e in (getattr(f, "evidence_log", None) or [])
-                                       if isinstance(e, dict)]
+            # A real capture supersedes any synthetic placeholder exchange (e.g. a ZAP passive alert
+            # rendered as status=None / body="finding basis: ..."). Keep genuine attack exchanges
+            # (those with a numeric status or an injected request body); drop the empty placeholders.
+            _kept_prior = [e for e in (getattr(f, "evidence_log", None) or [])
+                           if isinstance(e, dict) and not _is_synthetic_exchange(e)]
+            f.evidence_log = [full] + _kept_prior
             if not getattr(f, "repro", ""):
                 f.repro = f"curl -i '{url}'"
             captured += 1
     return captured
+
+
+# ---- header-hygiene applicability gate (kills "missing header" findings on non-applicable responses) ----
+
+# check-name pattern -> (response header that would satisfy it, requires-framable-html-body)
+_HYGIENE_CHECKS = [
+    ("clickjack", "x-frame-options", True), ("x-frame-options", "x-frame-options", True),
+    ("frame-ancestors", "x-frame-options", True),
+    ("x-content-type-options", "x-content-type-options", False), ("nosniff", "x-content-type-options", False),
+    ("mime-sniff", "x-content-type-options", False),
+    ("strict-transport", "strict-transport-security", False), ("hsts", "strict-transport-security", False),
+    ("referrer-policy", "referrer-policy", False), ("referer", "referrer-policy", False),
+    ("permissions-policy", "permissions-policy", False), ("feature-policy", "permissions-policy", False),
+    ("cacheable", "cache-control", False), ("cache-control", "cache-control", False),
+    ("charset", "content-type", True),
+]
+
+
+def _hygiene_kind(f) -> tuple[str, bool] | None:
+    """If this finding is a 'missing security header' hygiene check, return (header, needs_html_body).
+    Matched on the finding's own text (ZAP alert name / evidence / check), not just its broad category."""
+    blob = " ".join(str(getattr(f, a, "") or "") for a in ("evidence", "verify_note", "detection")).lower()
+    # CSP-missing is only a hygiene drop when it's specifically the 'missing CSP header' alert
+    if ("content security policy" in blob or "content-security-policy" in blob) and \
+       any(w in blob for w in ("missing", "not set", "absent", "no content-security")):
+        return ("content-security-policy", True)
+    for pat, header, needs_html in _HYGIENE_CHECKS:
+        if pat in blob:
+            return (header, needs_html)
+    return None
+
+
+def _primary_captured_response(f) -> dict | None:
+    """The first evidence exchange that is a REAL capture (numeric HTTP status)."""
+    for e in (getattr(f, "evidence_log", None) or []):
+        if isinstance(e, dict):
+            resp = e.get("response") or {}
+            if isinstance(resp.get("status"), int):
+                return resp
+    return None
+
+
+def dedup_shell_hygiene(findings: list) -> tuple[list, int]:
+    """Collapse 'missing security header' findings that are really ONE issue reported many times.
+
+    A single-page-app (Angular/React) serves the SAME index.html for every unmatched route, so a
+    header-hygiene alert (clickjacking, nosniff, cacheable, ...) on that shell gets re-reported once
+    per URL. When several such findings share the same check AND the byte-identical response body,
+    they are the same site-wide misconfiguration: keep one representative annotated with 'affects N
+    routes', drop the duplicates. Findings with distinct bodies stay separate. Returns (kept, collapsed)."""
+    import hashlib
+    groups: dict = {}
+    passthrough: list = []
+    for f in findings:
+        kind = _hygiene_kind(f)
+        resp = _primary_captured_response(f) if kind else None
+        body = str((resp or {}).get("body") or "")
+        if not kind or not body.strip():
+            passthrough.append(f)
+            continue
+        key = (kind[0], hashlib.sha1(body.encode("utf-8", "replace")).hexdigest())
+        groups.setdefault(key, []).append(f)
+
+    kept, collapsed = list(passthrough), 0
+    for _key, grp in groups.items():
+        rep = grp[0]
+        if len(grp) > 1:
+            routes = sorted({getattr(g, "url", "") for g in grp if getattr(g, "url", "")})
+            note = (f" (site-wide: the same response served on {len(routes)} routes — SPA catch-all — "
+                    f"is one misconfiguration, not {len(grp)})")
+            rep.evidence = (getattr(rep, "evidence", "") or "") + note
+            rep.affects_routes = routes            # surfaced by the report as 'affects N endpoints'
+            collapsed += len(grp) - 1
+        kept.append(rep)
+    return kept, collapsed
+
+
+def gate_header_hygiene(findings: list) -> tuple[list, list]:
+    """Re-evaluate every 'missing security header' finding against its REAL captured response.
+    Drop it when the response is not applicable (redirect / empty / non-HTML for framing checks) or
+    when the header is actually present on the real final response. When no real response was captured
+    (e.g. network was down), keep the finding but downgrade verified -> None (unproven, not shipped as
+    'independently verified'). Returns (kept, dropped)."""
+    kept, dropped = [], []
+    for f in findings:
+        kind = _hygiene_kind(f)
+        if not kind:
+            kept.append(f)
+            continue
+        header, needs_html = kind
+        resp = _primary_captured_response(f)
+        if resp is None:
+            # could not fetch a real response -> cannot prove; keep but mark unproven
+            if getattr(f, "verified", None) is True:
+                f.verified = None
+                f.verify_note = (getattr(f, "verify_note", "") or "") + \
+                    " [evidence: no live response captured; not independently verified]"
+            kept.append(f)
+            continue
+        rh = {k.lower(): str(v) for k, v in (resp.get("headers") or {}).items()}
+        status = resp.get("status")
+        ctype = rh.get("content-type", "").lower()
+        body = str(resp.get("body") or "")
+        # 'present -> drop' is only valid for headers whose mere presence resolves the issue. For
+        # cache-control (cacheable) and content-type (charset) the VALUE matters, so presence alone
+        # never clears them — those are only dropped when the response itself is non-applicable.
+        _presence_fixes = {"x-frame-options", "x-content-type-options", "strict-transport-security",
+                           "referrer-policy", "permissions-policy", "content-security-policy"}
+        present = header in _presence_fixes and header in rh
+        # CSP frame-ancestors also satisfies the clickjacking check
+        if header == "x-frame-options" and "frame-ancestors" in rh.get("content-security-policy", "").lower():
+            present = True
+        applicable = (status == 200) and (not needs_html or ("text/html" in ctype and bool(body.strip())))
+        if present or not applicable:
+            f._drop_reason = ("header present on live response" if present
+                              else f"not applicable (HTTP {status}, {ctype or 'no content-type'}, "
+                                   f"{len(body)}B body)")
+            dropped.append(f)
+        else:
+            kept.append(f)
+    return kept, dropped
 
 
 def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
@@ -3117,6 +3265,26 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             _fc = capture_full_evidence(uniq, cookie, rps=(pol.rps if pol else 4.0))
             print(f"[evidence] captured FULL request/response for {_fc} finding(s) "
                   f"(complete raw req + full response headers/body)", flush=True)
+            # Header-hygiene gate: now that every finding has a REAL captured response, drop the
+            # "missing security header" alerts that don't actually apply (redirect/empty/non-HTML
+            # response, or the header is present on the live response). Kills the class of FP where
+            # ZAP flags clickjacking on a 0-byte redirect. Only drops when a real response proves it.
+            _pre = len(uniq)
+            uniq, _dropped_hy = gate_header_hygiene(uniq)
+            if _dropped_hy:
+                for _df in _dropped_hy:
+                    print(f"[evidence] dropped header-hygiene FP: {getattr(_df, 'category', '?')} "
+                          f"{getattr(_df, 'url', '')} — {getattr(_df, '_drop_reason', '')}", flush=True)
+                print(f"[evidence] header-hygiene gate: {_pre} -> {len(uniq)} "
+                      f"({len(_dropped_hy)} non-applicable header findings dropped)", flush=True)
+            # collapse SPA-shell inflation: the same missing-header issue on the identical response
+            # served across many routes is ONE misconfiguration, not N.
+            _pre2 = len(uniq)
+            uniq, _collapsed = dedup_shell_hygiene(uniq)
+            if _collapsed:
+                print(f"[evidence] shell-dedup: {_pre2} -> {len(uniq)} "
+                      f"({_collapsed} duplicate header findings on identical SPA responses collapsed)",
+                      flush=True)
         except Exception as _fce:  # noqa: BLE001 - capture must never sink the scan
             print(f"[evidence] full-capture pass skipped: {_fce}", flush=True)
 

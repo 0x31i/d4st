@@ -53,7 +53,16 @@ automated scan tier of a commercial suite. It does not replace a human doing man
   HTTP verb/method tampering (BFLA), host-header injection, and a two-account horizontal BOLA/IDOR
   matrix — the classes a generic scanner structurally misses.
 - **Evidence on every finding.** Each finding carries the full request/response exchange plus a
-  copy-paste `curl` repro — Burp-grade proof, guaranteed (a finding never ships without it).
+  copy-paste `curl` repro — Burp-grade proof, guaranteed (a finding never ships without it). A
+  final capture pass replays every finding authenticated and follows redirects, so the proof is
+  the real 200/HTML response, not an empty 30x. Tool-side placeholder exchanges (e.g. a ZAP
+  passive alert with no captured body) are superseded by that real capture, and anything that
+  still can't be proven live is downgraded from "verified" rather than shipped with empty proof.
+- **Noise control that matches its own claims.** Passive "missing security header" alerts are
+  re-checked against the real captured response and dropped when they don't apply (redirect,
+  empty, or non-HTML body, or the header is actually present). Single-page apps that serve the
+  same shell on every route no longer inflate the count — the identical-body duplicates collapse
+  to one finding annotated with the routes it affects.
 - **One config per engagement.** `d4st init` records a login once in a browser and writes the
   auth profile + a single `engagement.yaml`; `d4st run engagement.yaml` captures the session,
   exports every tuning knob, and scans. New target to first scan in one flow, no env-var wrangling.
