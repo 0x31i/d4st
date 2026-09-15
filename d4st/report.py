@@ -699,6 +699,29 @@ def _smart_excerpt(text: str, needles: list[str]) -> tuple[str, bool]:
     return "".join(out), True
 
 
+def _is_synthetic_exchange(e: dict) -> bool:
+    """A placeholder exchange with no real captured response (status None, no headers, empty or
+    'finding basis:' pseudo-body). Real captures and genuine attack exchanges are not synthetic."""
+    if not isinstance(e, dict):
+        return True
+    resp = e.get("response") or {}
+    req = e.get("request") or {}
+    if isinstance(resp.get("status"), int) or resp.get("headers"):
+        return False
+    if str(req.get("body") or "").strip():
+        return False
+    body = str(resp.get("body") or "").lstrip()
+    return body == "" or body.startswith(("finding basis:", "matched evidence", "ZAP alert:"))
+
+
+def _real_exchanges(exlog: list) -> list:
+    """Drop synthetic placeholder exchanges when at least one real captured exchange is present, so a
+    finding's proof never shows a bogus 0-byte 'HTTP —' block alongside its real request/response."""
+    exlog = [e for e in (exlog or []) if isinstance(e, dict)]
+    real = [e for e in exlog if not _is_synthetic_exchange(e)]
+    return real if real else exlog   # if ALL are synthetic, keep them (better a note than nothing)
+
+
 def _render_exchange(ex: dict, body_cap: int | None = None, needles: list[str] | None = None,
                      excerpt: bool = True) -> str:
     """Render one request/response pane pair. On SCREEN the full body shows in a scroll box; for
@@ -800,6 +823,7 @@ def _render_finding(f: dict, anchor: str, nobreak: bool = False, concise: bool =
     if payload:
         blocks.append("<div class='block'><div class='h'>Payload</div>"
                       f"<pre class='payload'>{_esc(payload)}</pre></div>")
+    exlog = _real_exchanges(exlog)   # never render a synthetic 0-byte placeholder when real proof exists
     if exlog:
         parts = []
         for i, ex in enumerate(exlog):

@@ -192,12 +192,20 @@ def to_xlsx(result: dict, path: str, meta: dict | None = None, burp_diff: dict |
         rr = 4
         for bucket in ("both", "d4st_only", "burp_only"):
             for item in burp_diff.get(bucket, []):
+                # 'both' items pair the two tools' records: {"d4st": {...}, "burp": {...}}; the
+                # 'only' buckets are already flat. Flatten 'both' from the d4st side, filling any
+                # blank field (e.g. severity) from the burp side so no BOTH row renders empty.
+                if bucket == "both" and isinstance(item.get("d4st"), dict):
+                    dd, bb = item.get("d4st") or {}, item.get("burp") or {}
+                    rec = {k: (dd.get(k) or bb.get(k) or "") for k in ("category", "endpoint", "param", "severity")}
+                else:
+                    rec = item
                 cs.cell(rr, 1, {"both": "BOTH", "d4st_only": "D4ST-ONLY",
                                 "burp_only": "BURP-ONLY"}[bucket])
-                cs.cell(rr, 2, item.get("category", ""))
-                cs.cell(rr, 3, item.get("endpoint", ""))
-                cs.cell(rr, 4, item.get("param", ""))
-                cs.cell(rr, 5, item.get("severity", ""))
+                cs.cell(rr, 2, rec.get("category", ""))
+                cs.cell(rr, 3, rec.get("endpoint", ""))
+                cs.cell(rr, 4, rec.get("param", ""))
+                cs.cell(rr, 5, rec.get("severity", ""))
                 rr += 1
         for ci, w in enumerate((14, 22, 52, 18, 12), 1):
             cs.column_dimensions[get_column_letter(ci)].width = w
