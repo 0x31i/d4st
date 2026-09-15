@@ -155,6 +155,22 @@ VULN_META: dict[str, dict] = {
              "access) and MUST be confirmed manually with a second account before reporting.",
         fix="Enforce per-object ownership checks server-side on every request; never authorize on "
             "authentication alone. Confirm whether the returned object belongs to another tenant."),
+    "cleartext-credential-submission": dict(
+        title="Cleartext Credential Submission", severity="high", cwe="CWE-319",
+        owasp="A02:2021 Cryptographic Failures",
+        desc="A login or credential form submits a password over cleartext HTTP (the page or the "
+             "form's action is not HTTPS). Any observer on the network path can read the submitted "
+             "username and password in transit.",
+        fix="Serve the application and submit all credential forms exclusively over HTTPS; redirect "
+            "HTTP to HTTPS and enforce HSTS so browsers never send credentials in the clear."),
+    "reflected-input": dict(
+        title="Reflected Input (XSS Precursor)", severity="low", cwe="CWE-79",
+        owasp="A03:2021 Injection",
+        desc="A value submitted to the application is reflected back unencoded in the response. This "
+             "is not a confirmed cross-site scripting flaw, but it is the precondition for one — an "
+             "input that reaches the response without output encoding warrants an XSS review.",
+        fix="Context-aware output-encode all user input rendered into responses; add a strict "
+            "Content-Security-Policy as defence in depth and confirm no reflection is script-executable."),
     "unauth-credential-exposure": dict(
         title="Unauthenticated Credential / Secret Exposure", severity="critical", cwe="CWE-522 / CWE-200",
         owasp="A01:2021 Broken Access Control / API3:2023 Broken Object Property Level Authorization",

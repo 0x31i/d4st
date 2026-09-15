@@ -3005,6 +3005,47 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[api-exposure] skipped: {_axe}", flush=True)
             _prog.update("api-exposure", findings, urls=len(urls), targets=len(targets))
 
+            # Form security — the login/HTML-form surface a Burp passive scan analyses: cleartext
+            # credential submission (HTTP), missing CSRF token, and input reflection (XSS precursor).
+            # On a login-gated app the form IS the unauth attack surface. Passive parse + one benign
+            # canary submission per form (no brute force).
+            try:
+                import httpx as _httpx
+                from .formchecks import analyze_forms, probe_reflection
+                _html_urls = [u for u in urls if not u.split("?")[0].lower().endswith(
+                    (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff",
+                     ".woff2", ".map", ".pdf", ".json"))][:40]
+                _fm_hdr = {"Cookie": cookie} if cookie else {}
+                _fm: list[dict] = []
+                with _httpx.Client(verify=False, follow_redirects=True, timeout=10) as _fc:
+                    for _u in _html_urls:
+                        try:
+                            _rr = _fc.get(_u, headers=_fm_hdr)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if "html" not in _rr.headers.get("content-type", "").lower():
+                            continue
+                        _fm += analyze_forms(str(_rr.url), _rr.text or "")
+                        _fm += probe_reflection(str(_rr.url), _rr.text or "", cookie)
+                # dedup by (check, url, param)
+                _fseen: set = set()
+                for _d in _fm:
+                    _k = (_d.get("check"), _d.get("url"), _d.get("param", ""))
+                    if _k in _fseen:
+                        continue
+                    _fseen.add(_k)
+                    findings.append(Finding(
+                        tool="formsec", category=_d["category"], url=_d["url"],
+                        param=_d.get("param", ""), method="POST", evidence=_d["detail"],
+                        verified=True, detection="form-security analysis", confidence="firm",
+                        evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
+                if _fseen:
+                    print(f"[formsec] {len(_fseen)} form-security finding(s) "
+                          f"(cleartext creds / missing CSRF / input reflection)", flush=True)
+            except Exception as _fme:  # noqa: BLE001
+                print(f"[formsec] skipped: {_fme}", flush=True)
+            _prog.update("form-security", findings, urls=len(urls), targets=len(targets))
+
             # SignalR / WebSocket realtime-channel testing (broken-auth on the socket) — compares an
             # authenticated baseline, so authenticated-only (self-skips in unauth-deep mode).
             if session is not None:
