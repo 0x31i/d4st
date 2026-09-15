@@ -155,6 +155,26 @@ VULN_META: dict[str, dict] = {
              "access) and MUST be confirmed manually with a second account before reporting.",
         fix="Enforce per-object ownership checks server-side on every request; never authorize on "
             "authentication alone. Confirm whether the returned object belongs to another tenant."),
+    "unauth-credential-exposure": dict(
+        title="Unauthenticated Credential / Secret Exposure", severity="critical", cwe="CWE-522 / CWE-200",
+        owasp="A01:2021 Broken Access Control / API3:2023 Broken Object Property Level Authorization",
+        desc="An API endpoint returns credential or secret fields (password, token, secret, hash) in "
+             "its response body to a caller with NO valid session. An unauthenticated attacker can "
+             "read other users' secrets directly — often the entire user table with passwords — which "
+             "is a complete pre-auth account-takeover primitive.",
+        fix="Require authentication and object-level authorization on the endpoint; never serialize "
+            "credential/secret fields into API responses; rotate any exposed secret immediately."),
+    "excessive-data-exposure": dict(
+        title="Unauthenticated API Data Exposure", severity="high", cwe="CWE-200 / CWE-359",
+        owasp="API3:2023 Broken Object Property Level Authorization / A01:2021 Broken Access Control",
+        desc="An API endpoint returns sensitive data — a bulk list of user/account records, or "
+             "credential-shaped fields (password, token, secret) — to a caller with no valid "
+             "session. This is excessive data exposure / missing object-level authorization: an "
+             "unauthenticated attacker can harvest other users' data (and, when credential fields "
+             "are present, their secrets) directly from the response body.",
+        fix="Enforce authentication and per-object authorization on every data endpoint; never "
+            "return credential or secret fields in API responses; return only the caller's own "
+            "records and the minimum fields required."),
     "secret-disclosure": dict(
         title="Hardcoded Secret / Credential Disclosure", severity="high", cwe="CWE-798",
         owasp="A07:2021 Identification and Authentication Failures",
