@@ -93,8 +93,14 @@ def _row(i: int, f: dict) -> list:
             f.get("repro") or ""]
 
 
+def _client_findings(result: dict) -> list:
+    """Client deliverable = real findings only; drop refuted (verify-disproved) candidates. They
+    stay in the raw result JSON for audit but never ship as findings."""
+    return [f for f in (result.get("findings") or []) if f.get("verified") is not False]
+
+
 def to_csv(result: dict, path: str) -> int:
-    findings = result.get("findings") or []
+    findings = _client_findings(result)
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = _csv.writer(fh)
         w.writerow(_HEADERS)
@@ -109,7 +115,7 @@ def to_xlsx(result: dict, path: str, meta: dict | None = None, burp_diff: dict |
     from openpyxl.utils import get_column_letter
     from collections import Counter
 
-    findings = _ordered(result.get("findings") or [])
+    findings = _ordered(_client_findings(result))
     meta = meta or {}
     wb = openpyxl.Workbook()
 
