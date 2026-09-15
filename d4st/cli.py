@@ -479,8 +479,16 @@ def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | No
 
     base = _normalize_target(target)
     host = urlsplit(base).hostname or ""
+    # Keep the unauth sweep bounded so it always completes in a predictable window (the deep
+    # engagement's default nuclei budget is an hour — too long for a one-command scan). Operators
+    # can still override D4ST_NUCLEI_TIMEOUT. --fast additionally trims the heavy CVE/takeover
+    # template corpus to the high-signal exposures/misconfig set.
     if fast:
         depth = min(depth, 2)
+        os.environ.setdefault("D4ST_NUCLEI_FAST", "1")
+        os.environ.setdefault("D4ST_NUCLEI_TIMEOUT", "240")
+    else:
+        os.environ.setdefault("D4ST_NUCLEI_TIMEOUT", "900")
 
     # parse self-test (a stale parser silently under-reports) — warn, do not block an unauth sweep
     try:
