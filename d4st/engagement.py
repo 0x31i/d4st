@@ -2985,6 +2985,26 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[hostheader] skipped: {_hhe}", flush=True)
             _prog.update("host-header", findings, urls=len(urls), targets=len(targets))
 
+            # API data-exposure — JSON endpoints that return bulk records or credential/secret fields
+            # to an unauthenticated caller (excessive data exposure / BOLA-lite). Runs with the same
+            # auth context as the scan (no cookie => the unauth view), so it rates a pre-auth data dump
+            # at its true severity instead of a low-confidence PII line.
+            try:
+                from .apiexposure import scan_api_exposure
+                _ax = scan_api_exposure(urls, cookie, authed=bool(cookie))
+                for _d in _ax:
+                    findings.append(Finding(
+                        tool="api-exposure", category=_d["category"], url=_d["url"],
+                        param="", method=_d.get("method", "GET"), evidence=_d["evidence"],
+                        verified=True, detection=_d["detection"], confidence="firm",
+                        evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
+                if _ax:
+                    print(f"[api-exposure] {len(_ax)} data-exposure finding(s) "
+                          f"(unauthenticated bulk/credential data in API responses)", flush=True)
+            except Exception as _axe:  # noqa: BLE001
+                print(f"[api-exposure] skipped: {_axe}", flush=True)
+            _prog.update("api-exposure", findings, urls=len(urls), targets=len(targets))
+
             # SignalR / WebSocket realtime-channel testing (broken-auth on the socket) — compares an
             # authenticated baseline, so authenticated-only (self-skips in unauth-deep mode).
             if session is not None:
