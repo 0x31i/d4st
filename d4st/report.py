@@ -850,7 +850,10 @@ def build_report(result: dict, target: str = "", meta: dict | None = None,
     PDF stays manageable. Full bodies are always preserved in the xlsx/csv exports.
     """
     meta = meta or {}
-    findings = result.get("findings", []) or []
+    # Client deliverable shows real findings only: drop anything the verify pass REFUTED
+    # (verified is False) — those are false positives d4st's own verification caught. They remain in
+    # the raw result JSON for audit, but a refuted candidate is not a finding and must not ship.
+    findings = [f for f in (result.get("findings", []) or []) if f.get("verified") is not False]
     findings = sorted(findings, key=lambda f: (SEV_RANK.get(_meta_for(f.get("category", "other"))["severity"], 9),
                                                f.get("category", "")))
     sev_counts = Counter(_meta_for(f.get("category", "other"))["severity"] for f in findings)
