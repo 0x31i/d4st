@@ -2500,7 +2500,8 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                    dom: bool = True, tools: bool = True, profile: str = "engagement",
                    zap: bool = True, reauth=None, session_probe: str = "",
                    session_marker: str = "", jwt_refresh=None,
-                   auth_headers: dict | None = None, session=None) -> dict:
+                   auth_headers: dict | None = None, session=None,
+                   unauth_deep: bool = False) -> dict:
     """Full blind flow covering BOTH profiles: blatant injection (DVWA-style) AND the
     hardened-app profile (config/passive + vulnerable JS + API + DOM-based). Returns
     {urls, targets, findings} with findings verified.
@@ -2902,12 +2903,16 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             _prog.update("harvest-authz", findings, urls=len(urls), targets=len(targets))
 
         # ------------------------------------------------------------------ ACTIVE DEPTH SUITE ----
+        # Runs authenticated (session present) OR in unauth-deep mode. The auth-only stages (JWT
+        # forgery, WebSocket broken-auth, two-account BOLA) self-skip when there is no session; the
+        # external-viewpoint stages (verb/method tampering, CORS reflection, host-header injection)
+        # run either way — they need no credentials and add real depth to an unauth pentest.
         # Human-tester depth that a generic DAST/Burp scan does not reach — all READ-ONLY GET (safe
         # under any profile; write-method BFLA and secret live-checks are opt-in only). A single
         # AdaptiveThrottle is shared across the stages so they collectively ease off a target that
         # answers 429/503 (protective — it only ever slows). Each stage maps its dict findings to
         # Finding objects; category drives severity via the report KB (added there).
-        if session is not None and getattr(session, "session_storage", None):
+        if (session is not None and getattr(session, "session_storage", None)) or unauth_deep:
             from .safety import AdaptiveThrottle
             _base_delay = max(0.1, 1.0 / (pol.rps or 4)) if pol else 0.15
             _thr = AdaptiveThrottle(base_delay=_base_delay,
@@ -2927,17 +2932,19 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                         evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
                 return out
 
-            # JWT attack suite — forge alg:none / sig-strip / weak-secret and replay vs a live oracle
-            _refresh_jwt("jwt-attacks")
-            try:
-                from .jwtattacks import run_jwt_attacks
-                _jw = run_jwt_attacks(session, target, urls, delay=_base_delay, throttle=_thr)
-                findings += _as_findings(_jw, "jwt")
-                if _jw:
-                    print(f"[jwt] {len(_jw)} token-integrity finding(s) (forged-token replay)", flush=True)
-            except Exception as _je:  # noqa: BLE001
-                print(f"[jwt] skipped: {_je}", flush=True)
-            _prog.update("jwt-attacks", findings, urls=len(urls), targets=len(targets))
+            # JWT attack suite — forge alg:none / sig-strip / weak-secret and replay vs a live oracle.
+            # Needs a captured token, so it is authenticated-only (self-skips in unauth-deep mode).
+            if session is not None:
+                _refresh_jwt("jwt-attacks")
+                try:
+                    from .jwtattacks import run_jwt_attacks
+                    _jw = run_jwt_attacks(session, target, urls, delay=_base_delay, throttle=_thr)
+                    findings += _as_findings(_jw, "jwt")
+                    if _jw:
+                        print(f"[jwt] {len(_jw)} token-integrity finding(s) (forged-token replay)", flush=True)
+                except Exception as _je:  # noqa: BLE001
+                    print(f"[jwt] skipped: {_je}", flush=True)
+                _prog.update("jwt-attacks", findings, urls=len(urls), targets=len(targets))
 
             # Verb / method tampering (BFLA) — SAFE read-only methods by default
             try:
@@ -2972,21 +2979,23 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[hostheader] skipped: {_hhe}", flush=True)
             _prog.update("host-header", findings, urls=len(urls), targets=len(targets))
 
-            # SignalR / WebSocket realtime-channel testing (broken-auth on the socket)
-            try:
-                from .wstests import run_ws_tests
-                _ws = run_ws_tests(session, target, urls, js_dir=_js_dir, delay=_base_delay, throttle=_thr)
-                findings += _as_findings(_ws, "websocket")
-                if _ws:
-                    print(f"[ws] {len(_ws)} SignalR/WebSocket finding(s)", flush=True)
-            except Exception as _wse:  # noqa: BLE001
-                print(f"[ws] skipped: {_wse}", flush=True)
-            _prog.update("websocket", findings, urls=len(urls), targets=len(targets))
+            # SignalR / WebSocket realtime-channel testing (broken-auth on the socket) — compares an
+            # authenticated baseline, so authenticated-only (self-skips in unauth-deep mode).
+            if session is not None:
+                try:
+                    from .wstests import run_ws_tests
+                    _ws = run_ws_tests(session, target, urls, js_dir=_js_dir, delay=_base_delay, throttle=_thr)
+                    findings += _as_findings(_ws, "websocket")
+                    if _ws:
+                        print(f"[ws] {len(_ws)} SignalR/WebSocket finding(s)", flush=True)
+                except Exception as _wse:  # noqa: BLE001
+                    print(f"[ws] skipped: {_wse}", flush=True)
+                _prog.update("websocket", findings, urls=len(urls), targets=len(targets))
 
             # Two-account horizontal BOLA matrix — fires only when a 2nd session is supplied via
             # D4ST_AUTHZ_SESSION_B (path to a second captured session JSON). Inert otherwise.
             _sb_path = os.environ.get("D4ST_AUTHZ_SESSION_B", "")
-            if _sb_path and os.path.exists(_sb_path):
+            if session is not None and _sb_path and os.path.exists(_sb_path):
                 try:
                     from .auth.session import Session as _Sess
                     from .auth.authz import run_authz_matrix
