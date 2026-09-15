@@ -1468,9 +1468,15 @@ def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[
     # excludes any intrusive/dos/fuzz/brute-force/default-login template that ships inside the
     # dirs we do load. Everything kept is read-only GET/HEAD detection — safe under any policy.
     base = os.path.expanduser("~/nuclei-templates/http")
-    tdirs = [os.path.join(base, d) for d in (
-        "exposures", "misconfiguration", "vulnerabilities", "cves",
-        "exposed-panels", "takeovers", "miscellaneous")]
+    # Fast lane (D4ST_NUCLEI_FAST=1, set by `d4st unauth --fast`): the high-signal, quick dirs only
+    # (exposures + misconfiguration + PII). Skips the slow, DNS-heavy CVE/takeover/panel corpus so a
+    # quick sweep finishes in minutes. Default keeps the full breadth for a deep run.
+    if os.environ.get("D4ST_NUCLEI_FAST") == "1":
+        _dnames = ("exposures", "misconfiguration")
+    else:
+        _dnames = ("exposures", "misconfiguration", "vulnerabilities", "cves",
+                   "exposed-panels", "takeovers", "miscellaneous")
+    tdirs = [os.path.join(base, d) for d in _dnames]
     tdirs.append(os.path.join(os.path.dirname(__file__), "rules", "pii-disclosure.yaml"))
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
         fh.write("\n".join(urls)); path = fh.name
