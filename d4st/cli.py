@@ -421,6 +421,127 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
             console.print(f"[yellow]store ingest skipped[/yellow]: {e}")
 
 
+def _normalize_target(raw: str) -> str:
+    """Accept a bare domain ('example.com'), host:port, or full URL and return a base URL.
+    Prefers https and falls back to http only if https is unreachable, so `d4st unauth example.com`
+    just works."""
+    from urllib.parse import urlsplit
+    raw = raw.strip().rstrip("/")
+    if "://" in raw:
+        return raw
+    # bare domain / host[:port] — probe https, fall back to http
+    import httpx
+    for scheme in ("https", "http"):
+        base = f"{scheme}://{raw}"
+        try:
+            httpx.head(base, verify=False, follow_redirects=True, timeout=8)
+            return base
+        except Exception:  # noqa: BLE001
+            continue
+    return f"https://{raw}"  # default; the crawler will report if it's truly unreachable
+
+
+@main.command()
+@click.argument("target")
+@click.option("--depth", default=4, type=int, show_default=True,
+              help="Crawl depth. Deep by default; --fast lowers it.")
+@click.option("--fast", is_flag=True, default=False,
+              help="Quicker sweep: shallower crawl (depth 2) and a gentler roster. Depth unchanged "
+                   "otherwise — this only trades breadth for speed.")
+@click.option("--profile", default="engagement",
+              type=click.Choice(["engagement", "safe-deep", "production-safe", "passive-only",
+                                 "aggressive", "polite", "normal"]),
+              help="Safety policy (pace + attack contract), independent of depth. DEFAULT "
+                   "'engagement'. Use 'safe-deep' for fragile targets, 'passive-only' for recon-only.")
+@click.option("--out", "-o", "out_path", default=None,
+              help="Findings JSON path. Default: ./d4st-unauth-<host>.json")
+@click.option("--report/--no-report", "want_report", default=True, show_default=True,
+              help="Also write a client-grade HTML report next to the JSON.")
+def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | None,
+           want_report: bool) -> None:
+    """Deep UNAUTHENTICATED scan of a domain — the external-attacker viewpoint, authorized targets only.
+
+    One command, no login, no config: crawl + content discovery + JS route mining + historical URLs,
+    then the full unauth roster (nuclei, ZAP active, XSS, SQLi/cmd injection, LFI/RFI, open-redirect,
+    CORS reflection, host-header injection, verb tampering, TLS hygiene, JS secret disclosure, and the
+    header/config passive checks) — every finding carrying a real request/response + curl repro.
+
+    Pairs with Burp: a second, open-source-tooled viewpoint that digs where a manual pass might not.
+
+        d4st unauth example.com
+        d4st unauth https://app.example.com:8443 --profile safe-deep
+        d4st unauth example.com --fast -o /tmp/ex.json
+    """
+    import json as _json
+    from urllib.parse import urlsplit
+
+    from .engagement import run_engagement
+
+    base = _normalize_target(target)
+    host = urlsplit(base).hostname or ""
+    if fast:
+        depth = min(depth, 2)
+
+    # parse self-test (a stale parser silently under-reports) — warn, do not block an unauth sweep
+    try:
+        from .selftest import run_selftest
+        st = run_selftest()
+        bad = [r for r in st if not r.passed]
+        if bad:
+            for r in bad:
+                console.print(f"[yellow]parser self-test warn[/yellow] {r.check}: {r.detail}")
+        else:
+            console.print(f"[green]parser self-test: {len(st)} checks healthy[/green]")
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[yellow]self-test skipped[/yellow]: {e}")
+
+    console.print(f"[bold]d4st unauth[/bold] · {base} · depth {depth} · profile [cyan]{profile}[/cyan] "
+                  f"· [dim]external / unauthenticated viewpoint[/dim]")
+    console.print("[dim]no session — auth-only stages (JWT forgery, WebSocket auth, BOLA) self-skip; "
+                  "CORS / host-header / verb-tampering run unauthenticated[/dim]")
+
+    # unauth: empty cookie, no session, but run the unauth-safe depth suite
+    result = run_engagement(base, "", host, depth=depth, profile=profile,
+                            auth_headers={}, session=None, unauth_deep=True)
+
+    console.print(f"crawled {len(result['urls'])} urls · {result['targets']} injection targets")
+    table = Table(title=f"unauth scan · {base}")
+    table.add_column("category"); table.add_column("tool"); table.add_column("url")
+    table.add_column("verified"); table.add_column("evidence")
+    for f in sorted(result["findings"], key=lambda x: str(x.get("category"))):
+        v = f["verified"]
+        vtag = "[green]CONFIRMED[/green]" if v is True else ("[red]refuted[/red]" if v is False
+                                                             else "[dim]tool[/dim]")
+        table.add_row(f["category"], f["tool"], (f.get("url") or "")[:44], vtag,
+                      (f["evidence"] or "")[:44])
+    console.print(table)
+    confirmed = sum(1 for f in result["findings"] if f["verified"] is True)
+    console.print(f"findings: {len(result['findings'])} ({confirmed} independently verified)")
+
+    out_path = out_path or f"d4st-unauth-{host or 'target'}.json"
+    with open(out_path, "w", encoding="utf-8") as fh:
+        _json.dump(result, fh, indent=2)
+    console.print(f"findings JSON -> {out_path}")
+
+    if want_report:
+        from .report import build_report
+        rep_path = os.path.splitext(out_path)[0] + ".html"
+        html = build_report(result, target=base, meta={"scope": f"{host} (unauthenticated, external)"})
+        with open(rep_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        console.print(f"HTML report  -> {rep_path}")
+
+    if not os.environ.get("D4ST_NO_INGEST"):
+        try:
+            from . import store
+            sid = _scan_id_for(out_path, base)
+            summ = store.ingest(result, sid)
+            console.print(f"[dim]ingested -> {store.db_path()} as '{sid}' "
+                          f"({summ['findings']} findings)[/dim]")
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[yellow]store ingest skipped[/yellow]: {e}")
+
+
 def _ensure_session(auth: dict, target: str) -> str:
     """Capture a fresh session from the auth profile+creds (or reuse a still-valid stored one).
     Returns the session file path. This is the auto-glue that removes the manual `auth capture` step."""
