@@ -1,6 +1,6 @@
 """Authenticated API-surface harvest for token SPAs.
 
-katana's headless crawl can't carry sessionStorage, so a JWT-in-sessionStorage SPA (APP) bounces
+katana's headless crawl can't carry sessionStorage, so a JWT-in-sessionStorage SPA bounces
 it to /login and the blind crawl finds nothing behind auth. This drives Playwright with the RESTORED
 session (cookies + localStorage + sessionStorage + bearer header), navigates the app's routes, and
 captures every same-origin XHR/fetch the SPA makes at runtime — the real API surface the scanners
@@ -27,7 +27,9 @@ def harvest(session: Session, base: str, routes: list[str] | None = None, *,
     seen: dict[str, dict] = {}
     visited: set[str] = set()
     init = session.session_storage_init_script()
-    to_visit = list(dict.fromkeys((routes or []) + ["/", "/home"]))
+    # Seed with the root plus a few common post-login landing paths; the discovered SPA
+    # route table (passed in via `routes`) supplies the app-specific ones.
+    to_visit = list(dict.fromkeys((routes or []) + ["/", "/home", "/dashboard"]))
 
     def _record(r) -> None:
         if r.resource_type in ("xhr", "fetch") and r.url.startswith(origin):

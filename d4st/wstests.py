@@ -1,5 +1,5 @@
 """SignalR / WebSocket testing — the realtime-channel depth no generic crawler or Burp active scan
-reaches. A .NET chat feature (APP's ChatRoom) almost certainly runs on SignalR over WebSocket; the
+reaches. A .NET chat feature (e.g. a ChatRoom hub) almost certainly runs on SignalR over WebSocket; the
 HTTP crawl never negotiates the hub, so the whole channel goes untested.
 
 What it does (read-only, throttled):

@@ -123,7 +123,7 @@ class TrufflehogAdapter(_DirScanner):
         # --only-verified: trufflehog live-validates each candidate against its real service and
         # emits ONLY confirmed-live secrets. Without it, minified JS bundles produce hundreds of
         # high-entropy FALSE POSITIVES (webpack hashes, base64 assets, minified identifiers) — 154
-        # on the APP chunks. A verified secret is a PROVEN live credential (undeniable finding);
+        # on the app's JS chunks. A verified secret is a PROVEN live credential (undeniable finding);
         # deterministic pattern secrets (connstring/API_KEY/SAS) are still caught by jsdisclosure.
         # D4ST_TRUFFLEHOG_ALL=1 restores the noisy unverified firehose if an operator wants it.
         import os

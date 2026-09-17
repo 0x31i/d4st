@@ -1,7 +1,7 @@
 """Lightweight TLS / certificate hygiene scan (stdlib `ssl` only).
 
 testssl.sh is the gold standard but is far too slow against some hosts (Azure App Service TLS
-probing blew past a 240 s budget on APP). This covers the high-value, Burp-parity classes fast:
+probing blew past a 240 s budget on a large target). This covers the high-value, Burp-parity classes fast:
 certificate validity/expiry/issuer (Burp's "TLS certificate") + deprecated-protocol support
 (TLS 1.0/1.1). Read-only handshakes; no attack traffic.
 """

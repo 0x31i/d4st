@@ -1,7 +1,7 @@
 """JWT attack suite — the token-auth depth a generic DAST/Burp scan does not reach.
 
-APP authenticates with a JWT in sessionStorage. The single highest-value active test for such an
-app is: does the server actually VALIDATE the token, or can we forge one? This module forges a family
+Token-auth SPAs authenticate with a JWT in sessionStorage. The single highest-value active test for
+such an app is: does the server actually VALIDATE the token, or can we forge one? This module forges a family
 of tampered tokens from the live bearer and replays each against a real authenticated endpoint (an
 "oracle" that returns 200 + data when authed). A forged token that still returns that data proves the
 signature/claims are not enforced — full authentication bypass.
@@ -44,8 +44,8 @@ _WEAK_SECRETS = [
     "0123456789", "1234567890", "qwerty", "letmein", "default", "token", "tokensecret",
     "s3cr3t", "s3cret", "SecretKey", "ThisIsASecret", "aaaaaaaa", "12345678", "00000000",
     "hmacsecret", "apikey", "api_secret", "clientsecret", "client_secret", "jwtkey", "authsecret",
-    # APP/.NET-flavoured guesses (product/tenant words seen in the app)
-    "app", "appsecret", "acme", "acme", "issuer", "audience", "IssuerSigningKey",
+    # .NET-flavoured guesses (common in enterprise JWT configs)
+    "issuer", "audience", "IssuerSigningKey", "SymmetricSecurityKey", "MyAppSecret",
 ]
 
 

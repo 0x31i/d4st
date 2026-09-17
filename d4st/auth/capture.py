@@ -22,7 +22,7 @@ from .totp import totp_from_env
 
 def _dump_session_storage(page) -> dict:
     """Snapshot sessionStorage — Playwright's storage_state does NOT include it, and
-    token-auth SPAs (APP keeps its JWT here) are logged-out without it."""
+    token-auth SPAs (which keep their JWT here) are logged-out without it."""
     try:
         return page.evaluate(
             "() => { const o = {}; for (let i = 0; i < sessionStorage.length; i++)"

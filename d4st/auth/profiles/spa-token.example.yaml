@@ -1,0 +1,36 @@
+# Example login recipe: token-auth SPA (JWT-in-sessionStorage — Angular / React / etc).
+# Copy to <yourapp>.yaml and fill in the selectors + markers for your target.
+# Creds come from env (APP_USERNAME / APP_PASSWORD) so they never live in this file.
+# A one-off run can override with:  auth capture -u <user> -w <pass>
+name: spa-token
+type: form
+base_url_env: D4ST_APP_URL
+login_url: "{base}/login"
+username_selector: "input[name=username]"       # e.g. input[formcontrolname=userName]
+password_selector: "input[name=password]"
+submit_selector: "button[type=submit]"
+username_env: APP_USERNAME
+password_env: APP_PASSWORD
+
+# Post-login: a URL fragment + body marker that only appears when authenticated.
+success:
+  url_contains: "/home"
+  body_contains: "Sign out"
+
+validity:
+  url: "{base}/home"
+  body_contains: "Sign out"
+  render: true          # SPA: the logged-in marker is client-rendered, so probe with a browser
+
+totp:
+  enabled: false
+  # For TOTP MFA:  enabled: true, seed_env: APP_TOTP_SEED, selector: "<otp input>"
+
+# Many SPAs keep auth as a Bearer JWT in sessionStorage (not cookies). Capture lifts the
+# named token into "Authorization: Bearer <jwt>" so the HTTP scanners replay it, and restores
+# sessionStorage into the crawl/validity browser so the SPA comes back authenticated.
+token:
+  key: accessToken
+  storage: session
+  header: Authorization
+  scheme: "Bearer "

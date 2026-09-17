@@ -366,7 +366,7 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
     from .art import phase
     phase("CRAWLER", f"authenticated · mapping {host or target} · depth {depth}", "crawl")
 
-    # Token-auth SPA (bearer JWT in sessionStorage): the token is short-lived (APP ~30 min), so a
+    # Token-auth SPA (bearer JWT in sessionStorage): the token is short-lived (often ~30 min), so a
     # long scan must re-mint it or it silently 401s mid-run. Wire a refresh that re-logs-in via the
     # captured profile (creds from its *_env vars, e.g. APP_USERNAME/APP_PASSWORD) and returns the
     # fresh token; run_engagement calls it before each heavy stage.

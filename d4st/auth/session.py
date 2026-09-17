@@ -66,7 +66,7 @@ class Session:
 
     def session_storage_init_script(self) -> str | None:
         """A Playwright init-script that repopulates sessionStorage on every page load.
-        storage_state can't carry sessionStorage, so token-in-sessionStorage SPAs (APP)
+        storage_state can't carry sessionStorage, so token-in-sessionStorage SPAs
         need this to come back authenticated in a restored browser context."""
         if not self.session_storage:
             return None

@@ -2537,7 +2537,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     policy = get_policy(profile)
     pol = policy.politeness
 
-    # Bearer/header auth from the captured session (e.g. APP's Authorization: Bearer <JWT>, lifted
+    # Bearer/header auth from the captured session (e.g. an Authorization: Bearer <JWT>, lifted
     # from sessionStorage at capture). Set globally NOW so every httpx probe (_base_headers), the
     # katana crawl (-H), and the roster (via _session_from_cookie -> translators) run authenticated
     # from the first request — not only after a JWT happens to be discovered mid-crawl.
@@ -2882,7 +2882,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[api-authz] {len(_authz)} BOLA/mass-assignment finding(s)", flush=True)
             _prog.update("api-authz", findings, urls=len(urls), targets=len(targets))
         # Harvest-driven authorization tests — the schema-less path. Most real SPAs expose NO
-        # OpenAPI spec (APP), so run_api_authz_tests above never fires. Instead replay the
+        # OpenAPI spec, so run_api_authz_tests above never fires. Instead replay the
         # authenticated /api endpoints the harvest found under tampered identities (no-auth /
         # bad-token / id-tamper) and diff against the authed baseline. READ-ONLY (GET only, no
         # mutation) + throttled, so it is safe on live/production infra under any active profile;
@@ -3542,7 +3542,7 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         "-config", "scanner.threadPerHost=2",       # fragile single-process targets
         "-config", "connection.timeoutInSecs=30",
     ]
-    # Bearer/header auth (token-auth APIs like APP): the Cookie replacer alone leaves the API
+    # Bearer/header auth (token-auth APIs): the Cookie replacer alone leaves the API
     # scanned UNAUTHENTICATED — the bearer lives in Authorization, not Cookie — so ZAP would only
     # ever hit 401s on the /api surface. Add a replacer entry per active auth header so ZAP attacks
     # the AUTHENTICATED surface. Indexes 1+ (0 is the Cookie replacer above).
