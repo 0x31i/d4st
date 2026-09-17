@@ -20,6 +20,10 @@ console = Console()
 @click.group()
 def main() -> None:
     """d4st: standalone open-source DAST appliance."""
+    # Cosmetic startup banner — stderr-only + TTY-gated, so it never touches
+    # stdout/JSON/reports (see d4st/art.py). No-op in pipelines and CI.
+    from .art import banner
+    banner()
 
 
 @main.command()
@@ -359,6 +363,8 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
         console.print(f"[cyan]safety policy[/cyan]: [bold]{profile}[/bold] — throttled, "
                       f"{'no attack traffic' if profile == 'passive-only' else 'no data mutation / no destructive endpoints / safe sqlmap'}")
     console.print(f"[green]session valid[/green] · crawling {target} blind...")
+    from .art import phase
+    phase("CRAWLER", f"authenticated · mapping {host or target} · depth {depth}", "crawl")
 
     # Token-auth SPA (bearer JWT in sessionStorage): the token is short-lived (APP ~30 min), so a
     # long scan must re-mint it or it silently 401s mid-run. Wire a refresh that re-logs-in via the
@@ -508,6 +514,9 @@ def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | No
     console.print("[dim]no session — auth-only stages (JWT forgery, WebSocket auth, BOLA) self-skip; "
                   "CORS / host-header / verb-tampering run unauthenticated[/dim]")
 
+    from .art import phase
+    phase("CRAWLER", f"mapping {host or base} · depth {depth}", "crawl")
+
     # unauth: empty cookie, no session, but run the unauth-safe depth suite
     result = run_engagement(base, "", host, depth=depth, profile=profile,
                             auth_headers={}, session=None, unauth_deep=True)
@@ -532,6 +541,8 @@ def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | No
     console.print(f"findings JSON -> {out_path}")
 
     if want_report:
+        from .art import phase
+        phase("REPORTER", "writing the client-grade report", "report")
         from .report import build_report
         rep_path = os.path.splitext(out_path)[0] + ".html"
         html = build_report(result, target=base, meta={"scope": f"{host} (unauthenticated, external)"})
@@ -577,6 +588,8 @@ def _ensure_session(auth: dict, target: str) -> str:
     if not auth.get("profile"):
         raise click.ClickException(f"no valid session at {sess_path} and no auth.profile to capture one")
     prof = load_profile(auth["profile"])
+    from .art import phase
+    phase("LOGIN", "capturing a real browser session", "session")
     console.print(f"[cyan]capturing session[/cyan] via {auth['profile']} → {sess_path}")
     if auth.get("interactive"):
         s = capture_interactive(prof, base)
@@ -662,9 +675,25 @@ def init(client: str, target: str, login_url: str | None, scan_profile: str,
         raise click.ClickException(f"target is not a valid URL: {target!r}")
     slug = _re.sub(r"[^a-z0-9]+", "", host.split(".")[0].lower()) or "site"
 
+    # Smart pre-flight: fingerprint the app so we can guide the operator (SPA vs classic,
+    # headless crawl, likely login) and auto-locate the login page instead of guessing /login.
+    login_guess = None
+    try:
+        from .fingerprint import fingerprint_target
+        ap = fingerprint_target(target, host)
+        console.print(f"[cyan]detected[/cyan]: {ap.summary()}")
+        for seed in ap.entry_seeds:
+            if _re.search(r"login|signin|sign-in|auth|account", seed, _re.IGNORECASE):
+                login_guess = seed
+                break
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[dim]fingerprint skipped ({exc}) — proceeding[/dim]")
+
     if record and not auth_profile:
         from .auth.recorder import record_login
-        lu = login_url or target.rstrip("/") + "/login"
+        lu = login_url or login_guess or target.rstrip("/") + "/login"
+        if login_guess and not login_url:
+            console.print(f"[green]login page auto-detected[/green]: {lu}")
         console.print(f"[cyan]recording login[/cyan] at {lu} — a browser will open; log in once.")
         try:
             profile, session = record_login(lu, slug, f"{urlsplit(target).scheme}://{host}")
@@ -699,6 +728,168 @@ def init(client: str, target: str, login_url: str | None, scan_profile: str,
     console.print(f"[green]wrote engagement config[/green] -> {out}")
     console.print(f"[dim]next: export {user_env}/{pass_env}, then:  d4st run {out}"
                   f"   (or dry-check:  d4st run {out} --preflight-only)[/dim]")
+
+
+@main.command()
+@click.option("--target", "-t", default=None,
+              help="Also probe this URL for reachability + app fingerprint.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Machine-readable JSON.")
+def doctor(target: str | None, as_json: bool) -> None:
+    """Health-check the install before you scan: Python, browser, the scanner roster,
+    detection-content freshness, and (with -t) whether a target is reachable.
+
+    Run this FIRST when a scan misbehaves — it tells you exactly what's missing and how
+    to fix it, no guessing.
+
+        d4st doctor
+        d4st doctor -t https://app.example.com
+    """
+    import platform
+    import sys as _sys
+    from urllib.parse import urlsplit
+
+    if as_json:
+        os.environ["D4ST_JSON"] = "1"  # also mutes art
+
+    checks: list[dict] = []
+
+    def add(name: str, status: str, detail: str, hint: str = "") -> None:
+        checks.append({"check": name, "status": status, "detail": detail, "hint": hint})
+
+    # 1. Python
+    v = _sys.version_info
+    add("python", "ok" if v >= (3, 9) else "fail", platform.python_version(),
+        "" if v >= (3, 9) else "d4st needs Python >= 3.9")
+
+    # 2. Headless browser (Playwright + Chromium) — auth capture needs it
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+        browsers = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or \
+            os.path.expanduser("~/.cache/ms-playwright")
+        has_chromium = os.path.isdir(browsers) and any(
+            n.startswith("chromium") for n in (os.listdir(browsers) if os.path.isdir(browsers) else []))
+        add("browser (playwright)", "ok" if has_chromium else "warn",
+            "chromium installed" if has_chromium else "playwright present, chromium not found",
+            "" if has_chromium else "run: python -m playwright install chromium")
+    except Exception:  # noqa: BLE001
+        add("browser (playwright)", "warn", "playwright not importable",
+            "pip install playwright && python -m playwright install chromium (needed only for authenticated scans)")
+
+    # 3. Scanner roster on PATH
+    from .selftest import roster_presence
+    rp = roster_presence()
+    present = [r.tool for r in rp if r.passed]
+    missing = [r.tool for r in rp if not r.passed]
+    r_status = "ok" if not missing else ("warn" if len(present) >= len(rp) // 2 else "fail")
+    add("scanners", r_status, f"{len(present)}/{len(rp)} on PATH"
+        + (f" · missing: {', '.join(missing)}" if missing else ""),
+        "" if not missing else "the Docker image ships the full roster; on a bare host, d4st still "
+        "runs but silently skips missing tools")
+
+    # 4. Detection-content freshness
+    try:
+        from .updater import freshness_report
+        stale = freshness_report()
+        add("detection content", "ok" if not stale else "warn",
+            "fresh" if not stale else "; ".join(stale), "" if not stale else "run: d4st update")
+    except Exception as e:  # noqa: BLE001
+        add("detection content", "warn", f"could not check ({e})", "run: d4st update")
+
+    # 5. Optional target reachability + fingerprint
+    if target:
+        base = _normalize_target(target)
+        host = urlsplit(base).hostname or ""
+        try:
+            from .fingerprint import fingerprint_target
+            ap = fingerprint_target(base, host)
+            add("target reachable", "ok", f"{base} · {ap.summary()}")
+        except Exception as e:  # noqa: BLE001
+            add("target reachable", "fail", f"{base}: {e}",
+                "check DNS + routing from THIS host to the target (the scanner must reach it directly)")
+
+    worst = "ok"
+    for c in checks:
+        if c["status"] == "fail":
+            worst = "fail"; break
+        if c["status"] == "warn":
+            worst = "warn"
+
+    if as_json:
+        console.print_json(data={"verdict": worst, "checks": checks})
+        return
+
+    from .art import phase
+    phase("DOCTOR", "checking your install", "verify")
+    tbl = Table(title="d4st doctor")
+    tbl.add_column("check"); tbl.add_column("status"); tbl.add_column("detail"); tbl.add_column("fix")
+    ico = {"ok": "[green]✓ ok[/green]", "warn": "[yellow]! warn[/yellow]", "fail": "[red]✗ fail[/red]"}
+    for c in checks:
+        tbl.add_row(c["check"], ico[c["status"]], c["detail"], f"[dim]{c['hint']}[/dim]" if c["hint"] else "")
+    console.print(tbl)
+    verdict = {"ok": "[green]ready to scan[/green]", "warn": "[yellow]usable — see warnings above[/yellow]",
+               "fail": "[red]not ready — fix the failures above[/red]"}[worst]
+    console.print(f"verdict: {verdict}")
+    if worst != "fail":
+        console.print("[dim]next:  d4st detect <url>   (fingerprint + recommended command)   ·   "
+                      "d4st unauth <domain>   (one-command external scan)[/dim]")
+
+
+@main.command()
+@click.argument("target")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Machine-readable JSON.")
+def detect(target: str, as_json: bool) -> None:
+    """Fingerprint a target and tell you exactly how to scan it — no scan, no side effects.
+
+    Probes the app, identifies its type (SPA / classic / API) and stack, and prints the
+    recommended next command. The 'what do I run?' answer for anyone new to d4st.
+
+        d4st detect app.example.com
+    """
+    from urllib.parse import urlsplit
+
+    if as_json:
+        os.environ["D4ST_JSON"] = "1"
+    base = _normalize_target(target)
+    host = urlsplit(base).hostname or ""
+    from .fingerprint import fingerprint_target
+    try:
+        ap = fingerprint_target(base, host)
+    except Exception as e:
+        raise click.ClickException(f"could not reach {base}: {e} — is it up + reachable from here?") from e
+
+    authy = ap.app_type in ("spa", "api") or any(
+        "login" in s.lower() or "auth" in s.lower() for s in (ap.signals or []))
+    if authy:
+        rec = [f"d4st init --client <name> --target {base}", "  # guided: records the login once,",
+               "  # writes engagement.yaml, then:  d4st run engagement.yaml"]
+        why = "looks authenticated (SPA/API or a login was detected) — an authed scan sees far more"
+    else:
+        rec = [f"d4st unauth {host or base}"]
+        why = "no login detected — a one-command unauthenticated sweep fits"
+
+    if as_json:
+        console.print_json(data={"target": base, "app_type": ap.app_type, "tech": ap.tech,
+                                 "headless": ap.headless, "signals": ap.signals,
+                                 "entry_seeds": ap.entry_seeds, "authenticated_recommended": authy,
+                                 "recommended": rec})
+        return
+
+    from .art import phase
+    phase("SCOUT", f"fingerprinting {host or base}", "discover")
+    tbl = Table(title=f"detect · {base}")
+    tbl.add_column("property"); tbl.add_column("value")
+    tbl.add_row("app type", f"[cyan]{ap.app_type}[/cyan]")
+    tbl.add_row("stack", ", ".join(ap.tech) or "[dim]generic[/dim]")
+    tbl.add_row("crawl mode", "headless (JS-rendered)" if ap.headless else "plain HTTP")
+    tbl.add_row("links seen", str(ap.seed_link_count))
+    if ap.entry_seeds:
+        tbl.add_row("entry seeds", f"{len(ap.entry_seeds)} discovered")
+    for s in (ap.signals or [])[:6]:
+        tbl.add_row("signal", f"[dim]{s}[/dim]")
+    console.print(tbl)
+    console.print(f"[bold]recommended[/bold] — [dim]{why}[/dim]")
+    for line in rec:
+        console.print(f"  [green]{line}[/green]" if not line.strip().startswith("#") else f"  [dim]{line}[/dim]")
 
 
 def _scan_id_for(out_path: str | None, target: str) -> str:
