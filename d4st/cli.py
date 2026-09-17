@@ -17,9 +17,23 @@ from .orchestrator.workflow import WorkflowRunner, load_workflow
 console = Console()
 
 
-@click.group()
+_EPILOG = """\
+\b
+Getting started:
+  d4st doctor              check the install is healthy
+  d4st scan <url>          fingerprint a target and scan it (the easy button)
+  d4st detect <url>        just fingerprint + print the recommended command
+  d4st init                guided setup for an authenticated (logged-in) scan
+Docs: https://github.com/0x31i/d4st
+"""
+
+
+@click.group(epilog=_EPILOG)
 def main() -> None:
-    """d4st: standalone open-source DAST appliance."""
+    """d4st: standalone open-source DAST appliance.
+
+    New here? Run `d4st doctor` to check your install, then `d4st scan <url>`.
+    """
     # Cosmetic startup banner — stderr-only + TTY-gated, so it never touches
     # stdout/JSON/reports (see d4st/art.py). No-op in pipelines and CI.
     from .art import banner
@@ -890,6 +904,45 @@ def detect(target: str, as_json: bool) -> None:
     console.print(f"[bold]recommended[/bold] — [dim]{why}[/dim]")
     for line in rec:
         console.print(f"  [green]{line}[/green]" if not line.strip().startswith("#") else f"  [dim]{line}[/dim]")
+
+
+@main.command()
+@click.argument("target")
+@click.option("--depth", default=4, type=int, show_default=True, help="Crawl depth.")
+@click.option("--fast", is_flag=True, default=False, help="Quicker, shallower sweep.")
+@click.option("--out", "-o", "out_path", default=None, help="Findings JSON path.")
+def scan(target: str, depth: int, fast: bool, out_path: str | None) -> None:
+    """The easy button: fingerprint a target, then scan it. Authorized targets only.
+
+    Runs a full UNAUTHENTICATED scan (external-attacker viewpoint) — one command, no
+    config. If the target has a login, it tells you how to get deeper authenticated
+    coverage with `d4st init`. When in doubt, start here.
+
+        d4st scan example.com
+        d4st scan https://app.example.com --fast
+    """
+    from urllib.parse import urlsplit
+
+    base = _normalize_target(target)
+    host = urlsplit(base).hostname or ""
+    from .fingerprint import fingerprint_target
+    ap = None
+    try:
+        ap = fingerprint_target(base, host)
+        console.print(f"[cyan]detected[/cyan]: {ap.summary()}")
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[yellow]could not fingerprint[/yellow] ({e}); scanning anyway…")
+
+    authy = bool(ap) and (ap.app_type in ("spa", "api")
+                          or any("login" in s.lower() or "auth" in s.lower() for s in (ap.signals or [])))
+    if authy:
+        console.print("[yellow]🔒 this target looks like it has a login.[/yellow] This unauthenticated "
+                      "scan covers the public surface; for the logged-in surface (far more), run:")
+        console.print(f"   [green]d4st init --client <name> --target {base}[/green]  →  d4st run engagement.yaml\n")
+
+    # Delegate to the fully-wired unauthenticated engagement (crawl + full roster + verify + report).
+    unauth.callback(target=base, depth=depth, fast=fast, profile="engagement",
+                    out_path=out_path, want_report=True)
 
 
 def _scan_id_for(out_path: str | None, target: str) -> str:

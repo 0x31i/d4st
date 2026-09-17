@@ -35,6 +35,53 @@ automated scan tier of a commercial suite. It does not replace a human doing man
 
 ---
 
+## Get started
+
+**You need Docker. That's it** — every scanner ships inside one image, nothing else to install.
+
+**1. Install** — pulls the image, creates a `~/.d4st` workspace, and installs the `d4st` command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/0x31i/d4st/main/install.sh | bash
+d4st doctor          # confirms Docker, the browser, and the scanner roster are ready
+```
+
+**2. Scan something** *(authorized targets only)*:
+
+```bash
+d4st scan example.com          # the easy button: fingerprint → full external scan → HTML report
+```
+
+One command gives you a complete unauthenticated scan with a client-grade report. Not sure what a
+target is first? `d4st detect example.com` fingerprints it and prints the recommended command.
+
+**3. Scan behind a login** — where most of the real coverage is. `d4st init` records the login
+once in a browser and writes a reusable `engagement.yaml`:
+
+```bash
+d4st init --client "Example Corp" --target https://app.example.com
+export APP_USERNAME=... APP_PASSWORD=...    # creds the generated config references
+d4st run engagement.yaml                    # captures the session, then scans authenticated
+```
+
+**Watch it + get the report.** A live console runs at `http://localhost:8810` (`d4st serve`);
+render the client report any time with `d4st report <name> --from-db --client "Example Corp"`.
+
+<details><summary><b>Other setups</b> — air-gapped host · Docker Compose (development) · Windows</summary>
+
+- **Air-gapped** (no ghcr.io egress): load the image from the offline release bundle with
+  [`scripts/airgap-load.sh`](scripts/airgap-load.sh), then run `install.sh` — it detects the
+  loaded image and skips the pull.
+- **Docker Compose** (bind-mounts the source for live code edits):
+  ```bash
+  git clone https://github.com/0x31i/d4st.git && cd d4st
+  docker compose pull && docker compose up -d
+  docker compose exec d4st d4st doctor
+  ```
+- **Windows**: see [`docs/deploy-windows.md`](docs/deploy-windows.md) (runs under WSL2).
+
+</details>
+
 ## Why d4st
 
 - **Authenticated by default.** Most scanners see the login page and stop. d4st captures a real
@@ -89,73 +136,12 @@ current roster:
 | **TLS / infra** | testssl.sh, stdlib cert/protocol check, security-header + tech/version-disclosure passive checks |
 | **Verify / report** | deterministic replay verifier, full req/resp evidence capture, client-grade HTML/PDF + xlsx/csv report, SQLite observability console with live in-flight scan monitoring |
 
-## Install (one command)
-
-Only Docker is required — the installer pulls the image, sets up a workspace, and installs a
-`d4st` command:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/0x31i/d4st/main/install.sh | bash
-d4st doctor                 # health-check: Python, browser, the 27-tool roster, freshness
-d4st detect app.example.com # fingerprint a target and print the command to run
-d4st unauth app.example.com # one-command external (unauthenticated) scan
-```
-
-Air-gapped host (no ghcr.io egress)? Load the image from the offline release bundle with
-[`scripts/airgap-load.sh`](scripts/airgap-load.sh), then run the installer — it skips the pull.
-
-## Quick start (Docker Compose, for development)
-
-The whole scanner stack runs in one container, so you install none of the tools on the host.
-Use Compose when you want the source bind-mounted for live edits:
-
-```bash
-git clone https://github.com/0x31i/d4st.git && cd d4st
-docker compose pull                       # pulls the prebuilt image (ghcr.io/0x31i/d4st:core)
-docker compose up -d
-docker compose exec d4st d4st doctor      # environment check (or `d4st selftest` for the deep parser check)
-```
-
-Onboard a new target in one flow — `d4st init` records the login in a browser (once), detects the
-session token, and writes both the auth profile and a single `engagement.yaml`:
-
-```bash
-d4st init                                 # prompts for client + target, opens a browser to log in
-export APP_USERNAME=… APP_PASSWORD=…      # creds referenced by the generated config
-d4st run engagement.yaml                  # auto-captures the session, exports every knob, scans
-d4st run engagement.yaml --preflight-only # dry readiness check (reachability, bearer, scope) first
-```
-
-`engagement.yaml` declares the whole run — target, scope, auth, scan profile, tuning, an optional
-second account for the BOLA matrix, and egress — so nothing lives in scattered environment variables.
-
-<details><summary>Manual path (no config file)</summary>
-
-```bash
-# capture the login once (headed the first time for SSO / MFA):
-docker compose exec d4st d4st auth capture -p <profile> -b https://app.example.com \
-  -o sessions/app.json --headed
-
-# blind authenticated engagement (crawl -> discover -> scan -> verify -> report):
-docker compose exec d4st d4st engagement -t https://app.example.com \
-  -s sessions/app.json --profile engagement -o results/app.json
-```
-</details>
-
-Watch it live in the console at `http://localhost:8810` — a running scan shows up immediately with a
-per-stage progress feed and findings that grow in real time. Then render the client report:
-
-```bash
-docker compose exec d4st d4st report app --from-db --client "Example Corp" -o results/app.pdf
-```
-
-See [`docs/deploy-windows.md`](docs/deploy-windows.md) for running on a Windows VM via WSL2.
-
 ## Commands
 
 | Command | Purpose |
 |---------|---------|
-| `d4st doctor` | Health-check the install (Python, headless browser, scanner roster, detection freshness, optional target reachability) with a fix for each issue. Run it first. |
+| `d4st scan <url>` | **The easy button.** Fingerprint a target, then run a full unauthenticated scan + report. Points you to `init` if the target has a login. |
+| `d4st doctor` | Health-check the install (Docker, headless browser, scanner roster, detection freshness, optional target reachability) with a fix for each issue. Run it first. |
 | `d4st detect <url>` | Fingerprint a target (SPA / classic / API + stack) and print the recommended next command. No scan, no side effects. |
 | `d4st init` | Guided onboarding: fingerprint the app, record the login in a browser, generate the auth profile + a ready `engagement.yaml`. |
 | `d4st run <engagement.yaml>` | Run a full engagement from one config file (auto-captures session, exports all tuning, scans). `--preflight-only` for a dry readiness check. |
