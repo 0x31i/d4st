@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <video src="https://github.com/0x31i/d4st/raw/main/assets/d4st-intro.mp4" controls muted width="760"></video>
+  <img src="assets/getting-started.gif" alt="d4st scan example.com — one command from install to report" width="850">
 </p>
 
 ---
@@ -46,6 +46,10 @@ curl -fsSL https://raw.githubusercontent.com/0x31i/d4st/main/install.sh | bash
 d4st doctor          # confirms Docker, the browser, and the scanner roster are ready
 ```
 
+<p align="center">
+  <img src="assets/doctor.gif" alt="d4st doctor — install health check" width="720">
+</p>
+
 **2. Scan something** *(authorized targets only)*:
 
 ```bash
@@ -63,6 +67,10 @@ d4st init --client "Example Corp" --target https://app.example.com
 export APP_USERNAME=... APP_PASSWORD=...    # creds the generated config references
 d4st run engagement.yaml                    # captures the session, then scans authenticated
 ```
+
+<p align="center">
+  <img src="assets/authenticated.gif" alt="d4st init then run — authenticated scan" width="800">
+</p>
 
 **Watch it + get the report.** A live console runs at `http://localhost:8810` (`d4st serve`);
 render the client report any time with `d4st report <name> --from-db --client "Example Corp"`.
