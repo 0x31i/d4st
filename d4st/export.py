@@ -9,7 +9,10 @@ the coverage diff (BOTH / d4st-only / Burp-only) so the two tools sit side-by-si
 
 from __future__ import annotations
 
+import base64 as _b64
 import csv as _csv
+from urllib.parse import urlsplit as _urlsplit
+from xml.sax.saxutils import escape as _xesc
 
 from .report import SEV_RANK, _meta_for
 
@@ -106,6 +109,92 @@ def to_csv(result: dict, path: str) -> int:
         w.writerow(_HEADERS)
         for i, f in enumerate(_ordered(findings), 1):
             w.writerow(_row(i, f))
+    return len(findings)
+
+
+# --- Burp Suite XML export --------------------------------------------------------------------
+# Emits the exact shape ASM-NG's Burp importer parses (issues>issue, base64 request/response,
+# severity in {High,Medium,Low,Information}) so d4st findings drop straight onto ASM-NG's BURP
+# page — tagged there as source=d4st. Keep field names in lockstep with _processBurpImport.
+
+# d4st severity -> Burp severity (Burp has no "Critical"; it caps at High).
+_BURP_SEV = {"critical": "High", "high": "High", "medium": "Medium", "low": "Low", "info": "Information"}
+
+
+def _burp_confidence(f: dict) -> str:
+    """Map d4st's deterministic-replay verdict to Burp's confidence vocabulary."""
+    v = f.get("verified")
+    if v is True:
+        return "Certain"        # replay-confirmed
+    if v is False:
+        return "Tentative"      # refuted (normally filtered out before export)
+    return "Firm"               # unverified but detected
+
+
+def _issue_detail(f: dict) -> str:
+    """Everything that proves/locates the issue, minus the request/response (those go in their
+    own base64 elements). Mirrors the xlsx Detection/Payload/Repro columns as prose."""
+    parts = []
+    if f.get("evidence"):
+        parts.append(f"Evidence: {f['evidence']}")
+    if f.get("detection"):
+        parts.append(f"Detection: {f['detection']}")
+    if f.get("param"):
+        parts.append(f"Parameter: {f['param']}")
+    if f.get("payload"):
+        parts.append(f"Payload: {f['payload']}")
+    if f.get("verify_note"):
+        parts.append(f"Verification: {f['verify_note']}")
+    if f.get("repro"):
+        parts.append(f"Repro (curl):\n{f['repro']}")
+    parts.append(f"Detected by: d4st ({f.get('tool', 'd4st')})")
+    return "\n\n".join(parts)
+
+
+def _b64el(text: str) -> str:
+    return _b64.b64encode((text or "").encode("utf-8", errors="replace")).decode("ascii")
+
+
+def to_burp_xml(result: dict, path: str) -> int:
+    """Write client findings as a Burp Suite XML export (issues root). Returns finding count.
+
+    Hand-built XML (not ElementTree) so request/response ship as base64 CDATA-free text elements
+    with base64="true" exactly like Burp Suite Professional's own export — which is what ASM-NG's
+    importburp endpoint decodes.
+    """
+    findings = _ordered(_client_findings(result))
+    lines = ['<?xml version="1.0"?>', '<issues burpVersion="d4st">']
+    for i, f in enumerate(findings, 1):
+        m = _meta_for(f.get("category", "other"))
+        url = f.get("url", "") or ""
+        sp = _urlsplit(url)
+        host = f"{sp.scheme}://{sp.netloc}" if sp.netloc else url
+        path_q = (sp.path or "/") + (("?" + sp.query) if sp.query else "")
+        req, resp = _exchange_text(f.get("evidence_log"))
+        refs = m.get("owasp", "") or ""
+        classifications = ", ".join(x for x in (m.get("cwe", ""), m.get("owasp", "")) if x)
+        lines.append("  <issue>")
+        lines.append(f"    <serialNumber>{i}</serialNumber>")
+        lines.append(f"    <type>{_xesc(f.get('category', ''))}</type>")
+        lines.append(f"    <name>{_xesc(m['title'])}</name>")
+        lines.append(f'    <host ip="">{_xesc(host)}</host>')
+        lines.append(f"    <path>{_xesc(path_q)}</path>")
+        lines.append(f"    <location>{_xesc(f.get('param') or path_q)}</location>")
+        lines.append(f"    <severity>{_BURP_SEV.get(m['severity'], 'Information')}</severity>")
+        lines.append(f"    <confidence>{_burp_confidence(f)}</confidence>")
+        lines.append(f"    <issueBackground>{_xesc(m['desc'])}</issueBackground>")
+        lines.append(f"    <issueDetail>{_xesc(_issue_detail(f))}</issueDetail>")
+        lines.append(f"    <remediationBackground>{_xesc(m['fix'])}</remediationBackground>")
+        lines.append(f"    <references>{_xesc(refs)}</references>")
+        lines.append(f"    <vulnerabilityClassifications>{_xesc(classifications)}</vulnerabilityClassifications>")
+        lines.append("    <requestresponse>")
+        lines.append(f'      <request base64="true">{_b64el(req)}</request>')
+        lines.append(f'      <response base64="true">{_b64el(resp)}</response>')
+        lines.append("    </requestresponse>")
+        lines.append("  </issue>")
+    lines.append("</issues>")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
     return len(findings)
 
 

@@ -1050,8 +1050,9 @@ def update(status: bool, components: tuple) -> None:
               help="Cap giant response bodies / raw output on medium/low/info findings "
                    "(critical & high keep full evidence).")
 @click.option("--format", "fmt", default="auto",
-              help="Report format(s): comma list of html,xlsx,csv,pdf (or 'all'). Default 'auto' "
-                   "= infer from the --out extension. Files share the --out basename.")
+              help="Report format(s): comma list of html,xlsx,csv,pdf,burp (or 'all'). 'burp' "
+                   "writes Burp Suite XML for import onto ASM-NG's BURP page. Default 'auto' "
+                   "= infer from the --out extension (.xml -> burp). Files share the --out basename.")
 @click.option("--open", "open_it", is_flag=True, default=False, help="Open the report after writing.")
 def report(source: str, out: str, target: str, client: str | None, scope: str | None,
            window: str | None, prepared_by: str | None, ref: str | None, logo: str | None,
@@ -1080,9 +1081,10 @@ def report(source: str, out: str, target: str, client: str | None, scope: str | 
     if fmt.strip().lower() == "auto":
         fmts = ["pdf"] if out.lower().endswith(".pdf") else \
                ["csv"] if out.lower().endswith(".csv") else \
+               ["burp"] if out.lower().endswith(".xml") else \
                ["xlsx"] if out.lower().endswith((".xlsx", ".xls")) else ["html"]
     elif fmt.strip().lower() == "all":
-        fmts = ["html", "xlsx", "csv", "pdf"]
+        fmts = ["html", "xlsx", "csv", "pdf", "burp"]
     else:
         fmts = [x.strip().lower() for x in fmt.split(",") if x.strip()]
     _html = None
@@ -1106,6 +1108,11 @@ def report(source: str, out: str, target: str, client: str | None, scope: str | 
             from .export import to_csv
             p = base + ".csv"
             to_csv(result, p)
+        elif fm == "burp":
+            # Burp Suite XML — upload on ASM-NG's BURP page (tagged source=d4st there).
+            from .export import to_burp_xml
+            p = base + ".burp.xml"
+            to_burp_xml(result, p)
         else:
             continue
         written.append(p)
