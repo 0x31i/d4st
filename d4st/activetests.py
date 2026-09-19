@@ -460,6 +460,119 @@ def run_backup_scan(session, base: str, urls: list[str], *,
     return findings
 
 
+_XFORM_MARK = "d4stX9"
+_XF_A, _XF_B = 419, 823          # distinctive operands; product 344837 is unlikely to occur naturally
+
+
+def run_transformation_checks(session, base: str, urls: list[str], *,
+                              delay: float = 0.2, timeout: float = 12.0, max_urls: int = 25,
+                              max_params: int = 4, max_hits: int = 10, throttle=None) -> list[dict]:
+    """Suspicious input transformation (Burp's check). For each in-scope URL with query parameters,
+    inject marker-anchored probes and detect when the app TRANSFORMS the input in a security-relevant
+    way:
+      * expression/template evaluation — '<mark>{{419*823}}' (and ${..}/#{..}/<%=..%> variants) comes
+        back as '<mark>344837' => the app evaluated our expression (server-side template injection).
+      * string-escape transformation — '<mark>'' comes back backslash-escaped ('<mark>\\'') or a
+        backslash is doubled => our input lands in a string-parsing context (SQL/JS injection tell).
+    Marker-anchored => near-zero FP (HTML output-encoding produces &#39;/&quot;, not these). READ-ONLY
+    GET; throttled; capped."""
+    import httpx
+    from urllib.parse import parse_qsl, quote
+    from urllib.parse import urlsplit as _us
+    from urllib.parse import urlunsplit
+
+    from .safety import pace
+    origin = f"{_us(base).scheme}://{_us(base).netloc}"
+    cand: list = []
+    for u in urls:
+        if u.startswith(origin):
+            sp = _us(u)
+            if sp.query:
+                cand.append(sp)
+        if len(cand) >= max_urls:
+            break
+    if not cand:
+        return []
+    authed = _authed_headers(session, base)
+    product = str(_XF_A * _XF_B)
+    ssti_payloads = [
+        f"{_XFORM_MARK}{{{{{_XF_A}*{_XF_B}}}}}",   # {{419*823}}
+        f"{_XFORM_MARK}${{{_XF_A}*{_XF_B}}}",       # ${419*823}
+        f"{_XFORM_MARK}#{{{_XF_A}*{_XF_B}}}",       # #{419*823}
+        f"{_XFORM_MARK}<%={_XF_A}*{_XF_B}%>",       # <%=419*823%>
+        f"{_XFORM_MARK}{{{_XF_A}*{_XF_B}}}",        # {419*823}
+    ]
+
+    def build(sp, idx, val, params):
+        qparts = [f"{k}={quote(val, safe='')}" if j == idx else f"{k}={quote(vv, safe='')}"
+                  for j, (k, vv) in enumerate(params)]
+        return urlunsplit((sp.scheme, sp.netloc, sp.path, "&".join(qparts), ""))
+
+    findings: list[dict] = []
+    with httpx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
+        for sp in cand:
+            params = parse_qsl(sp.query, keep_blank_values=True)
+            done = False
+            for i, (pn, _pv) in enumerate(params[:max_params]):
+                # (1) expression/template evaluation — strongest signal, report as SSTI
+                for pay in ssti_payloads:
+                    try:
+                        r = c.get(build(sp, i, pay, params), headers=authed)
+                        pace(throttle, delay, r.status_code)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if (_XFORM_MARK + product) in (r.text or ""):
+                        findings.append({
+                            "type": "server-side-template-injection",
+                            "name": "suspicious-input-transformation (expression evaluated)",
+                            "severity": "high", "url": build(sp, i, pay, params), "method": "GET",
+                            "category": "server-side-template-injection", "verified": True,
+                            "detail": f"parameter '{pn}' is evaluated server-side: our injected "
+                                      f"expression '{pay[len(_XFORM_MARK):]}' returned as "
+                                      f"'{_XFORM_MARK}{product}' ({_XF_A}*{_XF_B}={product}). The "
+                                      "application evaluates input as a template/expression — "
+                                      "server-side template injection, frequently escalating to RCE.",
+                            "evidence_log": [exchange(
+                                f"PROOF — '{pn}' expression evaluated to {product}", r)],
+                            "repro": curl(r),
+                        })
+                        done = True
+                        break
+                if done:
+                    break
+                # (2) string-escape transformation — quote/backslash escaping (SQL/JS string context)
+                for probe, escaped, kind in (
+                        (_XFORM_MARK + "'", _XFORM_MARK + "\\'", "single-quote backslash-escaped"),
+                        (_XFORM_MARK + "\\", _XFORM_MARK + "\\\\", "backslash doubled")):
+                    try:
+                        r = c.get(build(sp, i, probe, params), headers=authed)
+                        pace(throttle, delay, r.status_code)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if escaped in (r.text or ""):
+                        findings.append({
+                            "type": "suspicious-input-transformation",
+                            "name": "suspicious-input-transformation (string escaping)",
+                            "severity": "medium", "url": build(sp, i, probe, params), "method": "GET",
+                            "category": "suspicious-input-transformation", "verified": True,
+                            "detail": f"parameter '{pn}' is transformed in a string-parsing context "
+                                      f"({kind}): our input came back escaped rather than "
+                                      "output-encoded. Input reaching a SQL/JS string context this "
+                                      "way is a classic injection precursor — probe for SQLi/JS "
+                                      "injection on this parameter.",
+                            "evidence_log": [exchange(
+                                f"PROOF — '{pn}' {kind}", r)],
+                            "repro": curl(r),
+                        })
+                        done = True
+                        break
+                if done:
+                    break
+            if len(findings) >= max_hits:
+                break
+    return findings
+
+
 _REFL_MARK = "d4stR3f"
 
 

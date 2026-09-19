@@ -3021,6 +3021,18 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[reflect] skipped: {_rfe}", flush=True)
             _prog.update("reflected-input", findings, urls=len(urls), targets=len(targets))
 
+            # Suspicious input transformation — expression/template evaluation (SSTI) and string-escape
+            # transformation (SQL/JS string-context tell). Marker-anchored, near-zero FP.
+            try:
+                from .activetests import run_transformation_checks
+                _xf = run_transformation_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_xf, "transform")
+                if _xf:
+                    print(f"[transform] {len(_xf)} suspicious-input-transformation finding(s)", flush=True)
+            except Exception as _xfe:  # noqa: BLE001
+                print(f"[transform] skipped: {_xfe}", flush=True)
+            _prog.update("input-transformation", findings, urls=len(urls), targets=len(targets))
+
             # API data-exposure — JSON endpoints that return bulk records or credential/secret fields
             # to an unauthenticated caller (excessive data exposure / BOLA-lite). Runs with the same
             # auth context as the scan (no cookie => the unauth view), so it rates a pre-auth data dump
