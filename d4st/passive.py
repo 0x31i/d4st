@@ -10,9 +10,12 @@ Deterministic + low-FP; no browser required. Findings are site-level (deduped by
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+
+_log = logging.getLogger("d4st.passive")
 
 _MISCONFIG = "misconfiguration"
 _INFO = "info-disclosure"
@@ -43,9 +46,23 @@ def check_response(url: str, status: int, headers: dict, body: str,
     def add(check, cat, detail, sev="low"):
         out.append(PassiveFinding(check=check, category=cat, url=url, detail=detail, severity=sev))
 
-    # HSTS (only meaningful over HTTPS)
-    if _is_https(url) and "strict-transport-security" not in h:
-        add("hsts-not-enforced", _MISCONFIG, "no Strict-Transport-Security header")
+    # HSTS (only meaningful over HTTPS) — flag missing AND weak policies
+    if _is_https(url):
+        hsts = h.get("strict-transport-security", "")
+        if not hsts:
+            add("hsts-not-enforced", _MISCONFIG, "no Strict-Transport-Security header")
+        else:
+            m = re.search(r"max-age\s*=\s*(\d+)", hsts, re.IGNORECASE)
+            max_age = int(m.group(1)) if m else 0
+            weak = []
+            if not m:
+                weak.append("no max-age directive")
+            elif max_age < 15552000:  # < 180 days
+                weak.append(f"max-age={max_age} (< 180 days)")
+            if "includesubdomains" not in hsts.lower():
+                weak.append("missing includeSubDomains")
+            if weak:
+                add("hsts-weak", _MISCONFIG, "weak HSTS policy: " + "; ".join(weak))
 
     # Clickjacking: neither X-Frame-Options nor CSP frame-ancestors
     csp = h.get("content-security-policy", "")
@@ -124,7 +141,47 @@ def check_response(url: str, status: int, headers: dict, body: str,
             add("path-relative-css", _MISCONFIG, f"path-relative stylesheet import: {href.group(1)}")
             break
 
+    # Mixed content: an HTTPS page pulling ACTIVE subresources over plaintext http://
+    if _is_https(url) and "text/html" in h.get("content-type", "").lower():
+        mixed = re.findall(
+            r'<(?:script|link|iframe|img|source|audio|video)\b[^>]+(?:src|href)=["\']?(http://[^"\'>\s]+)',
+            body, re.IGNORECASE)
+        if mixed:
+            add("mixed-content", _MISCONFIG,
+                f"HTTPS page references {len(mixed)} plaintext http:// subresource(s), "
+                f"e.g. {mixed[0][:120]}", sev="medium")
+
     return out
+
+
+def _check_http_service(host: str, base_headers: dict) -> PassiveFinding | None:
+    """Probe the plaintext http:// listener for a host. Flags a finding when the site serves
+    content over cleartext HTTP without upgrading to HTTPS (Burp's 'Unencrypted communications').
+    Returns None when http correctly 301/302-redirects to https, or the port is closed/errors."""
+    import httpx
+    url = f"http://{host}/"
+    try:
+        r = httpx.get(url, headers=base_headers, follow_redirects=False, timeout=10)
+    except Exception as e:  # noqa: BLE001
+        _log.debug("cleartext probe failed for %s: %s", url, e)
+        return None
+    loc = r.headers.get("location", "") or ""
+    if 300 <= r.status_code < 400 and loc.lower().startswith("https://"):
+        return None  # plaintext listener correctly upgrades to HTTPS
+    if r.status_code >= 400:
+        return None  # listener answered an error; not clearly serving cleartext content — avoid FP
+    # 2xx over http, or a redirect that stays on http:// → real cleartext exposure
+    detail = (f"service reachable over plaintext HTTP (status {r.status_code}"
+              + (f", redirects to {loc[:80]}" if loc else ", no HTTPS upgrade") + ")")
+    proof = {
+        "label": "plaintext HTTP response",
+        "request": {"method": "GET", "url": url, "headers": {}, "body": ""},
+        "response": {"status": r.status_code, "headers": dict(r.headers),
+                     "elapsed_ms": None, "size": len(r.text or ""),
+                     "body": (r.text or "")[:4000], "truncated": len(r.text or "") > 4000},
+    }
+    return PassiveFinding(check="cleartext-service", category=_MISCONFIG, url=url,
+                          detail=detail, severity="medium", response=proof)
 
 
 def passive_scan(urls: list[str], cookie: str, cap: int = 40) -> list[PassiveFinding]:
@@ -132,16 +189,25 @@ def passive_scan(urls: list[str], cookie: str, cap: int = 40) -> list[PassiveFin
     import httpx
     headers = {"Cookie": cookie} if cookie else {}
     seen: set = set()
+    http_probed: set = set()
     out: list[PassiveFinding] = []
     for url in urls[:cap]:
         host = urlsplit(url).hostname or ""
+        # Once per host: is the plaintext HTTP service reachable without upgrading to HTTPS?
+        if host and host not in http_probed:
+            http_probed.add(host)
+            hf = _check_http_service(host, headers)
+            if hf and ("cleartext-service", host) not in seen:
+                seen.add(("cleartext-service", host))
+                out.append(hf)
         try:
             r = httpx.get(url, headers=headers, follow_redirects=True, timeout=12)
             # CORS probe: does the server reflect an evil Origin?
             cr = httpx.get(url, headers={**headers, "Origin": "https://evil.example"},
                            follow_redirects=True, timeout=12)
             acao = cr.headers.get("access-control-allow-origin")
-        except Exception:  # noqa: BLE001, S112
+        except Exception as e:  # noqa: BLE001, S112
+            _log.debug("passive fetch failed for %s: %s", url, e)
             continue
         set_cookies = r.headers.get_list("set-cookie") if hasattr(r.headers, "get_list") else []
         # The response IS the proof for a passive finding (the headers that are missing/present).

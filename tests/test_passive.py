@@ -52,3 +52,23 @@ def test_version_disclosure():
 def test_path_relative_css():
     body = '<link rel="stylesheet" href="styles/main.css">'
     assert "path-relative-css" in _checks(headers={"Content-Type": "text/html"}, body=body)
+
+
+def test_hsts_weak_short_maxage():
+    c = _checks(headers={"Strict-Transport-Security": "max-age=3600"})
+    assert "hsts-weak" in c and "hsts-not-enforced" not in c
+
+
+def test_hsts_strong_not_flagged_weak():
+    c = _checks(headers={"Strict-Transport-Security": "max-age=31536000; includeSubDomains"})
+    assert "hsts-weak" not in c and "hsts-not-enforced" not in c
+
+
+def test_mixed_content_flagged():
+    body = '<script src="http://cdn.example/x.js"></script>'
+    assert "mixed-content" in _checks(headers={"Content-Type": "text/html"}, body=body)
+
+
+def test_mixed_content_https_subresource_ok():
+    body = '<script src="https://cdn.example/x.js"></script>'
+    assert "mixed-content" not in _checks(headers={"Content-Type": "text/html"}, body=body)

@@ -2985,6 +2985,30 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[hostheader] skipped: {_hhe}", flush=True)
             _prog.update("host-header", findings, urls=len(urls), targets=len(targets))
 
+            # Client-side HTTP parameter pollution (CSPP) — canary-verified reflection of an
+            # injected parameter into a page link/form URL (Burp-parity, near-zero FP).
+            try:
+                from .activetests import run_cspp_checks
+                _cp = run_cspp_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_cp, "cspp")
+                if _cp:
+                    print(f"[cspp] {len(_cp)} client-side param-pollution finding(s)", flush=True)
+            except Exception as _cpe:  # noqa: BLE001
+                print(f"[cspp] skipped: {_cpe}", flush=True)
+            _prog.update("cspp", findings, urls=len(urls), targets=len(targets))
+
+            # Backup/temp file exposure — probe .bak/.old/~/.swp/.zip variants of discovered files,
+            # with a catch-all/soft-404 guard so we don't inherit phantom "backup file" FPs.
+            try:
+                from .activetests import run_backup_scan
+                _bk = run_backup_scan(session, target, urls, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_bk, "backup")
+                if _bk:
+                    print(f"[backup] {len(_bk)} backup/temp file exposure(s)", flush=True)
+            except Exception as _bke:  # noqa: BLE001
+                print(f"[backup] skipped: {_bke}", flush=True)
+            _prog.update("backup-files", findings, urls=len(urls), targets=len(targets))
+
             # API data-exposure — JSON endpoints that return bulk records or credential/secret fields
             # to an unauthenticated caller (excessive data exposure / BOLA-lite). Runs with the same
             # auth context as the scan (no cookie => the unauth view), so it rates a pre-auth data dump

@@ -280,6 +280,186 @@ def run_host_header_injection(session, base: str, urls: list[str], *,
     return findings
 
 
+_CSPP_MARK = "d4stZ9"
+
+
+def run_cspp_checks(session, base: str, urls: list[str], *,
+                    delay: float = 0.2, timeout: float = 12.0, max_urls: int = 25,
+                    throttle=None) -> list[dict]:
+    """Client-side HTTP parameter pollution (CSPP). For each in-scope URL that carries query
+    parameters, inject a canary value that DECODES to '<mark>&cspp=1' into one parameter and see
+    whether the app reflects it into a link/form URL WITHOUT re-encoding — i.e. an extra '&cspp=1'
+    parameter appears inside an href/src/action query string in the page. If it does, an attacker
+    can add or override parameters on the URLs a victim clicks. Canary-verified (near-zero FP):
+    we only report when our injected parameter actually materialises in a page URL. READ-ONLY GET."""
+    import httpx
+    from urllib.parse import parse_qsl, quote
+    from urllib.parse import urlsplit as _us
+    from urllib.parse import urlunsplit
+
+    from .safety import pace
+    origin = f"{_us(base).scheme}://{_us(base).netloc}"
+    cand: list = []
+    for u in urls:
+        if not u.startswith(origin):
+            continue
+        sp = _us(u)
+        if sp.query:
+            cand.append(sp)
+        if len(cand) >= max_urls:
+            break
+    if not cand:
+        return []
+    authed = _authed_headers(session, base)
+    inj = f"{_CSPP_MARK}%26cspp%3d1"   # sent as-is in the query; server decodes to <mark>&cspp=1
+    # a page URL where our injected param landed inside a query string
+    hit_re = re.compile(r'(?:href|src|action)\s*=\s*["\'][^"\']*[?&]cspp=1\b', re.IGNORECASE)
+    findings: list[dict] = []
+    with httpx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
+        for sp in cand:
+            params = parse_qsl(sp.query, keep_blank_values=True)
+            for i, (pn, _pv) in enumerate(params):
+                qparts = [f"{k}={inj}" if j == i else f"{k}={quote(vv, safe='')}"
+                          for j, (k, vv) in enumerate(params)]
+                test_url = urlunsplit((sp.scheme, sp.netloc, sp.path, "&".join(qparts), ""))
+                try:
+                    r = c.get(test_url, headers=authed)
+                    pace(throttle, delay, r.status_code)
+                except Exception:  # noqa: BLE001
+                    continue
+                body = r.text or ""
+                if _CSPP_MARK in body and hit_re.search(body):
+                    findings.append({
+                        "type": "client-side-param-pollution",
+                        "name": "client-side-param-pollution",
+                        "severity": "medium", "url": test_url, "method": "GET",
+                        "category": "client-side-param-pollution", "verified": True,
+                        "detail": f"parameter '{pn}' is reflected into a page link's query string "
+                                  f"without encoding — our injected '&cspp=1' appears as a distinct "
+                                  f"parameter on a URL in the response (client-side HTTP parameter "
+                                  f"pollution). An attacker can add or override query parameters on "
+                                  f"links/forms the victim interacts with.",
+                        "evidence_log": [exchange(
+                            f"PROOF — injected '&cspp=1' via '{pn}' reflected into a page URL", r)],
+                        "repro": curl(r),
+                    })
+                    return findings   # one canary-verified proof is enough
+    return findings
+
+
+_BACKUP_SUFFIXES = (".bak", ".old", ".orig", ".save", ".copy", ".tmp", ".1",
+                    ".zip", ".gz", ".tar.gz", ".rar", ".7z")
+
+
+def _looks_like_file(path: str) -> bool:
+    seg = path.rsplit("/", 1)[-1]
+    return "." in seg and not path.endswith("/")
+
+
+def _body_sig(r) -> tuple:
+    """Coarse content signature to compare a hit against the catch-all baseline."""
+    body = r.text or ""
+    return (r.status_code, len(body) // 64, hash(body[:256]))
+
+
+def _backup_variants(url: str) -> list[str]:
+    from urllib.parse import urlsplit as _us
+    from urllib.parse import urlunsplit
+    sp = _us(url)
+    p = sp.path
+    seg = p.rsplit("/", 1)[-1]
+    base_dir = p[: len(p) - len(seg)]
+    paths = [base_dir + seg + suf for suf in _BACKUP_SUFFIXES]
+    paths.append(base_dir + seg + "~")            # editor backup
+    paths.append(base_dir + "." + seg + ".swp")   # vim swap file
+    if "." in seg:
+        stem = seg.rsplit(".", 1)[0]
+        paths.append(base_dir + stem + ".bak")
+        paths.append(base_dir + stem + ".zip")
+    seen: set = set()
+    out: list[str] = []
+    for pp in paths:
+        if pp in seen:
+            continue
+        seen.add(pp)
+        out.append(urlunsplit((sp.scheme, sp.netloc, pp, "", "")))
+    return out
+
+
+def run_backup_scan(session, base: str, urls: list[str], *,
+                    delay: float = 0.2, timeout: float = 12.0, max_files: int = 30,
+                    max_hits: int = 12, throttle=None) -> list[dict]:
+    """Probe backup/temp permutations of discovered files (name.ext.bak/.old/~/.swp/.zip/...).
+    Guards against the OWA-style catch-all responder that makes commercial scanners report dozens
+    of phantom 'backup file' hits: first establish whether the server returns 200 for random
+    non-existent *.bak paths, and if so only report a variant whose body DIFFERS from that
+    catch-all baseline. READ-ONLY GET; throttled; capped."""
+    import secrets
+
+    import httpx
+    from urllib.parse import urlsplit as _us
+
+    from .safety import pace
+    origin = f"{_us(base).scheme}://{_us(base).netloc}"
+    files: list[str] = []
+    seen_files: set = set()
+    for u in urls:
+        if not u.startswith(origin):
+            continue
+        sp = _us(u)
+        key = sp.path
+        if _looks_like_file(sp.path) and key not in seen_files:
+            seen_files.add(key)
+            files.append(f"{sp.scheme}://{sp.netloc}{sp.path}")
+        if len(files) >= max_files:
+            break
+    if not files:
+        return []
+    authed = _authed_headers(session, base)
+    findings: list[dict] = []
+    with httpx.Client(verify=False, follow_redirects=False, timeout=timeout) as c:
+        # Catch-all / soft-404 baseline: do random non-existent *.bak paths return 200?
+        catchall_sigs: list = []
+        catchall = False
+        for _ in range(2):
+            probe = f"{origin}/d4st_{secrets.token_hex(8)}.bak"
+            try:
+                rp = c.get(probe, headers=authed)
+            except Exception:  # noqa: BLE001
+                rp = None
+            if rp is not None and rp.status_code == 200:
+                catchall = True
+                catchall_sigs.append(_body_sig(rp))
+        for f in files:
+            for variant in _backup_variants(f):
+                try:
+                    r = c.get(variant, headers=authed)
+                    pace(throttle, delay, r.status_code)
+                except Exception:  # noqa: BLE001
+                    continue
+                if r.status_code != 200 or not (r.text or "").strip():
+                    continue
+                # FP guard: on a catch-all server, a real backup must differ from the baseline body
+                if catchall and _body_sig(r) in catchall_sigs:
+                    continue
+                findings.append({
+                    "type": "backup-file-exposure", "name": "backup-file-exposure",
+                    "severity": "medium", "url": variant, "method": "GET",
+                    "category": "info-disclosure", "verified": True,
+                    "detail": f"a backup/temporary copy is directly accessible ({variant}) — returns "
+                              f"HTTP 200 with content"
+                              + (" that differs from the server's catch-all response" if catchall else "")
+                              + ". Backup/temp files frequently expose source code, credentials, or "
+                              "configuration.",
+                    "evidence_log": [exchange("PROOF — backup/temp file accessible over HTTP", r)],
+                    "repro": curl(r),
+                })
+                if len(findings) >= max_hits:
+                    return findings
+                break  # one backup variant per file is enough proof
+    return findings
+
+
 # ---------------------------------------------------- secret live-validation ----
 _KEY_KINDS = [
     ("google-api-key", re.compile(r"AIza[0-9A-Za-z_\-]{20,}")),
