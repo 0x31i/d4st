@@ -35,6 +35,67 @@ def _is_https(url: str) -> bool:
     return urlsplit(url).scheme == "https"
 
 
+_CSP_DIRECTIVES = {
+    "default-src", "script-src", "script-src-elem", "script-src-attr", "style-src",
+    "style-src-elem", "style-src-attr", "img-src", "connect-src", "font-src", "object-src",
+    "media-src", "frame-src", "child-src", "worker-src", "manifest-src", "prefetch-src",
+    "frame-ancestors", "form-action", "base-uri", "navigate-to", "report-uri", "report-to",
+    "sandbox", "upgrade-insecure-requests", "block-all-mixed-content", "require-trusted-types-for",
+    "trusted-types", "plugin-types", "referrer", "require-sri-for",
+}
+
+
+def _parse_csp(csp: str) -> dict:
+    out: dict = {}
+    for part in csp.split(";"):
+        toks = part.strip().split()
+        if toks:
+            out[toks[0].lower()] = [t.lower() for t in toks[1:]]
+    return out
+
+
+def analyze_csp(csp: str) -> list[tuple]:
+    """Parse a PRESENT Content-Security-Policy and flag weak directives the way a commercial DAST
+    does. Returns (check, detail, severity) tuples. Clickjacking is intentionally left to the
+    dedicated X-Frame-Options/frame-ancestors check to avoid double-reporting."""
+    d = _parse_csp(csp)
+    out: list[tuple] = []
+    unknown = [n for n in d if n not in _CSP_DIRECTIVES]
+    if unknown:
+        out.append(("csp-malformed", _MISCONFIG,
+                    f"CSP contains invalid directive(s) that browsers will NOT enforce: "
+                    f"{', '.join(sorted(unknown))[:120]}", "low"))
+
+    def srcs(name: str):
+        if name in d:
+            return d[name]
+        return d.get("default-src")  # None if neither present
+
+    ss = srcs("script-src")
+    if ss is None:
+        out.append(("csp-allows-untrusted-script", _MISCONFIG,
+                    "CSP defines no script-src or default-src — untrusted script execution is not "
+                    "restricted (CSP fails to mitigate XSS)", "medium"))
+    elif any(t in ("'unsafe-inline'", "'unsafe-eval'", "*", "http:", "https:", "data:") for t in ss) \
+            and "'strict-dynamic'" not in ss:
+        weak = [t for t in ss if t in ("'unsafe-inline'", "'unsafe-eval'", "*", "http:", "https:", "data:")]
+        out.append(("csp-allows-untrusted-script", _MISCONFIG,
+                    f"script-src permits untrusted execution ({' '.join(weak)[:80]}) — CSP may fail "
+                    "to mitigate cross-site scripting", "medium"))
+
+    st = srcs("style-src")
+    if st is not None and any(t in ("'unsafe-inline'", "*") for t in st):
+        out.append(("csp-allows-untrusted-style", _MISCONFIG,
+                    "style-src allows untrusted styles ('unsafe-inline' or *) — enables style-based "
+                    "data exfiltration", "low"))
+
+    if "form-action" not in d:
+        out.append(("csp-allows-form-hijacking", _MISCONFIG,
+                    "CSP has no form-action directive — an injected form can post credentials to an "
+                    "attacker-controlled URL (form hijacking)", "low"))
+    return out
+
+
 def check_response(url: str, status: int, headers: dict, body: str,
                    set_cookies: list[str], cors_acao: str | None = None) -> list[PassiveFinding]:
     """headers: case-insensitive dict-ish (lowercased keys). set_cookies: raw Set-Cookie lines.
@@ -69,9 +130,12 @@ def check_response(url: str, status: int, headers: dict, body: str,
     if "x-frame-options" not in h and "frame-ancestors" not in csp.lower():
         add("clickjacking", _MISCONFIG, "no X-Frame-Options / CSP frame-ancestors (frameable)")
 
-    # CSP missing
+    # CSP: missing entirely, or present-but-weak (policy analysis)
     if "content-security-policy" not in h:
         add("csp-missing", _MISCONFIG, "no Content-Security-Policy header")
+    else:
+        for chk, cat, detail, sev in analyze_csp(h["content-security-policy"]):
+            add(chk, cat, detail, sev)
 
     # CORS: server reflects an arbitrary Origin, or wildcards with credentials
     if cors_acao is not None:
@@ -139,6 +203,16 @@ def check_response(url: str, status: int, headers: dict, body: str,
         href = re.search(r'href=["\']([^"\']+)["\']', m.group(0), re.IGNORECASE)
         if href and not href.group(1).startswith(("/", "http", "//", "data:")):
             add("path-relative-css", _MISCONFIG, f"path-relative stylesheet import: {href.group(1)}")
+            break
+
+    # Cross-domain script include: a <script src> pulled from a third-party origin
+    page_host = urlsplit(url).hostname or ""
+    for m in re.finditer(r'<script\b[^>]+src=["\']([^"\']+)["\']', body, re.IGNORECASE):
+        s = urlsplit(m.group(1))
+        if s.scheme in ("http", "https") and s.hostname and s.hostname != page_host:
+            add("cross-domain-script-include", _INFO,
+                f"third-party script included from {s.hostname} ({m.group(1)[:80]}) — page trusts "
+                "code served by an external origin", sev="low")
             break
 
     # Mixed content: an HTTPS page pulling ACTIVE subresources over plaintext http://

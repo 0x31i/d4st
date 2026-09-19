@@ -72,3 +72,34 @@ def test_mixed_content_flagged():
 def test_mixed_content_https_subresource_ok():
     body = '<script src="https://cdn.example/x.js"></script>'
     assert "mixed-content" not in _checks(headers={"Content-Type": "text/html"}, body=body)
+
+
+def test_csp_weak_policy_flags_script_style_form():
+    # weak CSP like islclinic.com: wildcard default + unsafe-inline, no form-action
+    c = _checks(headers={"Content-Security-Policy": "default-src *; script-src 'unsafe-inline' 'unsafe-eval'"})
+    assert "csp-allows-untrusted-script" in c
+    assert "csp-allows-untrusted-style" in c        # style-src falls back to default-src *
+    assert "csp-allows-form-hijacking" in c
+    assert "csp-missing" not in c
+
+
+def test_csp_malformed_directive():
+    c = _checks(headers={"Content-Security-Policy": "default-src 'self'; frobnicate foo; form-action 'self'"})
+    assert "csp-malformed" in c
+
+
+def test_csp_strong_policy_clean():
+    strong = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+              "form-action 'self'; frame-ancestors 'none'")
+    c = _checks(headers={"Content-Security-Policy": strong, "X-Frame-Options": "DENY"})
+    assert not any(x.startswith("csp-") for x in c), c
+
+
+def test_cross_domain_script_include():
+    body = '<script src="https://cdn.thirdparty.io/lib.js"></script>'
+    assert "cross-domain-script-include" in _checks(headers={"Content-Type": "text/html"}, body=body)
+
+
+def test_same_origin_script_not_flagged():
+    body = '<script src="/local/app.js"></script>'
+    assert "cross-domain-script-include" not in _checks(headers={"Content-Type": "text/html"}, body=body)

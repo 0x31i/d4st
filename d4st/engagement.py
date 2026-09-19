@@ -3009,6 +3009,18 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[backup] skipped: {_bke}", flush=True)
             _prog.update("backup-files", findings, urls=len(urls), targets=len(targets))
 
+            # Reflected-input surface map (Burp's "Input returned in response") — canary-verified,
+            # classifies JS/attribute/HTML context. The XSS/injection precursor.
+            try:
+                from .activetests import run_reflection_checks
+                _rf = run_reflection_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_rf, "reflection")
+                if _rf:
+                    print(f"[reflect] {len(_rf)} reflected-input point(s)", flush=True)
+            except Exception as _rfe:  # noqa: BLE001
+                print(f"[reflect] skipped: {_rfe}", flush=True)
+            _prog.update("reflected-input", findings, urls=len(urls), targets=len(targets))
+
             # API data-exposure — JSON endpoints that return bulk records or credential/secret fields
             # to an unauthenticated caller (excessive data exposure / BOLA-lite). Runs with the same
             # auth context as the scan (no cookie => the unauth view), so it rates a pre-auth data dump

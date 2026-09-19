@@ -460,6 +460,88 @@ def run_backup_scan(session, base: str, urls: list[str], *,
     return findings
 
 
+_REFL_MARK = "d4stR3f"
+
+
+def _reflect_context(body: str, token: str) -> str:
+    idx = body.find(token)
+    if idx < 0:
+        return "html"
+    pre = body[max(0, idx - 400):idx].lower()
+    if pre.rfind("<script") > pre.rfind("</script"):
+        return "javascript"
+    if re.search(r'=\s*["\'][^"\'<>]*$', body[max(0, idx - 60):idx]):
+        return "attribute"
+    return "html"
+
+
+def run_reflection_checks(session, base: str, urls: list[str], *,
+                          delay: float = 0.2, timeout: float = 12.0, max_urls: int = 30,
+                          max_hits: int = 15, throttle=None) -> list[dict]:
+    """Reflected-input surface map (Burp's 'Input returned in response'). For each in-scope URL with
+    query parameters, inject a unique canary and report where it is reflected verbatim, classifying
+    the context (JavaScript / HTML attribute / HTML body) — the context determines XSS potential.
+    Canary-verified (near-zero FP): reported only when our exact token appears in the response.
+    READ-ONLY GET; throttled; capped. This maps the injection surface; active XSS confirmation is
+    left to the roster (dalfox/nuclei)."""
+    import secrets
+
+    import httpx
+    from urllib.parse import parse_qsl, quote
+    from urllib.parse import urlsplit as _us
+    from urllib.parse import urlunsplit
+
+    from .safety import pace
+    origin = f"{_us(base).scheme}://{_us(base).netloc}"
+    cand: list = []
+    for u in urls:
+        if u.startswith(origin):
+            sp = _us(u)
+            if sp.query:
+                cand.append(sp)
+        if len(cand) >= max_urls:
+            break
+    if not cand:
+        return []
+    authed = _authed_headers(session, base)
+    sev_by_ctx = {"javascript": "medium", "attribute": "low", "html": "low"}
+    findings: list[dict] = []
+    with httpx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
+        for sp in cand:
+            params = parse_qsl(sp.query, keep_blank_values=True)
+            for i, (pn, _pv) in enumerate(params):
+                token = _REFL_MARK + secrets.token_hex(4)
+                qparts = [f"{k}={token}" if j == i else f"{k}={quote(vv, safe='')}"
+                          for j, (k, vv) in enumerate(params)]
+                test_url = urlunsplit((sp.scheme, sp.netloc, sp.path, "&".join(qparts), ""))
+                try:
+                    r = c.get(test_url, headers=authed)
+                    pace(throttle, delay, r.status_code)
+                except Exception:  # noqa: BLE001
+                    continue
+                body = r.text or ""
+                if token not in body:
+                    continue
+                ctx = _reflect_context(body, token)
+                findings.append({
+                    "type": "reflected-input", "name": "reflected-input",
+                    "severity": sev_by_ctx[ctx], "url": test_url, "method": "GET",
+                    "category": "reflected-input", "verified": True,
+                    "detail": f"parameter '{pn}' is reflected verbatim into the response in a "
+                              f"{ctx} context. Reflected input is the precursor to cross-site "
+                              f"scripting" + (" — a JavaScript context is directly XSS-relevant"
+                                              if ctx == "javascript" else "") + "; confirm with "
+                              "context-appropriate payloads.",
+                    "evidence_log": [exchange(
+                        f"PROOF — canary '{token}' reflected via '{pn}' ({ctx} context)", r)],
+                    "repro": curl(r),
+                })
+                if len(findings) >= max_hits:
+                    return findings
+                break   # one reflection point per URL is enough for the surface map
+    return findings
+
+
 # ---------------------------------------------------- secret live-validation ----
 _KEY_KINDS = [
     ("google-api-key", re.compile(r"AIza[0-9A-Za-z_\-]{20,}")),
