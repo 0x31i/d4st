@@ -3230,13 +3230,22 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # 4) DOM-based (headless): DOM-XSS + DOM open-redirect on HTML pages. This injects via a
     #    headless browser (client-side), so it is skipped under passive-only (no attack traffic).
     if dom and policy.active_scan and not health.halted:
-        html_pages = sorted({u.split("#")[0] for u in urls
+        # Dedup HTML pages by BASE path (dom_probe strips the query and injects its own payloads),
+        # so page_params — also keyed by base path — actually matches the lookup below.
+        html_pages = sorted({u.split("#")[0].split("?")[0] for u in urls
                              if not u.split("?")[0].endswith((".js", ".css", ".png", ".jpg",
                                                               ".svg", ".ico", ".woff", ".map"))})
-        # map discovered params per page for DOM source testing
+        # Map discovered params per page for DOM source testing — from injection targets AND directly
+        # from the frontier URLs' own query strings (an auth page's nav param like ?url= may be
+        # filtered out of `targets` but is still a DOM source worth testing).
         page_params: dict = {}
         for t in targets:
             page_params.setdefault(t.url.split("?")[0], set()).update(t.params)
+        from urllib.parse import parse_qsl
+        for u in urls:
+            q = urlsplit(u).query
+            if q:
+                page_params.setdefault(u.split("?")[0], set()).update(k for k, _ in parse_qsl(q))
         for pg in html_pages[:25]:
             for d in dom_probe(pg, cookie, params=sorted(page_params.get(pg, []))):
                 findings.append(Finding(tool="dom", category=d.category, url=d.url,

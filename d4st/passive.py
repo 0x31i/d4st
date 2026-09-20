@@ -181,10 +181,16 @@ def check_response(url: str, status: int, headers: dict, body: str,
             add(f"version-disclosure-{hdr}", _INFO,
                 f"technology/version disclosed in '{hdr}: {val}' header")
 
-    # Cacheable HTTPS response with a session-ish cookie present
+    # Cacheable HTTPS response — a cookie-bearing OR HTML page over HTTPS that proxies/browsers may
+    # cache (Burp's "Cacheable HTTPS response"). Static assets aside, an HTML app page or a
+    # cookie-setting response cached by a shared proxy can leak sensitive content.
     cc = h.get("cache-control", "").lower()
-    if _is_https(url) and set_cookies and not any(x in cc for x in ("no-store", "no-cache", "private")):
-        add("cacheable-https", _INFO, f"cacheable HTTPS response (Cache-Control: {cc or 'unset'})")
+    ct_cache = h.get("content-type", "").lower()
+    cacheable = not any(x in cc for x in ("no-store", "no-cache", "private"))
+    if _is_https(url) and cacheable and (set_cookies or "text/html" in ct_cache):
+        why = "sets a cookie" if set_cookies else "HTML response"
+        add("cacheable-https", _INFO,
+            f"cacheable HTTPS response ({why}; Cache-Control: {cc or 'unset'})")
 
     # HTML without charset
     ct = h.get("content-type", "").lower()
