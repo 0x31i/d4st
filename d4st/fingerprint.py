@@ -319,6 +319,20 @@ def fingerprint_target(target: str, host: str, cookie: str = '') -> AppProfile:
             prof.headless = False
             prof.signals.append('reclassified spa=>mpa: server-rendered page tree, no framework root')
 
+    # Capture the redirect LANDING url (with its query string) as a crawl seed. A login/return
+    # flow like OWA 302s the seed to logon.aspx?url=...&reason=0, whose reflected return-URL param
+    # is a real injection point that is otherwise lost — the crawler only ever sees the base path.
+    try:
+        landing = str(r.url)
+        if (landing and landing != target
+                and (urlsplit(landing).hostname or '').lower() == want_host
+                and urlsplit(landing).query
+                and landing not in prof.entry_seeds):
+            prof.entry_seeds.append(landing)
+            prof.signals.append(f'redirect landing captured as seed ({urlsplit(landing).path})')
+    except Exception:  # noqa: BLE001
+        pass
+
     # de-dup tech, keep order
     prof.tech = list(dict.fromkeys(prof.tech))
     return prof

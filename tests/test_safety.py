@@ -1,4 +1,25 @@
-from d4st.safety import LockoutMonitor, Politeness, is_auth_endpoint
+from d4st.safety import (
+    LockoutMonitor,
+    Politeness,
+    auth_endpoint_safe_to_test,
+    is_auth_endpoint,
+)
+
+
+def test_auth_endpoint_get_nav_params_testable():
+    # OWA logon.aspx?url=...&reason= — return-URL/nav params, safe to reflection-test read-only
+    assert auth_endpoint_safe_to_test("https://h/owa/auth/logon.aspx", "GET", ["url", "reason"])
+    assert auth_endpoint_safe_to_test("https://h/owa/auth/logon.aspx", "GET", ["replaceCurrent"])
+
+
+def test_auth_endpoint_credential_params_blocked():
+    assert not auth_endpoint_safe_to_test("https://h/login", "GET", ["username", "password"])
+    assert not auth_endpoint_safe_to_test("https://h/login", "GET", ["token"])
+
+
+def test_auth_endpoint_no_params_or_post_blocked():
+    assert not auth_endpoint_safe_to_test("https://h/login", "GET", [])
+    assert not auth_endpoint_safe_to_test("https://h/login", "POST", ["url"])
 
 
 def test_auth_endpoints_excluded():

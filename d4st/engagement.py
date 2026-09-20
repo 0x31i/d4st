@@ -1740,13 +1740,14 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
     When fuzz_forms is False (production-safe), stored-XSS (which WRITES data) is skipped."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from .safety import is_auth_endpoint
+    from .safety import auth_endpoint_safe_to_test, is_auth_endpoint
 
     def _probe_one(t: Target):
         """All checks for ONE target. Returns (findings, csrf_hit|None). Self-contained so it runs
         safely in a worker thread and never raises into the pool."""
         found: list[Finding] = []
-        if is_auth_endpoint(t.url):   # never inject auth endpoints
+        # never inject auth endpoints — except a GET with only non-credential nav params (safe)
+        if is_auth_endpoint(t.url) and not auth_endpoint_safe_to_test(t.url, t.method, t.params):
             return found, None
 
         def _emit(cat, param, note, ev):
@@ -2594,6 +2595,11 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     _seeds = appprof.entry_seeds if appprof else []
     urls = blind_crawl(target, cookie, depth=depth, politeness=pol,
                        headless=_headless, seeds=_seeds)
+    # Ensure discovered entry seeds (incl. a captured redirect-landing URL with its query params)
+    # are in the frontier directly — katana may normalize/drop a seed's query string, but the
+    # passive + active param checks iterate this list and need the parameterized URL intact.
+    if _seeds:
+        urls = sorted(set(urls) | set(_seeds))
 
     # ---- crawl-reach self-check: escalate if coverage came back trivially small ----
     # A healthy crawl reaches many URLs; ~one means the strategy was wrong (headless on a
@@ -2721,7 +2727,11 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     targets = discover_targets(urls, cookie, host, session_keeper=_session)
     # SAFETY: never actively test auth endpoints (submitting payloads/failed logins there
     # locks accounts and logs the scanner out). Passive checks still cover them read-only.
-    targets = [t for t in targets if not is_auth_endpoint(t.url)]
+    # EXCEPTION: a GET auth URL carrying only non-credential nav params (e.g. OWA
+    # logon.aspx?url=...&reason=) is a real reflected-injection point and is safe to test read-only.
+    from .safety import auth_endpoint_safe_to_test
+    targets = [t for t in targets if not is_auth_endpoint(t.url)
+               or auth_endpoint_safe_to_test(t.url, t.method, t.params)]
     # SAFETY: never actively fuzz a password/credential-CHANGE form. Sending payloads there can
     # reset the account's own password (DVWA's csrf module did this, locking every later stage out
     # of the app -> dead sessions, sqlmap 0 findings) and it mutates the client's credentials. Drop

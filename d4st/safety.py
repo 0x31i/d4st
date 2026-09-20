@@ -29,6 +29,28 @@ def is_auth_endpoint(url: str) -> bool:
     return bool(_AUTH_PATH.search(urlsplit(url).path))
 
 
+# Query params that carry credentials / auth secrets — testing these submits or manipulates
+# authentication and is never safe on an auth endpoint.
+_CRED_PARAMS = frozenset({
+    "username", "user", "uname", "usr", "login", "logon", "email", "mail",
+    "pass", "password", "passwd", "pwd", "otp", "mfa", "code", "pin", "token", "secret",
+})
+
+
+def auth_endpoint_safe_to_test(url: str, method: str = "GET", params=None) -> bool:
+    """An auth endpoint is safe to actively (read-only GET) test ONLY when it is a GET whose query
+    params are ALL non-credential — e.g. a return-URL / nav param like ?url= / ?returnUrl= / ?reason=
+    on a login page (OWA `logon.aspx?url=...`). Those are real reflected-injection points and testing
+    them neither submits credentials nor triggers a login/logout. Anything with a credential-like
+    param, no params, or a non-GET method stays blocked (account-lockout / session-kill protection)."""
+    if (method or "GET").upper() != "GET":
+        return False
+    params = params or []
+    if not params:
+        return False
+    return not any((p or "").lower() in _CRED_PARAMS for p in params)
+
+
 # URL patterns that perform DESTRUCTIVE or NOTIFYING actions. Actively fuzzing these on real
 # infra can delete data, spam real inboxes/phones, move money, or fire irreversible workflows.
 # Deliberately does NOT include create/update/edit/save (too common, and injection often lives
