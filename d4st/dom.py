@@ -139,7 +139,8 @@ def dom_probe(url: str, cookie: str = "", params: list[str] | None = None,
                 continue
             try:
                 if page.evaluate(f"window.{_XSS_MARK}") == 1:
-                    findings.append(DomFinding("xss", u, src, "payload reached a DOM sink (executed)"))
+                    findings.append(DomFinding("xss", base, src,
+                                               f"payload reached a DOM sink (executed); PoC: {u}"))
             except Exception:  # noqa: BLE001, S112
                 continue
 
@@ -155,8 +156,8 @@ def dom_probe(url: str, cookie: str = "", params: list[str] | None = None,
             _load(u)
             landed = (urlsplit(page.url or "").hostname == "evil.example")
             if state["evil"] or landed:
-                findings.append(DomFinding("open-redirect", u, src,
-                                           "DOM navigation to attacker-controlled URL"))
+                findings.append(DomFinding("open-redirect", base, src,
+                                           f"DOM navigation to attacker-controlled URL; PoC: {u}"))
 
         # --- DOM data manipulation: inject a taint marker into a source, see which sinks
         # receive it (cookie/storage/attribute/value/innerHTML). Non-executing flows Burp
@@ -164,7 +165,8 @@ def dom_probe(url: str, cookie: str = "", params: list[str] | None = None,
         # "Cookie manipulation (DOM-based)". ---
         def _emit_taint(u, src, sink):
             cat = "dom-cookie-manipulation" if sink == "document.cookie" else "dom-data-manipulation"
-            findings.append(DomFinding(cat, u, src, f"tainted {src} reaches DOM sink: {sink}"))
+            findings.append(DomFinding(cat, base, src,
+                                       f"tainted {src} reaches DOM sink: {sink}; PoC: {u}"))
 
         taint_sources = [("hash", f"{base}#{_TAINT}")]
         for pn in params:
