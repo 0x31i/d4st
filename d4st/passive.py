@@ -241,12 +241,18 @@ def _check_http_service(host: str, base_headers: dict) -> PassiveFinding | None:
         return None
     loc = r.headers.get("location", "") or ""
     if 300 <= r.status_code < 400 and loc.lower().startswith("https://"):
-        return None  # plaintext listener correctly upgrades to HTTPS
-    if r.status_code >= 400:
-        return None  # listener answered an error; not clearly serving cleartext content — avoid FP
-    # 2xx over http, or a redirect that stays on http:// → real cleartext exposure
-    detail = (f"service reachable over plaintext HTTP (status {r.status_code}"
-              + (f", redirects to {loc[:80]}" if loc else ", no HTTPS upgrade") + ")")
+        return None  # plaintext listener correctly upgrades to HTTPS — not a finding
+    # Any other cleartext response proves an unencrypted HTTP service is reachable (Burp's
+    # "Unencrypted communications"). 2xx or a non-https redirect = actively serving over http
+    # (medium); a 4xx/5xx still means the plaintext listener is up but isn't serving content (low).
+    serving = r.status_code < 400
+    sev = "medium" if serving else "low"
+    if serving:
+        detail = (f"service reachable over plaintext HTTP (status {r.status_code}"
+                  + (f", redirects to {loc[:80]}" if loc else ", no HTTPS upgrade") + ")")
+    else:
+        detail = (f"plaintext HTTP listener reachable (status {r.status_code}) — an unencrypted "
+                  "service is exposed even though it does not serve content on this path")
     proof = {
         "label": "plaintext HTTP response",
         "request": {"method": "GET", "url": url, "headers": {}, "body": ""},
@@ -255,7 +261,7 @@ def _check_http_service(host: str, base_headers: dict) -> PassiveFinding | None:
                      "body": (r.text or "")[:4000], "truncated": len(r.text or "") > 4000},
     }
     return PassiveFinding(check="cleartext-service", category=_MISCONFIG, url=url,
-                          detail=detail, severity="medium", response=proof)
+                          detail=detail, severity=sev, response=proof)
 
 
 def passive_scan(urls: list[str], cookie: str, cap: int = 40) -> list[PassiveFinding]:
