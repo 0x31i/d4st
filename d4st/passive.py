@@ -84,7 +84,11 @@ def analyze_csp(csp: str) -> list[tuple]:
                     "to mitigate cross-site scripting", "medium"))
 
     st = srcs("style-src")
-    if st is not None and any(t in ("'unsafe-inline'", "*") for t in st):
+    if st is None:
+        out.append(("csp-allows-untrusted-style", _MISCONFIG,
+                    "CSP defines no style-src or default-src — untrusted style execution is not "
+                    "restricted", "low"))
+    elif any(t in ("'unsafe-inline'", "*") for t in st):
         out.append(("csp-allows-untrusted-style", _MISCONFIG,
                     "style-src allows untrusted styles ('unsafe-inline' or *) — enables style-based "
                     "data exfiltration", "low"))
@@ -93,6 +97,17 @@ def analyze_csp(csp: str) -> list[tuple]:
         out.append(("csp-allows-form-hijacking", _MISCONFIG,
                     "CSP has no form-action directive — an injected form can post credentials to an "
                     "attacker-controlled URL (form hijacking)", "low"))
+
+    # Clickjacking via a PRESENT-but-permissive frame-ancestors (an absent frame-ancestors is
+    # handled by the X-Frame-Options/clickjacking check). Permitting any external origin (a host or
+    # wildcard beyond 'self'/'none') means third parties can frame the page.
+    fa = d.get("frame-ancestors")
+    if fa is not None:
+        externals = [s for s in fa if s not in ("'self'", "'none'")]
+        if externals:
+            out.append(("csp-allows-clickjacking", _MISCONFIG,
+                        f"CSP frame-ancestors permits framing by external origins "
+                        f"({' '.join(externals)[:80]}) — does not fully mitigate clickjacking", "low"))
     return out
 
 
@@ -211,13 +226,18 @@ def check_response(url: str, status: int, headers: dict, body: str,
             add("path-relative-css", _MISCONFIG, f"path-relative stylesheet import: {href.group(1)}")
             break
 
-    # Cross-domain script include: a <script src> pulled from a third-party origin
+    # Cross-domain script include: a <script src> pulled from a third-party origin. Handles
+    # absolute (http(s)://) AND protocol-relative (//host/…) URLs — the latter is common for CDNs
+    # (e.g. //img1.wsimg.com/…) and was previously missed.
     page_host = urlsplit(url).hostname or ""
     for m in re.finditer(r'<script\b[^>]+src=["\']([^"\']+)["\']', body, re.IGNORECASE):
-        s = urlsplit(m.group(1))
-        if s.scheme in ("http", "https") and s.hostname and s.hostname != page_host:
+        src = m.group(1)
+        s = urlsplit(src)
+        external = s.hostname and s.hostname != page_host and (
+            s.scheme in ("http", "https") or src.startswith("//"))
+        if external:
             add("cross-domain-script-include", _INFO,
-                f"third-party script included from {s.hostname} ({m.group(1)[:80]}) — page trusts "
+                f"third-party script included from {s.hostname} ({src[:80]}) — page trusts "
                 "code served by an external origin", sev="low")
             break
 

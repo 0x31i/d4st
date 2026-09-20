@@ -100,6 +100,30 @@ def test_cross_domain_script_include():
     assert "cross-domain-script-include" in _checks(headers={"Content-Type": "text/html"}, body=body)
 
 
+def test_cross_domain_script_protocol_relative():
+    # protocol-relative //host/ (common for CDNs like wsimg.com) must be caught
+    body = '<script src="//img1.wsimg.com/widgets/UX.js"></script>'
+    assert "cross-domain-script-include" in _checks(headers={"Content-Type": "text/html"}, body=body)
+
+
+def test_csp_no_style_src_flags_untrusted_style():
+    # CSP with only frame-ancestors => no style-src/default-src => untrusted styles unrestricted
+    c = _checks(headers={"Content-Security-Policy": "frame-ancestors 'self' *.godaddy.com"})
+    assert "csp-allows-untrusted-style" in c
+
+
+def test_csp_permissive_frame_ancestors_flags_clickjacking():
+    c = _checks(headers={"Content-Security-Policy": "frame-ancestors 'self' godaddy.com *.godaddy.com"})
+    assert "csp-allows-clickjacking" in c
+
+
+def test_csp_strict_frame_ancestors_no_clickjacking():
+    c = _checks(headers={"Content-Security-Policy":
+                         "default-src 'self'; script-src 'self'; style-src 'self'; "
+                         "form-action 'self'; frame-ancestors 'none'"})
+    assert "csp-allows-clickjacking" not in c
+
+
 def test_same_origin_script_not_flagged():
     body = '<script src="/local/app.js"></script>'
     assert "cross-domain-script-include" not in _checks(headers={"Content-Type": "text/html"}, body=body)
