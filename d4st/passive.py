@@ -235,7 +235,7 @@ def _check_http_service(host: str, base_headers: dict) -> PassiveFinding | None:
     import httpx
     url = f"http://{host}/"
     try:
-        r = httpx.get(url, headers=base_headers, follow_redirects=False, timeout=10)
+        r = httpx.get(url, headers=base_headers, follow_redirects=False, timeout=10, verify=False)
     except Exception as e:  # noqa: BLE001
         _log.debug("cleartext probe failed for %s: %s", url, e)
         return None
@@ -275,10 +275,13 @@ def passive_scan(urls: list[str], cookie: str, cap: int = 40) -> list[PassiveFin
                 seen.add(("cleartext-service", host))
                 out.append(hf)
         try:
-            r = httpx.get(url, headers=headers, follow_redirects=True, timeout=12)
+            # verify=False: pentest targets routinely have invalid/self-signed certs (the target may
+            # even BE the cert finding). Without this, every HTTPS fetch raises an SSLError that the
+            # except below swallows — silently dropping ALL passive header findings on such hosts.
+            r = httpx.get(url, headers=headers, follow_redirects=True, timeout=12, verify=False)
             # CORS probe: does the server reflect an evil Origin?
             cr = httpx.get(url, headers={**headers, "Origin": "https://evil.example"},
-                           follow_redirects=True, timeout=12)
+                           follow_redirects=True, timeout=12, verify=False)
             acao = cr.headers.get("access-control-allow-origin")
         except Exception as e:  # noqa: BLE001, S112
             _log.debug("passive fetch failed for %s: %s", url, e)
