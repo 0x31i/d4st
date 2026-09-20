@@ -312,11 +312,15 @@ class TargetHealth:
         """Active liveness GET on the base URL. Returns (alive, elapsed_ms). alive is False on
         connection error/timeout or any 5xx (the signals a stressed app emits before dying)."""
         import httpx
-        headers = {"Cookie": self.cookie} if self.cookie else {}
+        # verify=False: an invalid/self-signed cert (routine in pentests — islclinic.net IS the cert
+        # finding) must NOT read as "target down". Without it every ping throws SSLError -> the target
+        # is falsely halted, silently skipping the DOM stage, ZAP, and deep injection. browser UA so a
+        # WAF doesn't tarpit the liveness ping either.
+        headers = browser_headers({"Cookie": self.cookie} if self.cookie else None)
         t0 = time.monotonic()
         try:
             r = httpx.get(self.base_url, headers=headers, timeout=self.ping_timeout,
-                          follow_redirects=True)
+                          follow_redirects=True, verify=False)
             return (r.status_code < 500, (time.monotonic() - t0) * 1000.0)
         except Exception:  # noqa: BLE001 - any failure = not alive
             return (False, (time.monotonic() - t0) * 1000.0)
