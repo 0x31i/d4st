@@ -53,3 +53,12 @@ def test_lockout_text_detected():
     m = LockoutMonitor(max_strikes=5, backoff_s=0)
     m.observe(200, "https://h/app", "Your account is locked. Try again later.", had_session=True)
     assert m.strikes == 1 and "lockout" in m.events[0].lower()
+
+
+def test_browser_headers_ua_and_merge():
+    from d4st.safety import BROWSER_UA, browser_headers
+    h = browser_headers()
+    assert "Mozilla/5.0" in h["User-Agent"] and h["User-Agent"] == BROWSER_UA
+    assert "Accept" in h
+    merged = browser_headers({"Cookie": "a=b"})
+    assert merged["Cookie"] == "a=b" and "Mozilla/5.0" in merged["User-Agent"]

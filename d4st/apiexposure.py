@@ -86,7 +86,8 @@ def scan_api_exposure(urls: list[str], cookie: str = "", *, authed: bool = False
     category + evidence_log)."""
     import httpx
 
-    headers = {"Cookie": cookie} if cookie else {}
+    from .safety import browser_headers
+    headers = browser_headers({"Cookie": cookie} if cookie else None)
     seen: set = set()
     out: list[dict] = []
     # focus on likely-JSON/API endpoints; skip static assets and spec docs

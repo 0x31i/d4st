@@ -258,6 +258,8 @@ def blind_crawl(target: str, cookie: str, depth: int = 3, duration: str = "3m",
         if use_headless:
             args += ["-hl", "-aff", "-xhr"]      # headless browser + auto-form-fill + XHR
         args += politeness.katana_flags() if politeness else ["-c", "10"]
+        from .safety import BROWSER_UA
+        args += ["-H", f"User-Agent: {BROWSER_UA}"]   # browser UA so WAFs don't tarpit the crawl
         if cookie:
             args += ["-H", f"Cookie: {cookie}"]
         for _k, _v in _AUTH_HEADER.items():      # bearer/header auth (token-SPA APIs) — crawl authed

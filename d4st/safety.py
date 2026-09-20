@@ -29,6 +29,33 @@ def is_auth_endpoint(url: str) -> bool:
     return bool(_AUTH_PATH.search(urlsplit(url).path))
 
 
+# A realistic desktop-browser User-Agent. Non-browser UAs (python-httpx, d4st-*, curl) are widely
+# tarpitted or blocked by CDN/WAF stacks (GoDaddy DPS, Cloudflare, Akamai) — that silently zeroes a
+# scan against a protected site. Authorized engagements allow-list the source IP, not the UA, so
+# presenting a browser UA is both safe and necessary for coverage parity with a real browser/Burp.
+# Override via D4ST_USER_AGENT.
+import os as _os
+
+BROWSER_UA = _os.environ.get(
+    "D4ST_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+)
+
+
+def browser_headers(extra: dict | None = None) -> dict:
+    """Default request headers carrying a realistic browser User-Agent + Accept, so WAFs don't
+    tarpit/deny the scanner. `extra` is merged on top (e.g. Cookie/Authorization)."""
+    h = {
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if extra:
+        h.update(extra)
+    return h
+
+
 # Query params that carry credentials / auth secrets — testing these submits or manipulates
 # authentication and is never safe on an auth endpoint.
 _CRED_PARAMS = frozenset({

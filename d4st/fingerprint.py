@@ -155,9 +155,8 @@ def build_attack_profile(appprof: 'AppProfile | None') -> AttackProfile:
 def _get(url: str, cookie: str, timeout: int = 12):
     if requests is None:
         return None
-    headers = {'User-Agent': 'd4st-fingerprint/1.0'}
-    if cookie:
-        headers['Cookie'] = cookie
+    from .safety import browser_headers
+    headers = browser_headers({'Cookie': cookie} if cookie else None)
     try:
         return requests.get(url, headers=headers, timeout=timeout,
                             allow_redirects=True, verify=False)

@@ -33,7 +33,9 @@ def _auth_header_name(session) -> str:
 
 
 def _authed_headers(session, base: str) -> dict:
-    h = dict(getattr(session, "headers", {}) or {})
+    from .safety import browser_headers
+    h = browser_headers()                                   # browser UA default (WAF-safe)
+    h.update(dict(getattr(session, "headers", {}) or {}))   # session's own headers/UA win if present
     try:
         ck = session.cookie_header(base)
         if ck:

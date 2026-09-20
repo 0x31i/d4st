@@ -267,7 +267,9 @@ def _check_http_service(host: str, base_headers: dict) -> PassiveFinding | None:
 def passive_scan(urls: list[str], cookie: str, cap: int = 40) -> list[PassiveFinding]:
     """Fetch a sample of discovered URLs and run passive checks. Dedups by (check, host)."""
     import httpx
-    headers = {"Cookie": cookie} if cookie else {}
+
+    from .safety import browser_headers
+    headers = browser_headers({"Cookie": cookie} if cookie else None)
     seen: set = set()
     http_probed: set = set()
     out: list[PassiveFinding] = []

@@ -85,7 +85,8 @@ def probe_reflection(url: str, body: str, cookie: str = "", *, timeout: float = 
 
     out: list[dict] = []
     canary = "d4stRX9z1q"          # distinctive, harmless marker
-    hdrs = {"Cookie": cookie} if cookie else {}
+    from .safety import browser_headers
+    hdrs = browser_headers({"Cookie": cookie} if cookie else None)
     forms = _parse_forms(body)
     with httpx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
         for f in forms:
