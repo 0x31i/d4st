@@ -160,7 +160,12 @@ def dom_probe(url: str, cookie: str = "", params: list[str] | None = None,
 
         # --- DOM data manipulation: inject a taint marker into a source, see which sinks
         # receive it (cookie/storage/attribute/value/innerHTML). Non-executing flows Burp
-        # reports as "DOM data manipulation". ---
+        # reports as "DOM data manipulation"; a document.cookie sink specifically is Burp's
+        # "Cookie manipulation (DOM-based)". ---
+        def _emit_taint(u, src, sink):
+            cat = "dom-cookie-manipulation" if sink == "document.cookie" else "dom-data-manipulation"
+            findings.append(DomFinding(cat, u, src, f"tainted {src} reaches DOM sink: {sink}"))
+
         taint_sources = [("hash", f"{base}#{_TAINT}")]
         for pn in params:
             taint_sources.append((f"param:{pn}", f"{base}?{pn}={_TAINT}"))
@@ -172,8 +177,35 @@ def dom_probe(url: str, cookie: str = "", params: list[str] | None = None,
             except Exception:  # noqa: BLE001, S112
                 continue
             for sink in sinks or []:
-                findings.append(DomFinding("dom-data-manipulation", u, src,
-                                           f"tainted {src} reaches DOM sink: {sink}"))
+                _emit_taint(u, src, sink)
+
+        # Extra non-URL DOM sources the app may read into a sink: window.name (survives
+        # navigation), localStorage, and document.referrer. Each on its own page so the
+        # per-source setup cannot leak into the others. This is what catches DOM-based cookie
+        # manipulation driven by a source other than the URL (which the URL loop above misses).
+        _extra = [
+            ("window.name", f"try{{window.name='{_TAINT}'}}catch(e){{}}", None),
+            ("localStorage", f"try{{localStorage.setItem('d4st_src','{_TAINT}')}}catch(e){{}}", None),
+            ("document.referrer", None, f"https://d4st.invalid/{_TAINT}"),
+        ]
+        for src, setup_js, referer in _extra:
+            try:
+                pg = ctx.new_page()
+                # Seed the SOURCE before installing the sink hooks, so our own seeding (e.g.
+                # localStorage.setItem) is not mistaken for the app writing tainted data to a sink.
+                if setup_js:
+                    pg.add_init_script(setup_js)
+                pg.add_init_script(_TAINT_HARNESS)
+                if referer:
+                    pg.goto(base, wait_until="load", timeout=timeout_ms, referer=referer)
+                else:
+                    pg.goto(base, wait_until="load", timeout=timeout_ms)
+                pg.wait_for_timeout(400)
+                for sink in (pg.evaluate("window.__domtaint || []") or []):
+                    _emit_taint(base, src, sink)
+                pg.close()
+            except Exception:  # noqa: BLE001, S112
+                continue
 
         browser.close()
     # dedup by (category, source)
