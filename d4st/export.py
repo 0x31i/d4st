@@ -11,10 +11,81 @@ from __future__ import annotations
 
 import base64 as _b64
 import csv as _csv
+import re as _re
 from urllib.parse import urlsplit as _urlsplit
 from xml.sax.saxutils import escape as _xesc
 
 from .report import SEV_RANK, _meta_for
+
+# Curated at-a-glance titles: param (check name) -> the EXACT issue. Without this, a d4st family
+# category ("misconfiguration"/"tls-configuration"/"pii-disclosure") collapses many distinct checks
+# under one generic name ("Security Misconfiguration") and the analyst can't tell which of 3+ issues
+# it is. The specificity already lives in f['param'] + f['evidence']; this restores it in the title.
+_SPECIFIC_TITLE = {
+    "hsts-not-enforced": "HSTS Not Enforced",
+    "hsts-weak": "Weak HSTS Policy",
+    "csp-missing": "Content-Security-Policy Missing",
+    "csp-allows-untrusted-script": "CSP Allows Untrusted Script Execution",
+    "csp-allows-untrusted-style": "CSP Allows Untrusted Style Execution",
+    "csp-allows-form-hijacking": "CSP Allows Form Hijacking",
+    "csp-allows-clickjacking": "CSP Allows Clickjacking",
+    "csp-malformed": "Malformed Content-Security-Policy",
+    "clickjacking": "Clickjacking (No X-Frame-Options / frame-ancestors)",
+    "cookie-no-httponly": "Cookie Missing HttpOnly Flag",
+    "cookie-no-secure": "Cookie Missing Secure Flag",
+    "cookie-no-samesite": "Cookie Missing SameSite Attribute",
+    "referer-leakage": "Referrer-Policy Missing (Referer Leakage)",
+    "no-nosniff": "X-Content-Type-Options Missing (MIME Sniffing)",
+    "no-permissions-policy": "Permissions-Policy Missing",
+    "cross-domain-script-include": "Cross-Domain Script Include",
+    "cacheable-https": "Cacheable HTTPS Response",
+    "cache-control": "Cacheable Response (Weak Cache-Control)",
+    "cleartext-service": "Unencrypted HTTP Service Reachable",
+    "mixed-content": "Mixed Content on HTTPS Page",
+    "cors-misconfig": "CORS Misconfiguration",
+    "x-content-type-options": "X-Content-Type-Options Missing (MIME Sniffing)",
+}
+
+
+def _specific_name(f: dict, m: dict) -> str:
+    """At-a-glance, SPECIFIC issue title from the finding's param + evidence — falls back to a
+    prettified param, then the family title. Surfaces the extracted value for disclosures so the
+    analyst sees the exact finding (the email, the cert failure reason) without opening the row."""
+    param = (f.get("param") or "").strip()
+    ev = (f.get("evidence") or "").strip()
+    cat = f.get("category", "")
+
+    if cat == "pii-disclosure":
+        kind = param.replace("_", " ").title() if param else "Sensitive Data"
+        mm = _re.search(r"disclosed:\s*([^()\n]+)", ev)
+        val = mm.group(1).strip() if mm else ""
+        base = "Email Address Disclosed" if kind.lower().startswith("email") else f"{kind} Disclosed"
+        return f"{base}: {val}" if val else base
+
+    if cat == "tls-configuration":
+        if param == "certificate-invalid":
+            reason = ev.split("FAILED:", 1)[1].strip().split(",")[0].strip() if "FAILED:" in ev else ""
+            return f"Invalid TLS Certificate ({reason})" if reason else "Invalid TLS Certificate"
+        if param in ("certificate-info", "certificate-details"):
+            return "TLS Certificate Details (Informational)"
+        if "protocol" in param.lower() or "tls-1" in param.lower():
+            return f"Deprecated TLS Protocol Enabled ({param})"
+
+    if param in _SPECIFIC_TITLE:
+        return _SPECIFIC_TITLE[param]
+    lp = param.lower()
+    if lp.startswith("version-disclosure"):
+        return "Technology / Version Disclosure"
+    if lp.startswith("cookie-no-"):
+        return "Insecure Cookie Flags"
+    if lp.startswith("csp-"):
+        return "Weak Content-Security-Policy"
+    # A hyphenated param is a CHECK name (self-describing) -> prettify it. A camelCase / single-word
+    # param is an INJECTED PARAMETER NAME (url, id, replaceCurrent) — that's a location, not an
+    # issue — so fall back to the family title instead of a meaningless "Url".
+    if "-" in param:
+        return param.replace("-", " ").title()
+    return m["title"]
 
 # (header, column-width) — order is the row order too.
 _COLUMNS = [
@@ -89,7 +160,7 @@ def _row(i: int, f: dict) -> list:
     m = _meta_for(f.get("category", "other"))
     req, resp = _exchange_text(f.get("evidence_log"))
     desc = _dd((m["desc"] + ((" - " + f["evidence"]) if f.get("evidence") else "")).strip())
-    return [i, _dd(m["title"]), f.get("category", ""), m["severity"], f.get("confidence") or "",
+    return [i, _dd(_specific_name(f, m)), f.get("category", ""), m["severity"], f.get("confidence") or "",
             _verified_str(f.get("verified")), f.get("tool", ""), f.get("url", ""),
             f.get("method", "GET"), f.get("param") or "", f.get("payload") or "", desc,
             _dd(m["fix"]), _dd(m["cwe"]), _dd(m["owasp"]), f.get("detection") or "", req, resp,
@@ -176,7 +247,7 @@ def to_burp_xml(result: dict, path: str) -> int:
         lines.append("  <issue>")
         lines.append(f"    <serialNumber>{i}</serialNumber>")
         lines.append(f"    <type>{_xesc(f.get('category', ''))}</type>")
-        lines.append(f"    <name>{_xesc(m['title'])}</name>")
+        lines.append(f"    <name>{_xesc(_specific_name(f, m))}</name>")
         lines.append(f'    <host ip="">{_xesc(host)}</host>')
         lines.append(f"    <path>{_xesc(path_q)}</path>")
         lines.append(f"    <location>{_xesc(f.get('param') or path_q)}</location>")
