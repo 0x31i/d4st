@@ -68,6 +68,15 @@ VULN_META: dict[str, dict] = {
              "links that bounce victims to malicious sites (phishing, token theft).",
         fix="Redirect only to a server-side allow-list of paths; never redirect to a raw "
             "user-supplied absolute URL."),
+    "web-cache-poisoning": dict(
+        title="Web Cache Poisoning", severity="high", cwe="CWE-349 / CWE-444",
+        owasp="A05:2021 Security Misconfiguration",
+        desc="An unkeyed request input (e.g. X-Forwarded-Host) is reflected into a response that is "
+             "then cached, so a poisoned response can be served to every user who requests the same "
+             "cached URL - enabling stored XSS, malicious redirection, or denial of service at scale.",
+        fix="Exclude untrusted/unkeyed headers from responses, or add them to the cache key. Do not "
+            "reflect Host / X-Forwarded-* into responses; normalise the cache key and set "
+            "Cache-Control appropriately."),
     "xxe": dict(
         title="XML External Entity (XXE) Injection", severity="high", cwe="CWE-611",
         owasp="A05:2021 Security Misconfiguration",
@@ -358,6 +367,8 @@ _CLASSES: dict[str, list] = {
             "CAPEC-591: Reflected XSS", "CAPEC-592: Stored XSS"],
     "open-redirect": ["CWE-601: URL Redirection to Untrusted Site", "CAPEC-194: Fake the Source of Data"],
     "csrf": ["CWE-352: Cross-Site Request Forgery", "CAPEC-62: Cross Site Request Forgery"],
+    "web-cache-poisoning": ["CWE-349: Acceptance of Extraneous Untrusted Data With Trusted Data",
+                            "CWE-444: HTTP Request/Response Smuggling", "CAPEC-141: Cache Poisoning"],
     "xxe": ["CWE-611: Improper Restriction of XML External Entity Reference",
             "CWE-827: Improper Control of Document Type Definition", "CAPEC-221: XXE"],
     "xpath": ["CWE-643: Improper Neutralization of Data within XPath Expressions",
@@ -399,6 +410,8 @@ _REFS: dict[str, list] = {
                       ("PortSwigger: DOM-based open redirection", "https://portswigger.net/web-security/dom-based/open-redirection")],
     "csrf": [("OWASP: CSRF", "https://owasp.org/www-community/attacks/csrf"),
              ("OWASP Cheat Sheet: CSRF Prevention", "https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html")],
+    "web-cache-poisoning": [("PortSwigger: Web cache poisoning", "https://portswigger.net/web-security/web-cache-poisoning"),
+                            ("OWASP: Cache Poisoning", "https://owasp.org/www-community/attacks/Cache_Poisoning")],
     "xxe": [("OWASP: XXE", "https://owasp.org/www-community/vulnerabilities/XML_External_Entity_(XXE)_Processing"),
             ("OWASP Cheat Sheet: XXE Prevention", "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html")],
     "xpath": [("OWASP: XPath Injection", "https://owasp.org/www-community/attacks/XPATH_Injection"),

@@ -349,6 +349,90 @@ def run_cspp_checks(session, base: str, urls: list[str], *,
     return findings
 
 
+# Unkeyed request headers that commonly reflect into cached responses (cache-poisoning vectors).
+_UNKEYED_HEADERS = (
+    "X-Forwarded-Host", "X-Forwarded-Scheme", "X-Forwarded-Proto", "X-Host",
+    "X-Forwarded-Server", "X-HTTP-Host-Override", "X-Original-URL", "X-Rewrite-URL",
+)
+
+
+def run_cache_poisoning_checks(session, base: str, urls: list[str], *,
+                               delay: float = 0.2, timeout: float = 12.0, max_urls: int = 20,
+                               throttle=None) -> list[dict]:
+    """Web cache poisoning detection. SAFE / detection-only:
+
+    Every request carries a UNIQUE cache-buster query param, so probes only ever create/read OUR
+    OWN cache entry and can NEVER poison a shared key that real users hit. For each URL and unkeyed
+    header (X-Forwarded-Host, ...), we inject a canary host, and ONLY report when a subsequent CLEAN
+    request to the same cache-busted URL (no injected header) returns our canary — proving the
+    poisoned response was cached under an unkeyed input. Read-only GET; auth endpoints skipped;
+    canary-verified (near-zero FP)."""
+    import secrets as _secrets
+
+    import httpx
+    from urllib.parse import parse_qsl, urlencode, urlunsplit
+    from urllib.parse import urlsplit as _us
+
+    from .safety import is_auth_endpoint, pace
+
+    origin = f"{_us(base).scheme}://{_us(base).netloc}"
+    cand = []
+    for u in urls:
+        if not u.startswith(origin) or is_auth_endpoint(u):
+            continue
+        cand.append(u)
+        if len(cand) >= max_urls:
+            break
+    if not cand:
+        return []
+    authed = _authed_headers(session, base)
+
+    def _bust(u: str, cb: str) -> str:
+        sp = _us(u)
+        q = dict(parse_qsl(sp.query, keep_blank_values=True))
+        q["cb"] = cb
+        return urlunsplit((sp.scheme, sp.netloc, sp.path, urlencode(q), ""))
+
+    findings: list[dict] = []
+    with httpx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
+        for u in cand:
+            for hdr in _UNKEYED_HEADERS:
+                cb = _secrets.token_hex(6)
+                canary = f"d4stcp{cb}.example"
+                purl = _bust(u, cb)
+                try:
+                    rp = c.get(purl, headers={**authed, hdr: canary})
+                    pace(throttle, delay, rp.status_code)
+                except Exception:  # noqa: BLE001
+                    continue
+                blob = (rp.text or "") + " " + " ".join(f"{k}:{v}" for k, v in rp.headers.items())
+                if canary not in blob:
+                    continue                      # header not reflected -> not a candidate
+                try:
+                    rc = c.get(purl, headers=authed)   # CLEAN re-fetch, same cache-buster key
+                    pace(throttle, delay, rc.status_code)
+                except Exception:  # noqa: BLE001
+                    continue
+                cblob = (rc.text or "") + " " + " ".join(f"{k}:{v}" for k, v in rc.headers.items())
+                if canary in cblob:
+                    findings.append({
+                        "type": "web-cache-poisoning", "name": "web-cache-poisoning",
+                        "severity": "high", "url": purl, "method": "GET",
+                        "category": "web-cache-poisoning", "verified": True,
+                        "detail": f"unkeyed header '{hdr}' is reflected into a CACHED response: a "
+                                  f"clean re-request (same cache key, no injected header) returned "
+                                  f"our canary host, proving the poisoned response was served from "
+                                  f"cache. Tested safely with a unique cache-buster so no shared "
+                                  f"cache entry was affected.",
+                        "evidence_log": [
+                            exchange(f"PROOF (poison) — {hdr}: {canary} reflected", rp),
+                            exchange("PROOF (cached) — clean re-request returns the canary", rc)],
+                        "repro": curl(rc),
+                    })
+                    return findings
+    return findings
+
+
 # XPath parser error signatures across common engines (PHP SimpleXML/libxml, .NET System.Xml,
 # Java javax.xml.xpath/Saxon/Xalan, Python lxml). Generic — not tied to any one app.
 _XPATH_ERR = re.compile(
