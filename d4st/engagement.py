@@ -2639,7 +2639,9 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
               "ferox_threads": _ferox_threads, "ferox_rate": _ferox_rate}
     if os.environ.get("D4ST_FEROX_WORDLIST"):   # operator override (e.g. a fast list)
         _dopts["ferox_wordlist"] = os.environ["D4ST_FEROX_WORDLIST"]
-    for _tool, _seeds in (("linkharvest", urls), ("feroxbuster", None)):
+    #  (c) arjun: hidden-parameter discovery on the crawled URLs, so downstream scanners test
+    #      REAL accepted params instead of a blind wordlist (non-active recon; --stable + rate cap).
+    for _tool, _seeds in (("linkharvest", urls), ("feroxbuster", None), ("arjun", urls)):
         try:
             _r = REGISTRY[_tool].run(_RC(target=target, seed_urls=_seeds or [], options=_dopts))
             if _r.discovered_urls:
