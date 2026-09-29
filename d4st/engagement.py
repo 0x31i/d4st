@@ -3023,6 +3023,19 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[xpath] skipped: {_xpe}", flush=True)
             _prog.update("xpath", findings, urls=len(urls), targets=len(targets))
 
+            # Web cache poisoning — unkeyed-header reflection into a CACHED response, proven with a
+            # clean re-fetch. SAFE: a unique cache-buster per probe means no shared cache entry is
+            # ever touched (we only poison + read our own key).
+            try:
+                from .activetests import run_cache_poisoning_checks
+                _wc = run_cache_poisoning_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_wc, "cache-poison")
+                if _wc:
+                    print(f"[cache-poison] {len(_wc)} web-cache-poisoning finding(s)", flush=True)
+            except Exception as _wce:  # noqa: BLE001
+                print(f"[cache-poison] skipped: {_wce}", flush=True)
+            _prog.update("cache-poison", findings, urls=len(urls), targets=len(targets))
+
             # Backup/temp file exposure — probe .bak/.old/~/.swp/.zip variants of discovered files,
             # with a catch-all/soft-404 guard so we don't inherit phantom "backup file" FPs.
             try:
