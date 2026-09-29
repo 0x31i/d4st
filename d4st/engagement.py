@@ -1854,14 +1854,14 @@ _ROSTER_CAT = {
     "crlfuzz": "crlf-injection", "sstimap": "ssti", "lfi_fuzz": "file-inclusion",
     "rfi_oast": "rfi", "dotdotpwn": "file-inclusion", "schemathesis": "api-fuzz",
     "jwt_tool": "jwt", "graphw00f": "graphql", "gitleaks": "secret", "trufflehog": "secret",
-    "openredirex": "open-redirect", "xsrfprobe": "csrf",
+    "openredirex": "open-redirect", "xsrfprobe": "csrf", "xxe_oast": "xxe",
 }
 # The full detection roster the mega scan runs over the SAFE frontier. nuclei + sqlmap are
 # already hand-coded above; ZAP is intentionally excluded (its full-scan re-crawls and can
 # crash fragile targets — the failure we hit on WAVSEP; use `launch -w full` if you want it).
 _MEGA_ROSTER = ["dalfox", "ghauri", "lfi_fuzz", "commix", "crlfuzz", "sstimap", "rfi_oast",
                 "dotdotpwn", "openredirex", "xsrfprobe", "schemathesis", "jwt_tool",
-                "graphw00f", "gitleaks", "trufflehog"]
+                "graphw00f", "gitleaks", "trufflehog", "xxe_oast"]
 
 
 # Roster tools that loop one subprocess PER URL (expensive at scale) vs tools that batch a whole

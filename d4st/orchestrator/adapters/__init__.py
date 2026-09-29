@@ -22,6 +22,7 @@ from . import (
     secrets,  # noqa: F401
     sqlmap,  # noqa: F401
     xsrfprobe,  # noqa: F401
+    xxe_oast,  # noqa: F401
     zap,  # noqa: F401
 )
 from .base import REGISTRY, AdapterResult, ToolAdapter, get_adapter, register
