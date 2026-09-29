@@ -68,6 +68,16 @@ VULN_META: dict[str, dict] = {
              "links that bounce victims to malicious sites (phishing, token theft).",
         fix="Redirect only to a server-side allow-list of paths; never redirect to a raw "
             "user-supplied absolute URL."),
+    "xxe": dict(
+        title="XML External Entity (XXE) Injection", severity="high", cwe="CWE-611",
+        owasp="A05:2021 Security Misconfiguration",
+        desc="An XML parser resolves attacker-controlled external entities, enabling server-side "
+             "file disclosure, server-side request forgery to internal services, and in some "
+             "parsers denial of service. Confirmed out-of-band: the parser fetched an entity URL "
+             "pointing at our listener.",
+        fix="Disable DOCTYPE / external-entity and external-DTD processing in every XML parser "
+            "(set FEATURE_SECURE_PROCESSING, disallow-doctype-decl, external-general/parameter "
+            "entities off). Prefer a hardened parser configuration or a non-XML format."),
     "xpath": dict(
         title="XPath Injection", severity="high", cwe="CWE-643",
         owasp="A03:2021 Injection",
@@ -348,6 +358,8 @@ _CLASSES: dict[str, list] = {
             "CAPEC-591: Reflected XSS", "CAPEC-592: Stored XSS"],
     "open-redirect": ["CWE-601: URL Redirection to Untrusted Site", "CAPEC-194: Fake the Source of Data"],
     "csrf": ["CWE-352: Cross-Site Request Forgery", "CAPEC-62: Cross Site Request Forgery"],
+    "xxe": ["CWE-611: Improper Restriction of XML External Entity Reference",
+            "CWE-827: Improper Control of Document Type Definition", "CAPEC-221: XXE"],
     "xpath": ["CWE-643: Improper Neutralization of Data within XPath Expressions",
              "CWE-91: XML Injection", "CAPEC-83: XPath Injection"],
     "weak-session": ["CWE-598: Use of GET Request with Sensitive Query Strings",
@@ -387,6 +399,8 @@ _REFS: dict[str, list] = {
                       ("PortSwigger: DOM-based open redirection", "https://portswigger.net/web-security/dom-based/open-redirection")],
     "csrf": [("OWASP: CSRF", "https://owasp.org/www-community/attacks/csrf"),
              ("OWASP Cheat Sheet: CSRF Prevention", "https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html")],
+    "xxe": [("OWASP: XXE", "https://owasp.org/www-community/vulnerabilities/XML_External_Entity_(XXE)_Processing"),
+            ("OWASP Cheat Sheet: XXE Prevention", "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html")],
     "xpath": [("OWASP: XPath Injection", "https://owasp.org/www-community/attacks/XPATH_Injection"),
              ("PortSwigger: XPath injection", "https://portswigger.net/kb/issues/00100600_xpath-injection")],
     "weak-session": [("OWASP: Session Management Cheat Sheet", "https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html"),
