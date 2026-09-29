@@ -19,7 +19,7 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from ...safety import is_auth_endpoint
+from ...safety import is_session_destroying_endpoint
 from .base import AdapterResult, RunContext, ToolAdapter, register
 from .session_util import _cookie_header
 
@@ -51,7 +51,7 @@ class LinkHarvestAdapter(ToolAdapter):
         seeds = list(dict.fromkeys([ctx.target, *(ctx.seed_urls or [])]))
         seen: set[str] = set(seeds)
         frontier: set[str] = set()
-        queue = [s for s in seeds if not is_auth_endpoint(s)]
+        queue = [s for s in seeds if not is_session_destroying_endpoint(s)]
         fetched = 0
 
         try:
@@ -75,7 +75,7 @@ class LinkHarvestAdapter(ToolAdapter):
                         if urlsplit(link).hostname != host:
                             continue
                         link = link.split("#")[0]
-                        if link in seen or is_auth_endpoint(link):
+                        if link in seen or is_session_destroying_endpoint(link):
                             continue
                         seen.add(link)
                         if urlsplit(link).query:

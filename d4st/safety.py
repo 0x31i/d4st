@@ -29,6 +29,25 @@ def is_auth_endpoint(url: str) -> bool:
     return bool(_AUTH_PATH.search(urlsplit(url).path))
 
 
+# Session-DESTROYING endpoints. Following one of these (even a plain GET during discovery)
+# logs the scanner out and blinds the rest of the authenticated crawl. This is deliberately
+# NARROWER than is_auth_endpoint: discovery may and should still traverse authenticated
+# content areas whose path merely contains an auth-ish word (e.g. /Authorization/,
+# /PasswordVault/, /AuthorList/, /Registers/). The broad is_auth_endpoint stays in force at
+# the ACTIVE-TEST gate (never fuzz a login/reset endpoint -> no account lockouts); this one
+# governs only what a GET-based crawler is allowed to follow.
+_LOGOUT_PATH = re.compile(
+    r"(logout|log-out|logoff|log-off|signout|sign-out|signoff|sign-off|"
+    r"(?:^|[/_-])exit(?:$|[/_-]))",
+    re.IGNORECASE,
+)
+
+
+def is_session_destroying_endpoint(url: str) -> bool:
+    """True only for logout / sign-out style links a crawler must never follow."""
+    return bool(_LOGOUT_PATH.search(urlsplit(url).path))
+
+
 # A realistic desktop-browser User-Agent. Non-browser UAs (python-httpx, d4st-*, curl) are widely
 # tarpitted or blocked by CDN/WAF stacks (GoDaddy DPS, Cloudflare, Akamai) — that silently zeroes a
 # scan against a protected site. Authorized engagements allow-list the source IP, not the UA, so

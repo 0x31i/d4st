@@ -68,6 +68,15 @@ VULN_META: dict[str, dict] = {
              "links that bounce victims to malicious sites (phishing, token theft).",
         fix="Redirect only to a server-side allow-list of paths; never redirect to a raw "
             "user-supplied absolute URL."),
+    "weak-session": dict(
+        title="Session Token / Credential Exposed in URL", severity="medium",
+        cwe="CWE-598 / CWE-384", owasp="A07:2021 Identification and Authentication Failures",
+        desc="A session identifier or credential is carried in the URL (query string or redirect "
+             "target). URLs leak through Referer headers, shared links, browser history, and "
+             "proxy/server access logs, exposing the token to session hijacking.",
+        fix="Carry session tokens in cookies (HttpOnly, Secure, SameSite) or the Authorization "
+            "header, never in the URL. Never place credentials or session tokens in redirect "
+            "targets; rotate any token that has been exposed in a URL."),
     "csrf": dict(
         title="Cross-Site Request Forgery", severity="medium", cwe="CWE-352",
         owasp="A01:2021 Broken Access Control",
@@ -331,6 +340,9 @@ _CLASSES: dict[str, list] = {
             "CAPEC-591: Reflected XSS", "CAPEC-592: Stored XSS"],
     "open-redirect": ["CWE-601: URL Redirection to Untrusted Site", "CAPEC-194: Fake the Source of Data"],
     "csrf": ["CWE-352: Cross-Site Request Forgery", "CAPEC-62: Cross Site Request Forgery"],
+    "weak-session": ["CWE-598: Use of GET Request with Sensitive Query Strings",
+                     "CWE-384: Session Fixation", "CWE-522: Insufficiently Protected Credentials",
+                     "CAPEC-593: Session Hijacking"],
     "bola": ["CWE-639: Authorization Bypass Through User-Controlled Key", "CWE-284: Improper Access Control",
              "CAPEC-180: Exploiting Incorrectly Configured Access Control"],
     "mass-assignment": ["CWE-915: Improperly Controlled Modification of Dynamically-Determined Attributes",
@@ -365,6 +377,8 @@ _REFS: dict[str, list] = {
                       ("PortSwigger: DOM-based open redirection", "https://portswigger.net/web-security/dom-based/open-redirection")],
     "csrf": [("OWASP: CSRF", "https://owasp.org/www-community/attacks/csrf"),
              ("OWASP Cheat Sheet: CSRF Prevention", "https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html")],
+    "weak-session": [("OWASP: Session Management Cheat Sheet", "https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html"),
+                     ("PortSwigger: Session hijacking", "https://portswigger.net/web-security/authentication")],
     "bola": [("OWASP API Top 10: BOLA", "https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/"),
              ("PortSwigger: IDOR", "https://portswigger.net/web-security/access-control/idor")],
     "mass-assignment": [("OWASP API Top 10: BOPLA", "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"),
