@@ -19,6 +19,33 @@ _log = logging.getLogger("d4st.passive")
 
 _MISCONFIG = "misconfiguration"
 _INFO = "info-disclosure"
+_WEAK_SESSION = "weak-session"
+
+# Session-identifier / credential parameter names that must never ride in a URL (they leak via
+# Referer, browser history, and proxy/server logs). Curated to be high-signal + low-FP: only
+# names that are unambiguously a session id, auth token, or credential — deliberately NOT the
+# generic "auth"/"token"/"key" which appear in benign params. Generic across any web stack.
+_SESSION_URL_PARAMS = {
+    "sessionid", "session_id", "session-id", "sid", "jsessionid", "phpsessid",
+    "aspsessionid", "asp.net_sessionid", "cfid", "cftoken", "sessiontoken",
+    "session_token", "session-token", "sessionkey", "session_key",
+    "access_token", "accesstoken", "id_token", "refresh_token", "bearer",
+    "jwt", "auth_token", "authtoken", "apikey", "api_key",
+    "password", "passwd", "pwd", "pass", "credential", "credentials",
+}
+
+
+def _session_params_in_query(url_or_target: str) -> list[str]:
+    """Return curated session/credential param names present in a URL's query string."""
+    from urllib.parse import parse_qs
+    q = urlsplit(url_or_target).query
+    if not q:
+        return []
+    found = []
+    for name in parse_qs(q, keep_blank_values=True):
+        if name.strip().lower() in _SESSION_URL_PARAMS:
+            found.append(name)
+    return found
 
 
 @dataclass
@@ -172,6 +199,19 @@ def check_response(url: str, status: int, headers: dict, body: str,
             add("cookie-no-httponly", _MISCONFIG, f"cookie {name} without HttpOnly flag")
         if "samesite" not in cl:
             add("cookie-no-samesite", _MISCONFIG, f"cookie {name} without SameSite attribute")
+
+    # Session token / credential carried in the URL (query string or redirect Location) — CWE-598.
+    # Tokens in the URL leak via Referer, shared links, browser history, and proxy/server logs.
+    for nm in _session_params_in_query(url):
+        add("session-token-in-url", _WEAK_SESSION,
+            f"session/credential parameter '{nm}' carried in the URL query string", sev="medium")
+    loc = h.get("location", "")
+    if loc:
+        loc_url = loc if "://" in loc else "http://_/" + loc.lstrip("/")
+        for nm in _session_params_in_query(loc_url):
+            add("session-token-in-url", _WEAK_SESSION,
+                f"redirect Location places session/credential parameter '{nm}' in the URL",
+                sev="medium")
 
     # Referrer-Policy (cross-domain referer leakage)
     if "referrer-policy" not in h:

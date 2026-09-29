@@ -171,3 +171,116 @@ class X8Adapter(ToolAdapter):
         urls = sorted({p["url"] for p in params if p.get("url")})
         return AdapterResult(tool=self.name, ok=True, discovered_urls=urls, findings=params,
                              command=cmd, note=f"{len(params)} hidden param(s)", raw=proc.stdout)
+
+
+def _with_param(url: str, param: str, value: str = "1") -> str:
+    """Return `url` with `param=value` merged into its query string (existing params kept).
+    Benign value; used only to make a discovered param a scannable frontier URL."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+    sp = urlsplit(url)
+    q = dict(parse_qsl(sp.query, keep_blank_values=True))
+    if param not in q:
+        q[param] = value
+    return urlunsplit((sp.scheme, sp.netloc, sp.path, urlencode(q), sp.fragment))
+
+
+def parse_arjun(obj) -> list[dict]:
+    """arjun -oJ writes {url: {"params": [...], "method": ..., "headers": {...}}}.
+    Return [{url, param, method}] flattened. Defensive against list/older shapes."""
+    out: list[dict] = []
+    if isinstance(obj, dict):
+        for url, info in obj.items():
+            if isinstance(info, dict):
+                params = info.get("params") or []
+                method = info.get("method", "GET")
+            else:
+                params, method = (info if isinstance(info, list) else []), "GET"
+            for p in params:
+                name = p.get("name") if isinstance(p, dict) else p
+                if name:
+                    out.append({"url": url, "param": name, "method": method})
+    elif isinstance(obj, list):
+        for r in obj:
+            if isinstance(r, dict) and r.get("url"):
+                for p in r.get("params", []) or []:
+                    name = p.get("name") if isinstance(p, dict) else p
+                    if name:
+                        out.append({"url": r["url"], "param": name,
+                                    "method": r.get("method", "GET")})
+    return out
+
+
+@register
+class ArjunAdapter(ToolAdapter):
+    """Hidden-parameter discovery (arjun). Non-active recon: it only probes for the existence of
+    accepted parameter names (differential response analysis with a junk-param baseline), never
+    injects attack payloads. Complements x8 with a larger default wordlist and passive sources.
+    Generic across any web stack; feeds discovered params into the frontier so downstream
+    injection stages test REAL params instead of a blind wordlist.
+    """
+    name = "arjun"
+    stage = "recon"
+    discovers = True
+    detects = False
+    active = False          # parameter existence probing only; no attack traffic
+    binary = "arjun"
+
+    def run(self, ctx: RunContext) -> AdapterResult:
+        import json
+        import os
+        import tempfile
+        targets = candidate_urls(ctx.seed_urls or [ctx.target], require_params=False,
+                                 cap=ctx.options.get("arjun_cap", 75))
+        cmd = f"arjun -i <{len(targets)} urls> -oJ <out> --stable"
+        if ctx.dry_run:
+            return AdapterResult(tool=self.name, ok=True, command=cmd, note="dry-run")
+        if not self.available():
+            return AdapterResult(tool=self.name, ok=False, command=cmd, note="arjun not found")
+        if not targets:
+            return AdapterResult(tool=self.name, ok=True, command=cmd, note="no targets")
+        with tempfile.TemporaryDirectory() as td:
+            inp = os.path.join(td, "urls.txt")
+            outp = os.path.join(td, "arjun.json")
+            with open(inp, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(targets))
+            # Politeness/safety: --stable + thread and rate ceilings track the scan profile so
+            # arjun can never emit more load than the engagement allows.
+            workers = int(ctx.options.get("workers", 2) or 2)
+            args = ["arjun", "-i", inp, "-oJ", outp, "--stable",
+                    "-t", str(max(1, min(workers, 10)))]
+            rate = ctx.options.get("arjun_rate") or ctx.options.get("rate_limit")
+            if rate:
+                args += ["--rate-limit", str(int(rate))]
+            delay = ctx.options.get("delay") or ctx.options.get("throttle")
+            if delay:
+                args += ["-d", str(delay)]
+            # Carry auth so param discovery reaches the authenticated surface. Honour both the
+            # session (scan stage) and options["cookie"] (discovery-loop convention).
+            header_lines = []
+            cookie = _cookie_header(ctx.session, ctx.target) or (ctx.options or {}).get("cookie")
+            if cookie:
+                header_lines.append(f"Cookie: {cookie}")
+            for hk, hv in ((ctx.session or {}).get("headers") or {}).items():
+                header_lines.append(f"{hk}: {hv}")
+            if header_lines:
+                args += ["--headers", "\n".join(header_lines)]
+            try:
+                proc = self._exec(args, timeout=ctx.options.get("timeout", 1800))
+            except Exception as exc:  # noqa: BLE001
+                return AdapterResult(tool=self.name, ok=False, command=cmd,
+                                     note=f"exec error: {exc}")
+            data = []
+            if os.path.exists(outp):
+                try:
+                    with open(outp, encoding="utf-8") as fh:
+                        data = json.load(fh)
+                except Exception:  # noqa: BLE001
+                    data = []
+        params = parse_arjun(data)
+        _ = proc  # command result kept implicitly; findings carry the params
+        # Synthesise param-annotated frontier URLs so downstream scanners actually TEST the hidden
+        # params (the frontier is URL-based). A benign probe value ("1") is used; real injection
+        # happens later in the authorization-gated scan stage, never here.
+        urls = sorted({_with_param(p["url"], p["param"]) for p in params if p.get("url")})
+        return AdapterResult(tool=self.name, ok=True, discovered_urls=urls, findings=params,
+                             command=cmd, note=f"{len(params)} hidden param(s)")

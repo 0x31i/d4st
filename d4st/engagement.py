@@ -2639,7 +2639,9 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
               "ferox_threads": _ferox_threads, "ferox_rate": _ferox_rate}
     if os.environ.get("D4ST_FEROX_WORDLIST"):   # operator override (e.g. a fast list)
         _dopts["ferox_wordlist"] = os.environ["D4ST_FEROX_WORDLIST"]
-    for _tool, _seeds in (("linkharvest", urls), ("feroxbuster", None)):
+    #  (c) arjun: hidden-parameter discovery on the crawled URLs, so downstream scanners test
+    #      REAL accepted params instead of a blind wordlist (non-active recon; --stable + rate cap).
+    for _tool, _seeds in (("linkharvest", urls), ("feroxbuster", None), ("arjun", urls)):
         try:
             _r = REGISTRY[_tool].run(_RC(target=target, seed_urls=_seeds or [], options=_dopts))
             if _r.discovered_urls:
@@ -3008,6 +3010,18 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             except Exception as _cpe:  # noqa: BLE001
                 print(f"[cspp] skipped: {_cpe}", flush=True)
             _prog.update("cspp", findings, urls=len(urls), targets=len(targets))
+
+            # XPath injection — error-based + boolean-based, READ-ONLY GET, detection-only (no data
+            # extraction), auth endpoints skipped. Closes the XPath gap vs Burp with low FP.
+            try:
+                from .activetests import run_xpath_checks
+                _xp = run_xpath_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_xp, "xpath")
+                if _xp:
+                    print(f"[xpath] {len(_xp)} XPath-injection finding(s)", flush=True)
+            except Exception as _xpe:  # noqa: BLE001
+                print(f"[xpath] skipped: {_xpe}", flush=True)
+            _prog.update("xpath", findings, urls=len(urls), targets=len(targets))
 
             # Backup/temp file exposure — probe .bak/.old/~/.swp/.zip variants of discovered files,
             # with a catch-all/soft-404 guard so we don't inherit phantom "backup file" FPs.

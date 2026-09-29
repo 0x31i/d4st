@@ -17,6 +17,7 @@ CSRF = "csrf"
 OPEN_REDIRECT = "open-redirect"
 WEAK_SESSION = "weak-session"
 SSRF = "ssrf"
+XPATH = "xpath"
 XXE = "xxe"
 SSTI = "ssti"
 INFO_DISCLOSURE = "info-disclosure"
@@ -25,7 +26,7 @@ OTHER = "other"
 
 CANONICAL = {
     SQL_INJECTION, XSS, COMMAND_INJECTION, FILE_INCLUSION, FILE_UPLOAD, CSRF,
-    OPEN_REDIRECT, WEAK_SESSION, SSRF, XXE, SSTI, INFO_DISCLOSURE, MISCONFIGURATION, OTHER,
+    OPEN_REDIRECT, WEAK_SESSION, SSRF, XXE, XPATH, SSTI, INFO_DISCLOSURE, MISCONFIGURATION, OTHER,
 }
 
 # CWE id -> canonical category.
@@ -40,6 +41,7 @@ _CWE = {
     "384": WEAK_SESSION, "613": WEAK_SESSION,
     "918": SSRF,
     "611": XXE,
+    "643": XPATH,
     "1336": SSTI, "94": SSTI,
     "200": INFO_DISCLOSURE,
     "16": MISCONFIGURATION, "693": MISCONFIGURATION,
@@ -59,6 +61,7 @@ _KEYWORDS = [
     (r"session\s*(id|fixation|token)|weak\s*session", WEAK_SESSION),
     (r"server[\s-]*side\s*request\s*forgery|(?<![a-z])ssrf(?![a-z])", SSRF),
     (r"xml\s*external|(?<![a-z])xxe(?![a-z])", XXE),
+    (r"xpath\s*inject|(?<![a-z])xpath(?![a-z])", XPATH),
     (r"template\s*injection|(?<![a-z])ssti(?![a-z])", SSTI),
 ]
 
