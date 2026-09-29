@@ -3011,6 +3011,18 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[cspp] skipped: {_cpe}", flush=True)
             _prog.update("cspp", findings, urls=len(urls), targets=len(targets))
 
+            # XPath injection — error-based + boolean-based, READ-ONLY GET, detection-only (no data
+            # extraction), auth endpoints skipped. Closes the XPath gap vs Burp with low FP.
+            try:
+                from .activetests import run_xpath_checks
+                _xp = run_xpath_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                findings += _as_findings(_xp, "xpath")
+                if _xp:
+                    print(f"[xpath] {len(_xp)} XPath-injection finding(s)", flush=True)
+            except Exception as _xpe:  # noqa: BLE001
+                print(f"[xpath] skipped: {_xpe}", flush=True)
+            _prog.update("xpath", findings, urls=len(urls), targets=len(targets))
+
             # Backup/temp file exposure — probe .bak/.old/~/.swp/.zip variants of discovered files,
             # with a catch-all/soft-404 guard so we don't inherit phantom "backup file" FPs.
             try:

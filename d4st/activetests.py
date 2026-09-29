@@ -349,6 +349,125 @@ def run_cspp_checks(session, base: str, urls: list[str], *,
     return findings
 
 
+# XPath parser error signatures across common engines (PHP SimpleXML/libxml, .NET System.Xml,
+# Java javax.xml.xpath/Saxon/Xalan, Python lxml). Generic — not tied to any one app.
+_XPATH_ERR = re.compile(
+    r"(XPathException|javax\.xml\.xpath|System\.Xml\.XPath|MS\.Internal\.Xml|"
+    r"org\.apache\.xpath|net\.sf\.saxon|SimpleXMLElement::xpath|xmlXPathEval|"
+    r"XPathEvalError|Expression must evaluate to a node-set|A location step was expected|"
+    r"Invalid predicate|unclosed token|Unfinished literal|Error parsing XPath|"
+    r"warning:.*xpath|xpath.*(syntax|compilation) error|Invalid XPath expression)",
+    re.IGNORECASE,
+)
+
+
+def run_xpath_checks(session, base: str, urls: list[str], *,
+                     delay: float = 0.2, timeout: float = 12.0, max_urls: int = 25,
+                     max_params: int = 12, throttle=None) -> list[dict]:
+    """XPath injection detection (error-based + boolean-based). READ-ONLY GET, DETECTION-ONLY.
+
+    Safety: never extracts data (no blind bit-by-bit document dumping), never touches auth
+    endpoints (is_auth_endpoint), uses only the classic non-destructive detection payloads
+    (`'`, `' or '1'='1`, `' and '1'='2`), and paces every request. Low-FP by construction:
+    - error-based fires only when an XPath parser error appears that is ABSENT from the clean
+      baseline response;
+    - boolean-based fires only on a STARK true/false differential (TRUE ~ baseline, FALSE clearly
+      different, and the two differ from each other) on a non-trivial page.
+    """
+    import httpx
+    from urllib.parse import parse_qsl, quote, urlunsplit
+    from urllib.parse import urlsplit as _us
+
+    from .safety import is_auth_endpoint, pace
+
+    origin = f"{_us(base).scheme}://{_us(base).netloc}"
+    cand = []
+    for u in urls:
+        if not u.startswith(origin) or is_auth_endpoint(u):
+            continue
+        sp = _us(u)
+        if sp.query:
+            cand.append(sp)
+        if len(cand) >= max_urls:
+            break
+    if not cand:
+        return []
+    authed = _authed_headers(session, base)
+    findings: list[dict] = []
+
+    def _req(c, sp, params, idx, payload):
+        qparts = [f"{k}={quote(payload, safe='')}" if j == idx else f"{k}={quote(vv, safe='')}"
+                  for j, (k, vv) in enumerate(params)]
+        url = urlunsplit((sp.scheme, sp.netloc, sp.path, "&".join(qparts), ""))
+        r = c.get(url, headers=authed)
+        pace(throttle, delay, r.status_code)
+        return url, r
+
+    with httpx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
+        for sp in cand:
+            params = parse_qsl(sp.query, keep_blank_values=True)
+            if not params:
+                continue
+            try:
+                _, rb = _req(c, sp, params, -1, "")   # baseline: all original values re-encoded
+            except Exception:  # noqa: BLE001
+                continue
+            base_body = rb.text or ""
+            base_len = len(base_body)
+            base_has_err = bool(_XPATH_ERR.search(base_body))
+            for i, (pn, pv) in enumerate(params[:max_params]):
+                # 1) ERROR-BASED — an unbalanced quote provokes an XPath parser error.
+                try:
+                    eurl, re_ = _req(c, sp, params, i, f"{pv}'")
+                except Exception:  # noqa: BLE001
+                    continue
+                m = _XPATH_ERR.search(re_.text or "")
+                if m and not base_has_err:
+                    findings.append({
+                        "type": "xpath-injection", "name": "xpath-injection",
+                        "severity": "high", "url": eurl, "method": "GET",
+                        "category": "xpath", "verified": True,
+                        "detail": f"parameter '{pn}' is injectable into an XPath query: an "
+                                  f"unbalanced quote produced an XPath parser error "
+                                  f"('{m.group(0)[:60]}') absent from the clean baseline, proving "
+                                  f"the input reaches an XPath expression. Detection only — no data "
+                                  f"was extracted.",
+                        "evidence_log": [exchange(
+                            f"PROOF (error-based) — XPath parser error via '{pn}'", re_)],
+                        "repro": curl(re_),
+                    })
+                    return findings
+                # 2) BOOLEAN-BASED — TRUE tautology ~ baseline, FALSE contradiction differs.
+                if base_len <= 200:
+                    continue
+                try:
+                    _, rt = _req(c, sp, params, i, f"{pv}' or '1'='1")
+                    furl, rf = _req(c, sp, params, i, f"{pv}' and '1'='2")
+                except Exception:  # noqa: BLE001
+                    continue
+                tb, fb = rt.text or "", rf.text or ""
+                t_ratio = abs(len(tb) - base_len) / base_len
+                f_ratio = abs(len(fb) - base_len) / base_len
+                tf_ratio = abs(len(tb) - len(fb)) / base_len
+                if t_ratio < 0.05 and f_ratio > 0.30 and tf_ratio > 0.30:
+                    findings.append({
+                        "type": "xpath-injection", "name": "xpath-injection",
+                        "severity": "high", "url": furl, "method": "GET",
+                        "category": "xpath", "verified": True,
+                        "detail": f"parameter '{pn}' shows a boolean XPath differential: a TRUE "
+                                  f"condition (' or '1'='1) returns the baseline page while a FALSE "
+                                  f"condition (' and '1'='2) collapses the result set "
+                                  f"(baseline≈{base_len}B, TRUE≈{len(tb)}B, FALSE≈{len(fb)}B). "
+                                  f"Detection only — no data was extracted.",
+                        "evidence_log": [
+                            exchange("PROOF (boolean TRUE) — ' or '1'='1", rt),
+                            exchange("PROOF (boolean FALSE) — ' and '1'='2", rf)],
+                        "repro": curl(rf),
+                    })
+                    return findings
+    return findings
+
+
 _BACKUP_SUFFIXES = (".bak", ".old", ".orig", ".save", ".copy", ".tmp", ".1",
                     ".zip", ".gz", ".tar.gz", ".rar", ".7z")
 
