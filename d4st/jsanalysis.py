@@ -196,6 +196,87 @@ def detect_vuln_libs(js_text: str, url: str) -> list[VulnLib]:
     return found
 
 
+def parse_retirejs(obj) -> list[VulnLib]:
+    """Parse `retire --outputformat json` output into VulnLib rows. Defensive across retire
+    versions (accepts the {"data": [...]} wrapper or a bare list). One row per vulnerable
+    component, detail summarising the top severity + CVE ids."""
+    data = obj.get("data", obj) if isinstance(obj, dict) else obj
+    if not isinstance(data, list):
+        return []
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    out: list[VulnLib] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        fpath = entry.get("file", "")
+        for res in entry.get("results", []) or []:
+            if not isinstance(res, dict):
+                continue
+            vulns = [v for v in (res.get("vulnerabilities") or []) if isinstance(v, dict)]
+            if not vulns:
+                continue
+            comp = res.get("component", "?")
+            ver = res.get("version", "?")
+            sevs = [str(v.get("severity", "")).lower() for v in vulns]
+            top = min((s for s in sevs if s), key=lambda s: order.get(s, 9), default="known")
+            cves: list[str] = []
+            summ = ""
+            for v in vulns:
+                ids = v.get("identifiers", {}) or {}
+                cves += list(ids.get("CVE", []) or [])
+                if not summ:
+                    summ = ids.get("summary", "") or (
+                        (v.get("info") or [""])[0] if v.get("info") else "")
+            detail = f"[{top}] {len(vulns)} known vuln(s)"
+            if cves:
+                detail += " (" + ", ".join(cves[:3]) + ")"
+            if summ:
+                detail += f": {summ[:140]}"
+            out.append(VulnLib(library=comp, version=ver, url=fpath, detail=detail))
+    return out
+
+
+def run_retirejs(js_dir: str, timeout: int = 300) -> list[VulnLib]:
+    """Authoritative vulnerable-JS-dependency scan: run the retire.js binary over a directory of
+    downloaded JS using its maintained vulnerability database (far broader than the built-in lite
+    signatures). Returns [] silently if `retire` is NOT installed — it NEVER auto-installs (that
+    would egress, unsafe on air-gapped/PHI engagements), so detect_vuln_libs stays the baseline.
+    """
+    import json
+    import os
+    import shutil
+    import subprocess
+    if not js_dir or not os.path.isdir(js_dir):
+        return []
+    binary = shutil.which("retire")
+    if not binary:
+        return []
+    try:
+        if not any(fn.endswith(".js") for fn in os.listdir(js_dir)):
+            return []
+    except OSError:
+        return []
+    try:
+        proc = subprocess.run([binary, "--jspath", js_dir, "--outputformat", "json"],
+                              capture_output=True, text=True, timeout=timeout, check=False)
+    except Exception:  # noqa: BLE001
+        return []
+    raw = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    if not raw:
+        return []
+    try:
+        obj = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        start = raw.find("{")
+        if start < 0:
+            return []
+        try:
+            obj = json.loads(raw[start:])
+        except Exception:  # noqa: BLE001
+            return []
+    return parse_retirejs(obj)
+
+
 # ----- JS CONTENT disclosure scanning (Burp parity: connstrings, emails, hardcoded keys) --------
 # These classes live in the SPA's chunk-*.js BODIES. The crawler reaches the chunks but nothing
 # scanned their content (run_roster's gitleaks/trufflehog need a populated js_dir, which nothing
@@ -280,6 +361,7 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
 
     findings: list[dict] = []
     endpoints: list[str] = []
+    file_url: dict = {}          # saved-file path -> source URL (for retire.js proof)
     seen_find: set = set()
     seen_ep: set = set()
     seen_urls: set = set()
@@ -335,6 +417,7 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
                     with open(fn, "w", encoding="utf-8") as fh:
                         fh.write(txt)
                     saved += 1
+                    file_url[fn] = u
                 except Exception:  # noqa: BLE001, S112
                     pass
                 for vl in detect_vuln_libs(txt, u):
@@ -373,6 +456,26 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
                             queue.append(cu)
     finally:
         client.close()
+    # Authoritative pass: if the retire.js binary is installed, scan the downloaded JS dir with its
+    # maintained vulnerability DB (far broader than the lite signatures above). No-op if retire is
+    # absent — never auto-installs (no egress). Deduped against the lite findings by (lib, version).
+    for vl in run_retirejs(out_dir):
+        k = ("dep", vl.library, vl.version)
+        if k in seen_find:
+            continue
+        seen_find.add(k)
+        src = file_url.get(vl.url, vl.url)           # map on-disk file back to its source URL
+        proof = []
+        try:
+            with open(vl.url, encoding="utf-8", errors="replace") as fh:
+                _txt = fh.read()
+            proof = _js_proof(src, _txt, 200, "application/javascript", vl.version)
+        except Exception:  # noqa: BLE001
+            proof = []
+        findings.append({"category": "vulnerable-js-dependency", "url": src,
+                         "param": vl.library,
+                         "detail": f"{vl.library} {vl.version}: {vl.detail} (retire.js)",
+                         "evidence_log": proof, "repro": f"curl -i '{src}'"})
     return saved, findings, endpoints, truncated
 
 
