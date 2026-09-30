@@ -3036,6 +3036,21 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 print(f"[cache-poison] skipped: {_wce}", flush=True)
             _prog.update("cache-poison", findings, urls=len(urls), targets=len(targets))
 
+            # Injection completeness — NoSQL, LDAP, server-side HPP. READ-ONLY GET, detection-only
+            # (error-based + differential/canary), auth endpoints skipped. Same safety model as XPath.
+            for _pname, _pfn in (("nosql", "run_nosql_checks"), ("ldap", "run_ldap_checks"),
+                                 ("hpp", "run_hpp_checks")):
+                try:
+                    import importlib
+                    _fn = getattr(importlib.import_module("d4st.activetests"), _pfn)
+                    _pr = _fn(session, target, urls, delay=_base_delay, throttle=_thr)
+                    findings += _as_findings(_pr, _pname)
+                    if _pr:
+                        print(f"[{_pname}] {len(_pr)} finding(s)", flush=True)
+                except Exception as _pe:  # noqa: BLE001
+                    print(f"[{_pname}] skipped: {_pe}", flush=True)
+                _prog.update(_pname, findings, urls=len(urls), targets=len(targets))
+
             # Backup/temp file exposure — probe .bak/.old/~/.swp/.zip variants of discovered files,
             # with a catch-all/soft-404 guard so we don't inherit phantom "backup file" FPs.
             try:

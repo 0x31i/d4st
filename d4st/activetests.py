@@ -552,6 +552,210 @@ def run_xpath_checks(session, base: str, urls: list[str], *,
     return findings
 
 
+_NOSQL_ERR = re.compile(
+    r"(MongoError|MongoServerError|MongoParseError|MongoDB|BSONError|CastError to|E11000|"
+    r"\$where|failed to (parse|optimize)|unterminated string|couldn't parse|NoSQL|"
+    r"com\.mongodb|pymongo|couchdb|N1QL)", re.IGNORECASE)
+_LDAP_ERR = re.compile(
+    r"(LDAPException|javax\.naming\.directory|com\.sun\.jndi\.ldap|Invalid DN syntax|"
+    r"LDAP:\s*error code|Bad search filter|supplied argument is not a valid ldap|"
+    r"AcceptSecurityContext|OpenLDAP|ldap_search|protocol error.*ldap)", re.IGNORECASE)
+
+
+def _param_candidates(base, urls, max_urls):
+    """In-scope, non-auth URLs that carry query params (shared by the injection probes)."""
+    from urllib.parse import urlsplit as _us
+    from .safety import is_auth_endpoint
+    origin = f"{_us(base).scheme}://{_us(base).netloc}"
+    out = []
+    for u in urls:
+        if not u.startswith(origin) or is_auth_endpoint(u):
+            continue
+        if _us(u).query:
+            out.append(_us(u))
+        if len(out) >= max_urls:
+            break
+    return out
+
+
+def _finding(category, severity, url, param, detail, resp):
+    """Shared finding-dict builder for the injection probes (canary/error-verified, with proof)."""
+    return {"type": category, "name": category, "severity": severity, "url": url,
+            "method": "GET", "category": category, "verified": True, "param": param,
+            "detail": detail, "evidence_log": [exchange(f"PROOF — {category}", resp)],
+            "repro": curl(resp)}
+
+
+def run_nosql_checks(session, base, urls, *, delay=0.2, timeout=12.0, max_urls=25,
+                     max_params=10, throttle=None) -> list[dict]:
+    """NoSQL injection detection (error-based + boolean-operator differential). READ-ONLY GET,
+    detection-only. error-based: a NoSQL/Mongo parser error appears that is absent from baseline.
+    boolean: a `[$ne]` operator injection (equality -> not-equal) starkly changes the result set."""
+    import httpx
+    from urllib.parse import parse_qsl, quote, urlunsplit
+    cand = _param_candidates(base, urls, max_urls)
+    if not cand:
+        return []
+    authed = _authed_headers(session, base)
+    from .safety import pace
+    findings = []
+
+    def _get(c, sp, query):
+        url = urlunsplit((sp.scheme, sp.netloc, sp.path, query, ""))
+        r = c.get(url, headers=authed)
+        pace(throttle, delay, r.status_code)
+        return url, r
+
+    with httpx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
+        for sp in cand:
+            params = parse_qsl(sp.query, keep_blank_values=True)
+            try:
+                _, rb = _get(c, sp, sp.query)
+            except Exception:  # noqa: BLE001
+                continue
+            base_body = rb.text or ""
+            base_len = len(base_body)
+            base_err = bool(_NOSQL_ERR.search(base_body))
+            for i, (pn, pv) in enumerate(params[:max_params]):
+                # error-based
+                q_err = "&".join(f"{k}={quote(pv + chr(39), safe='')}" if j == i
+                                 else f"{k}={quote(vv, safe='')}" for j, (k, vv) in enumerate(params))
+                try:
+                    eurl, re_ = _get(c, sp, q_err)
+                except Exception:  # noqa: BLE001
+                    continue
+                m = _NOSQL_ERR.search(re_.text or "")
+                if m and not base_err:
+                    findings.append(_finding("nosql-injection", "high", eurl, pn,
+                        f"parameter '{pn}' triggers a NoSQL parser error ('{m.group(0)[:50]}') "
+                        f"absent from baseline. Detection only.", re_))
+                    return findings
+                # boolean operator: rename param to param[$ne] (equality -> not-equal)
+                q_ne = "&".join(f"{quote(k)}[$ne]={quote(pv, safe='')}" if j == i
+                                else f"{k}={quote(vv, safe='')}" for j, (k, vv) in enumerate(params))
+                if base_len <= 200:
+                    continue
+                try:
+                    nurl, rn = _get(c, sp, q_ne)
+                except Exception:  # noqa: BLE001
+                    continue
+                nb = rn.text or ""
+                if abs(len(nb) - base_len) / base_len > 0.30:
+                    findings.append(_finding("nosql-injection", "high", nurl, pn,
+                        f"parameter '{pn}' shows a NoSQL operator differential: injecting a "
+                        f"'[$ne]' operator materially changed the result set "
+                        f"(baseline≈{base_len}B, [$ne]≈{len(nb)}B). Detection only.", rn))
+                    return findings
+    return findings
+
+
+def run_ldap_checks(session, base, urls, *, delay=0.2, timeout=12.0, max_urls=25,
+                    max_params=10, throttle=None) -> list[dict]:
+    """LDAP injection detection (error-based + wildcard differential). READ-ONLY GET,
+    detection-only. error-based: an unbalanced filter char provokes an LDAP error absent from
+    baseline. wildcard: a bare '*' matches far more entries than a specific value."""
+    import httpx
+    from urllib.parse import parse_qsl, quote, urlunsplit
+    cand = _param_candidates(base, urls, max_urls)
+    if not cand:
+        return []
+    authed = _authed_headers(session, base)
+    from .safety import pace
+    findings = []
+
+    def _get(c, sp, query):
+        url = urlunsplit((sp.scheme, sp.netloc, sp.path, query, ""))
+        r = c.get(url, headers=authed)
+        pace(throttle, delay, r.status_code)
+        return url, r
+
+    with httpx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
+        for sp in cand:
+            params = parse_qsl(sp.query, keep_blank_values=True)
+            try:
+                _, rb = _get(c, sp, sp.query)
+            except Exception:  # noqa: BLE001
+                continue
+            base_body = rb.text or ""
+            base_len = len(base_body)
+            base_err = bool(_LDAP_ERR.search(base_body))
+            for i, (pn, pv) in enumerate(params[:max_params]):
+                q_err = "&".join(f"{k}={quote(pv + ')(', safe='')}" if j == i
+                                 else f"{k}={quote(vv, safe='')}" for j, (k, vv) in enumerate(params))
+                try:
+                    eurl, re_ = _get(c, sp, q_err)
+                except Exception:  # noqa: BLE001
+                    continue
+                m = _LDAP_ERR.search(re_.text or "")
+                if m and not base_err:
+                    findings.append(_finding("ldap-injection", "high", eurl, pn,
+                        f"parameter '{pn}' triggers an LDAP filter error ('{m.group(0)[:50]}') "
+                        f"absent from baseline. Detection only.", re_))
+                    return findings
+                if base_len <= 200:
+                    continue
+                q_wc = "&".join(f"{k}=*" if j == i else f"{k}={quote(vv, safe='')}"
+                                for j, (k, vv) in enumerate(params))
+                try:
+                    wurl, rw = _get(c, sp, q_wc)
+                except Exception:  # noqa: BLE001
+                    continue
+                wb = rw.text or ""
+                if (len(wb) - base_len) / base_len > 0.40:   # wildcard returns materially MORE
+                    findings.append(_finding("ldap-injection", "high", wurl, pn,
+                        f"parameter '{pn}' shows an LDAP wildcard differential: a bare '*' returned "
+                        f"materially more data than a specific value (baseline≈{base_len}B, "
+                        f"'*'≈{len(wb)}B), indicating unescaped input in an LDAP filter. "
+                        f"Detection only.", rw))
+                    return findings
+    return findings
+
+
+def run_hpp_checks(session, base, urls, *, delay=0.2, timeout=12.0, max_urls=25,
+                   max_params=10, throttle=None) -> list[dict]:
+    """Server-side HTTP Parameter Pollution detection. READ-ONLY GET, canary-verified, low-FP:
+    a duplicate parameter with two distinct canaries is reflected as BOTH values (concatenation,
+    the classic ASP.NET behaviour) when the single-value baseline reflected only one."""
+    import httpx
+    from urllib.parse import parse_qsl, quote, urlunsplit
+    cand = _param_candidates(base, urls, max_urls)
+    if not cand:
+        return []
+    authed = _authed_headers(session, base)
+    from .safety import pace
+    c1, c2 = "d4sthppA1", "d4sthppB2"
+    findings = []
+
+    def _get(c, sp, query):
+        url = urlunsplit((sp.scheme, sp.netloc, sp.path, query, ""))
+        r = c.get(url, headers=authed)
+        pace(throttle, delay, r.status_code)
+        return url, r
+
+    with httpx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
+        for sp in cand:
+            params = parse_qsl(sp.query, keep_blank_values=True)
+            for i, (pn, _pv) in enumerate(params[:max_params]):
+                q_single = "&".join(f"{k}={c1}" if j == i else f"{k}={quote(vv, safe='')}"
+                                    for j, (k, vv) in enumerate(params))
+                q_dup = "&".join(f"{k}={c1}&{k}={c2}" if j == i else f"{k}={quote(vv, safe='')}"
+                                 for j, (k, vv) in enumerate(params))
+                try:
+                    _, rs = _get(c, sp, q_single)
+                    durl, rd = _get(c, sp, q_dup)
+                except Exception:  # noqa: BLE001
+                    continue
+                sb, db = rs.text or "", rd.text or ""
+                # HPP: the duplicate request reflects BOTH canaries, but the single reflected only c1
+                if c1 in db and c2 in db and not (c1 in sb and c2 in sb):
+                    findings.append(_finding("parameter-pollution", "medium", durl, pn,
+                        f"parameter '{pn}' is merged when duplicated: both injected values were "
+                        f"reflected for '{pn}={c1}&{pn}={c2}' (concatenation), enabling validation/WAF "
+                        f"bypass via duplicate parameters.", rd))
+                    return findings
+    return findings
+
+
 _BACKUP_SUFFIXES = (".bak", ".old", ".orig", ".save", ".copy", ".tmp", ".1",
                     ".zip", ".gz", ".tar.gz", ".rar", ".7z")
 
