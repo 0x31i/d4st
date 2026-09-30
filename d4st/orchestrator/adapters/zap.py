@@ -49,6 +49,49 @@ def parse_zap(report: dict) -> tuple[list[dict], list[str]]:
     return findings, sorted(urls)
 
 
+def _ajax_config(options: dict) -> str:
+    """ZAP `-config` string tuning the AJAX Spider for depth on JS-heavy / ASP.NET WebForms apps.
+    The AJAX spider drives a real browser and triggers __doPostBack/JS navigation the traditional
+    spider misses; its CLI defaults are shallow, so we push crawl depth + duration and click every
+    element. All values are generic knobs (no target specifics), overridable via options/env."""
+    o = options or {}
+    depth = int(o.get("zap_ajax_depth", os.environ.get("D4ST_ZAP_AJAX_DEPTH", 10)))
+    dur = int(o.get("zap_ajax_duration_min", os.environ.get("D4ST_ZAP_AJAX_DURATION", 10)))
+    browsers = int(o.get("zap_ajax_browsers", os.environ.get("D4ST_ZAP_AJAX_BROWSERS", 1)))
+    browser = o.get("zap_ajax_browser", os.environ.get("D4ST_ZAP_AJAX_BROWSER", "firefox-headless"))
+    return (
+        f"-config ajaxSpider.maxCrawlDepth={depth} "
+        f"-config ajaxSpider.maxDuration={dur} "
+        f"-config ajaxSpider.numberOfBrowsers={browsers} "
+        f"-config ajaxSpider.browserId={browser} "
+        # click every element (not once) so grid paging / dropdown postbacks are all exercised
+        "-config ajaxSpider.clickElemsOnce=false "
+        "-config ajaxSpider.clickDefaultElems=false"
+    )
+
+
+def _cookie_config(cookie: str) -> str:
+    """Best-effort auth: replace the Cookie header on every ZAP request."""
+    return (
+        "-config replacer.full_list(0).description=auth "
+        "-config replacer.full_list(0).enabled=true "
+        "-config replacer.full_list(0).matchtype=REQ_HEADER "
+        "-config replacer.full_list(0).matchstr=Cookie "
+        f"-config replacer.full_list(0).replacement={cookie}"
+    )
+
+
+def build_zap_args(target: str, cookie: str, options: dict) -> list[str]:
+    """Assemble the zap-full-scan.py argv. `-j` enables the AJAX Spider; we always tune it deeper.
+    Extracted so the invocation is unit-testable without a ZAP install."""
+    args = ["zap-full-scan.py", "-t", target, "-J", "report.json", "-j"]
+    zcfg = _ajax_config(options)
+    if cookie:
+        zcfg = _cookie_config(cookie) + " " + zcfg
+    args += ["-z", zcfg]
+    return args
+
+
 @register
 class ZapAdapter(ToolAdapter):
     name = "zap"
@@ -59,7 +102,7 @@ class ZapAdapter(ToolAdapter):
     binary = "zap-full-scan.py"
 
     def run(self, ctx: RunContext) -> AdapterResult:
-        cmd = f"zap-full-scan.py -t {ctx.target} -J report.json -j"
+        cmd = f"zap-full-scan.py -t {ctx.target} -J report.json -j (AJAX spider tuned deep)"
         if ctx.dry_run:
             return AdapterResult(tool=self.name, ok=True, command=cmd, note="dry-run (not executed)")
         if not self.available():
@@ -69,18 +112,8 @@ class ZapAdapter(ToolAdapter):
         try:
             workdir = tempfile.mkdtemp(prefix="zap_")
             report_path = os.path.join(workdir, "report.json")
-            args = ["zap-full-scan.py", "-t", ctx.target, "-J", "report.json", "-j"]
             cookie = _cookie_header(ctx.session, ctx.target)
-            if cookie:
-                # best-effort header injection; Phase 3 replaces this with a ZAP context
-                zap_opts = (
-                    "-config replacer.full_list(0).description=auth "
-                    "-config replacer.full_list(0).enabled=true "
-                    "-config replacer.full_list(0).matchtype=REQ_HEADER "
-                    "-config replacer.full_list(0).matchstr=Cookie "
-                    f"-config replacer.full_list(0).replacement={cookie}"
-                )
-                args += ["-z", zap_opts]
+            args = build_zap_args(ctx.target, cookie, ctx.options)
             proc = self._exec(args, timeout=ctx.options.get("timeout", 3600))
             report = {}
             # zap-full-scan writes the report into its working directory
