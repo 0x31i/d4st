@@ -87,6 +87,29 @@ VULN_META: dict[str, dict] = {
         fix="Disable DOCTYPE / external-entity and external-DTD processing in every XML parser "
             "(set FEATURE_SECURE_PROCESSING, disallow-doctype-decl, external-general/parameter "
             "entities off). Prefer a hardened parser configuration or a non-XML format."),
+    "nosql-injection": dict(
+        title="NoSQL Injection", severity="high", cwe="CWE-943",
+        owasp="A03:2021 Injection",
+        desc="User input is interpreted as part of a NoSQL query (e.g. MongoDB operators like $ne / "
+             "$gt or a JS $where clause), letting an attacker bypass authentication or read/alter "
+             "documents.",
+        fix="Never build queries from raw input; cast/validate types, reject query operators in "
+            "user fields, and use the driver's parameterised query API. Disable server-side JS ($where)."),
+    "ldap-injection": dict(
+        title="LDAP Injection", severity="high", cwe="CWE-90",
+        owasp="A03:2021 Injection",
+        desc="User input is concatenated into an LDAP filter, letting an attacker alter the filter "
+             "logic (e.g. inject '*' or ')(' ) to bypass authentication or enumerate directory data.",
+        fix="Escape LDAP special characters per RFC 4515, validate input, and bind with "
+            "least-privilege accounts; prefer parameterised directory APIs."),
+    "parameter-pollution": dict(
+        title="HTTP Parameter Pollution", severity="medium", cwe="CWE-235",
+        owasp="A03:2021 Injection",
+        desc="The application merges duplicate request parameters (e.g. reflects both values), so an "
+             "attacker can override values or smuggle input past validation/WAF layers that only "
+             "inspect the first occurrence.",
+        fix="Normalise duplicate parameters server-side (reject or take a single defined occurrence); "
+            "ensure validation and the consuming code see the same value."),
     "xpath": dict(
         title="XPath Injection", severity="high", cwe="CWE-643",
         owasp="A03:2021 Injection",
@@ -371,6 +394,10 @@ _CLASSES: dict[str, list] = {
                             "CWE-444: HTTP Request/Response Smuggling", "CAPEC-141: Cache Poisoning"],
     "xxe": ["CWE-611: Improper Restriction of XML External Entity Reference",
             "CWE-827: Improper Control of Document Type Definition", "CAPEC-221: XXE"],
+    "nosql-injection": ["CWE-943: Improper Neutralization of Special Elements in Data Query Logic",
+                        "CWE-89: SQL Injection (family)", "CAPEC-676: NoSQL Injection"],
+    "ldap-injection": ["CWE-90: LDAP Injection", "CAPEC-136: LDAP Injection"],
+    "parameter-pollution": ["CWE-235: Improper Handling of Extra Parameters", "CAPEC-460: HTTP Parameter Pollution"],
     "xpath": ["CWE-643: Improper Neutralization of Data within XPath Expressions",
              "CWE-91: XML Injection", "CAPEC-83: XPath Injection"],
     "weak-session": ["CWE-598: Use of GET Request with Sensitive Query Strings",
@@ -414,6 +441,12 @@ _REFS: dict[str, list] = {
                             ("OWASP: Cache Poisoning", "https://owasp.org/www-community/attacks/Cache_Poisoning")],
     "xxe": [("OWASP: XXE", "https://owasp.org/www-community/vulnerabilities/XML_External_Entity_(XXE)_Processing"),
             ("OWASP Cheat Sheet: XXE Prevention", "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html")],
+    "nosql-injection": [("OWASP: NoSQL Injection", "https://owasp.org/www-community/Injection_Flaws"),
+                        ("PortSwigger: NoSQL injection", "https://portswigger.net/web-security/nosql-injection")],
+    "ldap-injection": [("OWASP: LDAP Injection", "https://owasp.org/www-community/attacks/LDAP_Injection"),
+                       ("OWASP Cheat Sheet: LDAP Injection Prevention", "https://cheatsheetseries.owasp.org/cheatsheets/LDAP_Injection_Prevention_Cheat_Sheet.html")],
+    "parameter-pollution": [("OWASP: HTTP Parameter Pollution", "https://owasp.org/www-community/attacks/HTTP_Parameter_Pollution"),
+                            ("OWASP Testing Guide: HPP", "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/04-Testing_for_HTTP_Parameter_Pollution")],
     "xpath": [("OWASP: XPath Injection", "https://owasp.org/www-community/attacks/XPATH_Injection"),
              ("PortSwigger: XPath injection", "https://portswigger.net/kb/issues/00100600_xpath-injection")],
     "weak-session": [("OWASP: Session Management Cheat Sheet", "https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html"),

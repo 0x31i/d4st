@@ -18,6 +18,9 @@ OPEN_REDIRECT = "open-redirect"
 WEAK_SESSION = "weak-session"
 SSRF = "ssrf"
 XPATH = "xpath"
+NOSQL = "nosql-injection"
+LDAP = "ldap-injection"
+HPP = "parameter-pollution"
 XXE = "xxe"
 SSTI = "ssti"
 INFO_DISCLOSURE = "info-disclosure"
@@ -26,7 +29,8 @@ OTHER = "other"
 
 CANONICAL = {
     SQL_INJECTION, XSS, COMMAND_INJECTION, FILE_INCLUSION, FILE_UPLOAD, CSRF,
-    OPEN_REDIRECT, WEAK_SESSION, SSRF, XXE, XPATH, SSTI, INFO_DISCLOSURE, MISCONFIGURATION, OTHER,
+    OPEN_REDIRECT, WEAK_SESSION, SSRF, XXE, XPATH, NOSQL, LDAP, HPP, SSTI,
+    INFO_DISCLOSURE, MISCONFIGURATION, OTHER,
 }
 
 # CWE id -> canonical category.
@@ -42,6 +46,9 @@ _CWE = {
     "918": SSRF,
     "611": XXE,
     "643": XPATH,
+    "943": NOSQL,
+    "90": LDAP,
+    "235": HPP,
     "1336": SSTI, "94": SSTI,
     "200": INFO_DISCLOSURE,
     "16": MISCONFIGURATION, "693": MISCONFIGURATION,
@@ -62,6 +69,9 @@ _KEYWORDS = [
     (r"server[\s-]*side\s*request\s*forgery|(?<![a-z])ssrf(?![a-z])", SSRF),
     (r"xml\s*external|(?<![a-z])xxe(?![a-z])", XXE),
     (r"xpath\s*inject|(?<![a-z])xpath(?![a-z])", XPATH),
+    (r"nosql\s*inject|mongo(db)?\s*inject|(?<![a-z])nosqli(?![a-z])", NOSQL),
+    (r"ldap\s*inject", LDAP),
+    (r"parameter\s*pollution|(?<![a-z])hpp(?![a-z])", HPP),
     (r"template\s*injection|(?<![a-z])ssti(?![a-z])", SSTI),
 ]
 
