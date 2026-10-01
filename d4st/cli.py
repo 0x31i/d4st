@@ -130,8 +130,11 @@ def auth() -> None:
 @click.option("--password", "-w", default=None,
               help="Login password (overrides profile/env creds). NOTE: visible in shell history/ps — "
                    "prefer the profile's *_env vars for anything you want to keep secret.")
+@click.option("--timeout", "timeout_ms", default=30000, type=int, show_default=True,
+              help="Per-step Playwright timeout in ms (raise for apps with a slow cold-start / SPA bootstrap).")
 def auth_capture(profile: str, base: str | None, out: str, security: str | None,
-                 interactive: bool, headed: bool, username: str | None, password: str | None) -> None:
+                 interactive: bool, headed: bool, username: str | None, password: str | None,
+                 timeout_ms: int = 30000) -> None:
     """Establish and persist a login session (the one-time set)."""
     from .auth.capture import capture_interactive, capture_scripted
     from .auth.profile import load_profile
@@ -142,7 +145,7 @@ def auth_capture(profile: str, base: str | None, out: str, security: str | None,
             session = capture_interactive(prof, base, security=security)
         else:
             session = capture_scripted(prof, base, headless=not headed, security=security,
-                                       username=username, password=password)
+                                       username=username, password=password, timeout_ms=timeout_ms)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
     session.save(out)
@@ -237,6 +240,58 @@ def auth_show(session_path: str) -> None:
     for c in session.cookies:
         console.print(f"  cookie {c.get('name')}={str(c.get('value'))[:12]}... "
                       f"domain={c.get('domain')} path={c.get('path')}")
+
+
+@auth.command("probe")
+@click.option("--target", "-t", required=True, help="Login page URL to probe.")
+@click.option("--username", "-u", "usernames", multiple=True, required=True,
+              help="A real username to test (repeatable). Password comes from --password.")
+@click.option("--password", "-w", default=None,
+              help="Password for the tested usernames (shared weak/universal passwords are common). "
+                   "NOTE: visible in shell history/ps.")
+@click.option("--fake-user", default=None, help="Baseline non-existent username (default auto).")
+@click.option("--token-key", default=None,
+              help="SPA token key in session/localStorage that marks a successful login (e.g. JWTToken).")
+@click.option("--token-storage", default="session", type=click.Choice(["session", "local"]))
+@click.option("--timeout", "timeout_ms", default=30000, type=int, show_default=True,
+              help="Per-step Playwright timeout in ms (raise for slow cold-start / SPA bootstrap).")
+@click.option("--evidence-dir", "-o", default=None, help="Directory for per-attempt screenshots.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON.")
+def auth_probe(target: str, usernames: tuple, password: str | None, fake_user: str | None,
+               token_key: str | None, token_storage: str, timeout_ms: int,
+               evidence_dir: str | None, as_json: bool) -> None:
+    """Is this account provisioned here? Differential login probe (read-only, lockout-safe).
+
+    Submits a deliberately non-existent username alongside the real ones; a real account whose
+    response is identical to that baseline is NOT in this app's user store. Distinguishes
+    not-provisioned vs account-exists-but-refused vs logged-in, with evidence.
+    """
+    import json as _json
+    from .auth.differential import DEFAULT_FAKE_USER, discover_and_probe
+
+    creds = [(u, password or "") for u in usernames]
+    probe = discover_and_probe(target, creds, fake_user=fake_user or DEFAULT_FAKE_USER,
+                               timeout_ms=timeout_ms, out_dir=evidence_dir,
+                               token_key=token_key, token_storage=token_storage)
+    if as_json:
+        console.print(_json.dumps({
+            "target": probe.target, "login_url": probe.login_url,
+            "api_endpoint": probe.api_endpoint, "client_side_hashing": probe.client_side_hashing,
+            "verdicts": {k: v.value for k, v in probe.verdicts.items()},
+            "attempts": [vars(a) for a in probe.attempts], "notes": probe.notes,
+        }, indent=2))
+        return
+    console.print(f"[bold]{probe.target}[/bold]")
+    if probe.api_endpoint:
+        console.print(f"  login API: {probe.api_endpoint}")
+    if probe.client_side_hashing:
+        console.print("  [yellow]client-side password handling detected — raw replay unreliable[/yellow]")
+    for a in probe.attempts:
+        console.print(f"  [{a.label:14}] HTTP {a.status}  logged_in={a.logged_in}  "
+                      f"body={a.body[:48]!r}  {a.note}")
+    for label, v in probe.verdicts.items():
+        color = {"LOGGED_IN": "green", "NOT_PROVISIONED": "red"}.get(v.value, "yellow")
+        console.print(f"  => {label}: [{color}]{v.value}[/{color}]")
 
 
 # Map result filenames (in a --results dir) to tools.

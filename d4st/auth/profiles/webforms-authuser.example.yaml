@@ -1,0 +1,42 @@
+# Example login recipe: classic ASP.NET WebForms app whose login button is a custom JS
+# handler (e.g. onclick="Login_Click();") that calls a backend auth API — often a GET to
+# /api/.../AuthUser with the credentials in the query string. Copy to <yourapp>.yaml.
+#
+# Characteristics this template targets:
+#   - login page served at a path like /Modules/Common/Login.aspx
+#   - visible username/password inputs, but the submit is a <button type=button> / <input
+#     type=button> with an onclick (NOT a plain form submit)
+#   - the real auth call is an XHR the browser makes AFTER the click
+#
+# BEFORE capturing a session here, confirm the account is actually provisioned on THIS app:
+#     d4st auth probe -t https://<host>/Modules/Common/Login.aspx -u <user> -w <pass> \
+#         --token-key <if-SPA> -o evidence/
+# The probe submits a non-existent baseline username alongside the real one; if the server's
+# response is identical to that baseline, the account is not provisioned here (don't burn a
+# capture on it). It is read-only and lockout-safe.
+name: webforms-authuser
+type: form
+base_url_env: D4ST_APP_URL
+login_url: "{base}/Modules/Common/Login.aspx"
+username_selector: "#txtUsername"          # some variants: #cpMain_txtUsername, input[name=Email]
+password_selector: "#txtPassword"          # e.g. #cpMain_txtPassword, input[name=Password]
+submit_selector: "#btnSubmit"              # the onclick button; or "[onclick*='ogin']"
+username_env: APP_USERNAME
+password_env: APP_PASSWORD
+
+# Slow cold-start / first-hit JIT is common on these — raise the per-step timeout at capture:
+#     d4st auth capture -p webforms-authuser -b https://<host> -o s.json --timeout 120000
+
+# Post-login: a URL fragment / body marker that only appears once authenticated.
+success:
+  url_contains: "/Default.aspx"
+  body_contains: "Sign Out"
+
+validity:
+  url: "{base}/Default.aspx"
+  body_contains: "Sign Out"
+  render: true
+
+# SECURITY NOTE (worth a finding): these AuthUser endpoints frequently pass the username and
+# password in the URL query string of a GET — credentials then land in server/proxy/access logs
+# in cleartext. Flag it when observed.
