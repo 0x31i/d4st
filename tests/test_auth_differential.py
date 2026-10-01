@@ -131,3 +131,30 @@ def test_raw_differential_substitutes_username_and_password():
     assert seen[0]["username"].startswith("zz_nouser")
     assert seen[1]["username"] == "Dast" and seen[1]["password"] == "mtest"
     assert seen[1]["UserId"] == "0"
+
+
+# ----- JSON serialization round-trip (probe --json must be valid JSON) ------ #
+
+import json  # noqa: E402
+
+from d4st.auth.differential import AppProbe  # noqa: E402
+
+
+def test_probe_as_dict_json_roundtrips_with_nasty_body():
+    # Raw login-API bodies carry newlines, backslashes, and markup-looking brackets; the
+    # emitted JSON must still parse (the bug: console.print wrapped/ate these -> invalid JSON).
+    nasty = 'Dast Auditaccount [ADMIN]<img src=x>\r\n{"path":"C:\\\\x"}\tTAB\x07bell'
+    probe = AppProbe(target="https://app.test/", api_endpoint="https://app.test/api/Login/")
+    probe.attempts.append(Attempt(label="Dast", username="Dast", lens="browser",
+                                  status=200, body=nasty, visible_error=nasty, logged_in=True))
+    probe.verdicts["Dast"] = Verdict.LOGGED_IN
+    probe.raw_verdicts["Dast"] = Verdict.LOGGED_IN
+    probe.notes.append("node[with]brackets")
+
+    emitted = json.dumps(probe.as_dict(), indent=2)   # same call the CLI makes
+    back = json.loads(emitted)                         # must not raise
+
+    assert back["verdicts"]["Dast"] == "LOGGED_IN"     # enum -> string
+    assert back["raw_verdicts"]["Dast"] == "LOGGED_IN"
+    assert back["attempts"][0]["body"] == nasty        # content preserved exactly
+    assert back["target"] == "https://app.test/"

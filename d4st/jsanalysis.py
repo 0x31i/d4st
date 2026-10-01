@@ -479,6 +479,65 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
     return saved, findings, endpoints, truncated
 
 
+def script_srcs(html: str, base_url: str, host: str) -> list[str]:
+    """Absolute, same-host .js bundle URLs referenced by <script src=...> in an HTML shell.
+    An SPA's index shell lists the bundles whose code holds the /api/* routes it calls."""
+    from urllib.parse import urljoin, urlsplit
+    out: list[str] = []
+    seen: set = set()
+    for m in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html or "", re.I):
+        u = urljoin(base_url, m.strip())
+        path = urlsplit(u).path.lower()
+        if not (path.endswith(".js") or path.endswith(".mjs")):
+            continue
+        if host and urlsplit(u).hostname and urlsplit(u).hostname != host:
+            continue
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def mine_api_endpoints(target: str, cookie: str = "", headers: dict | None = None,
+                       host: str | None = None, timeout: float = 20.0,
+                       max_js: int = 40) -> list[str]:
+    """SPA-aware API discovery: fetch the target shell, find its <script src> bundles, and
+    mine them for API endpoints — the same JS route-mining the unauth/engagement path uses,
+    made reusable for the authenticated `launch` discovery stage. Returns absolute, same-host
+    endpoint URLs. Best-effort and side-effect-free (never raises)."""
+    import httpx
+    from urllib.parse import urljoin, urlsplit
+    hdrs = dict(headers or {})
+    if cookie:
+        hdrs["Cookie"] = cookie
+    host = host or urlsplit(target).hostname or ""
+    try:
+        r = httpx.get(target, headers=hdrs, follow_redirects=True, timeout=timeout, verify=False)
+    except Exception:  # noqa: BLE001
+        return []
+    base = str(r.url)
+    js_urls = script_srcs(r.text or "", base, host)
+    if not js_urls:
+        return []
+    try:
+        endpoints, _libs = analyze_js(js_urls, cookie, host, cap=max_js)
+    except Exception:  # noqa: BLE001
+        return []
+    # Keep same-host absolute http(s) endpoints (extract_endpoints may return paths too).
+    out: list[str] = []
+    seen: set = set()
+    for ep in endpoints:
+        u = ep if ep.startswith("http") else urljoin(base, ep)
+        if not u.startswith("http"):
+            continue
+        if host and urlsplit(u).hostname and urlsplit(u).hostname != host:
+            continue
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
 def analyze_js(js_urls: list[str], cookie: str, host: str,
                cap: int = 30) -> tuple[list[str], list[VulnLib]]:
     """Fetch JS files, return (discovered_endpoints, vulnerable_libs)."""

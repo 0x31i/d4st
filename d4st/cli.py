@@ -56,9 +56,18 @@ def version() -> None:
 @click.option("--dry-run", is_flag=True, default=False, help="Plan only; run no tools.")
 @click.option("--force", is_flag=True, default=False,
               help="Scan even if the session fails its validity probe (not recommended).")
+@click.option("--seed-url", "seed_url", multiple=True,
+              help="Extra URL to seed the frontier (repeatable) — e.g. a known /api endpoint a "
+                   "crawler won't find on a client-rendered SPA.")
+@click.option("--seed-file", "seed_file", default=None,
+              help="File of seed URLs (one per line) to add to the frontier.")
+@click.option("--no-js-mine", "no_js_mine", is_flag=True, default=False,
+              help="Disable automatic JS/route mining of the SPA shell for API endpoints.")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON.")
 def launch(workflow: str, target: str, session_path: str | None,
-           allow_active: bool, dry_run: bool, force: bool, as_json: bool) -> None:
+           allow_active: bool, dry_run: bool, force: bool,
+           seed_url: tuple = (), seed_file: str | None = None, no_js_mine: bool = False,
+           as_json: bool = False) -> None:
     """Run a scanning workflow against a target."""
     Config.from_env()  # loaded for side effects / future DB + egress wiring
     spec = load_workflow(workflow)
@@ -71,11 +80,17 @@ def launch(workflow: str, target: str, session_path: str | None,
         # instead of silently producing unauthenticated (garbage) results.
         if not dry_run:
             from .auth.session import Session
-            from .auth.validity import is_valid
+            from .auth.validity import is_session_valid
             sess = Session.from_dict(session)
-            marker = sess.meta.get("validity_marker") or "Logout"
+            # Honor the captured validity marker if one was recorded; do NOT default to
+            # 'Logout' (that false-negatives JWT-SPAs whose session is token-based, not a
+            # server-rendered logout link). is_session_valid() is token-aware.
+            marker = sess.meta.get("validity_marker") or None
             probe_url = sess.meta.get("validity_url") or sess.origin or target
-            ok, note = is_valid(sess, probe_url, marker)
+            render_hint = sess.meta.get("validity_render")
+            ok, note = is_session_valid(
+                sess, probe_url, marker,
+                render=(bool(render_hint) if render_hint is not None else None))
             if ok:
                 console.print(f"[green]session valid[/green]: {note}")
             elif force:
@@ -86,11 +101,33 @@ def launch(workflow: str, target: str, session_path: str | None,
                     f"`d4st auth capture` (check credentials), or pass --force to override."
                 )
 
+    # Build the seed list: explicit --seed-url / --seed-file, plus (for authed SPA scans) the
+    # API endpoints JS-mined from the shell — so detection actually reaches the /api surface
+    # Burp would, instead of just the root on a client-rendered app.
+    _log = (lambda m: None) if as_json else console.print
+    seeds: list[str] = list(seed_url)
+    if seed_file:
+        try:
+            with open(seed_file, "r", encoding="utf-8") as fh:
+                seeds += [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+        except OSError as exc:
+            raise click.ClickException(f"cannot read --seed-file {seed_file!r}: {exc}")
+    if session is not None and not no_js_mine and not dry_run:
+        try:
+            from .auth.session import Session
+            from .jsanalysis import mine_api_endpoints
+            _s = Session.from_dict(session)
+            mined = mine_api_endpoints(target, cookie=_s.cookie_header(target), headers=_s.headers)
+            if mined:
+                _log(f"authed discovery: JS-mined {len(mined)} API endpoint(s) from the SPA shell")
+                seeds += mined
+        except Exception as exc:  # noqa: BLE001 — discovery is best-effort, never fatal
+            _log(f"authed JS-mine skipped: {exc}")
+
     runner = WorkflowRunner(
-        spec, allow_active=allow_active, dry_run=dry_run,
-        log=(lambda m: None) if as_json else console.print,
+        spec, allow_active=allow_active, dry_run=dry_run, log=_log,
     )
-    result = runner.run(target, session=session)
+    result = runner.run(target, session=session, seed_urls=seeds)
 
     if as_json:
         click.echo(json.dumps({
@@ -274,12 +311,10 @@ def auth_probe(target: str, usernames: tuple, password: str | None, fake_user: s
                                timeout_ms=timeout_ms, out_dir=evidence_dir,
                                token_key=token_key, token_storage=token_storage)
     if as_json:
-        console.print(_json.dumps({
-            "target": probe.target, "login_url": probe.login_url,
-            "api_endpoint": probe.api_endpoint, "client_side_hashing": probe.client_side_hashing,
-            "verdicts": {k: v.value for k, v in probe.verdicts.items()},
-            "attempts": [vars(a) for a in probe.attempts], "notes": probe.notes,
-        }, indent=2))
+        # click.echo (raw), NOT console.print — Rich line-wraps to terminal width and parses
+        # markup, which corrupts JSON (newlines injected into string values, [..] eaten) when
+        # the body carries raw HTTP response text. as_dict() centralizes the serialization.
+        click.echo(_json.dumps(probe.as_dict(), indent=2))
         return
     console.print(f"[bold]{probe.target}[/bold]")
     if probe.api_endpoint:

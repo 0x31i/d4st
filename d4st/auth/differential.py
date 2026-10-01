@@ -86,6 +86,25 @@ class AppProbe:
     raw_verdicts: dict = field(default_factory=dict)  # cred label -> Verdict (raw lens)
     notes: list[str] = field(default_factory=list)
 
+    def as_dict(self) -> dict:
+        """JSON-serializable view. Centralizes serialization so callers never hand-build JSON
+        (raw login-API response bodies carry newlines/backslashes/markup, so callers MUST emit
+        this via json.dumps + a raw writer like click.echo — never Rich console.print, which
+        line-wraps and interprets markup, corrupting the JSON)."""
+        def _v(d: dict) -> dict:
+            return {k: (val.value if isinstance(val, Verdict) else val) for k, val in d.items()}
+        return {
+            "target": self.target,
+            "login_url": self.login_url,
+            "api_endpoint": self.api_endpoint,
+            "api_method": self.api_method,
+            "client_side_hashing": self.client_side_hashing,
+            "verdicts": _v(self.verdicts),
+            "raw_verdicts": _v(self.raw_verdicts),
+            "attempts": [vars(a) for a in self.attempts],
+            "notes": list(self.notes),
+        }
+
 
 # --------------------------------------------------------------------------- #
 # Pure classification (unit-testable, no I/O)                                  #
