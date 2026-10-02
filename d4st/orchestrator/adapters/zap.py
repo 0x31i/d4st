@@ -132,10 +132,20 @@ class ZapAdapter(ToolAdapter):
             cookie = _cookie_header(ctx.session, ctx.target)
             headers = _session_headers(ctx.session)
             args = build_zap_args(ctx.target, cookie, ctx.options, headers=headers)
-            proc = self._exec(args, timeout=ctx.options.get("timeout", 3600))
+            # Run ZAP INSIDE the writable workdir and point HOME there. zap-full-scan.py writes
+            # `-J report.json` relative to cwd and ZAP needs a writable home (~/.ZAP session + config
+            # files); when the process cwd / HOME aren't writable it dies with rc=3 "A file based
+            # operation failed" and no report. A fresh mkdtemp (under /tmp) is always writable.
+            env = dict(os.environ)
+            env["HOME"] = workdir
+            proc = self._exec(args, timeout=ctx.options.get("timeout", 3600),
+                              cwd=workdir, env=env)
             report = None
-            # zap-full-scan writes the report into its working directory
-            for cand in (report_path, os.path.join(os.getcwd(), "report.json")):
+            # zap-full-scan may drop the report in cwd (=workdir), its legacy /zap/wrk mount,
+            # or the launcher's original cwd — check them all.
+            for cand in (report_path,
+                         os.path.join("/zap/wrk", "report.json"),
+                         os.path.join(os.getcwd(), "report.json")):
                 if os.path.exists(cand):
                     with open(cand, "r", encoding="utf-8") as fh:
                         report = json.load(fh)
@@ -152,7 +162,10 @@ class ZapAdapter(ToolAdapter):
         # Previously any rc not in (0,1,2) was reported as a bland "0 alert(s), 0 url(s)" which
         # hid the actual reason (ZAP couldn't start, AJAX browser missing, target unreachable…).
         if report is None:
-            tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1][:200]
+            # Surface the real reason: the last few non-empty lines of ZAP's output (not just one),
+            # so file-op / browser / startup failures are diagnosable from the run note.
+            lines = [ln.strip() for ln in (proc.stderr or proc.stdout or "").splitlines() if ln.strip()]
+            tail = " | ".join(lines[-4:])[:400]
             return AdapterResult(
                 tool=self.name, ok=False, command=cmd, raw=None,
                 note=f"no report produced (zap rc={proc.returncode}): {tail or 'see zap output'}",

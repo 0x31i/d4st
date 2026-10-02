@@ -96,3 +96,53 @@ def test_zap_run_clean_zero_alert_is_ok(tmp_path, monkeypatch):
     res = ad.run(RunContext(target="https://app.example", options={}))
     assert res.ok is True
     assert "0 alert(s)" in res.note
+
+
+# --- rc=3 "file based operation" fix: run in a writable workdir + HOME, surface the real error ---
+import os
+import types
+from d4st.orchestrator.adapters.base import RunContext
+from d4st.orchestrator.adapters.zap import ZapAdapter
+
+
+def _fake_proc(returncode=0, stdout="", stderr=""):
+    return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_zap_runs_in_writable_workdir_with_home(monkeypatch, tmp_path):
+    """ZAP must execute with cwd + HOME pointed at a writable dir (the rc=3 file-op cause) and then
+    find the report it writes there."""
+    captured = {}
+
+    def fake_exec(self, args, timeout=3600, cwd=None, env=None):
+        captured["cwd"] = cwd
+        captured["home"] = (env or {}).get("HOME")
+        # ZAP writes its report into the cwd it was handed
+        with open(os.path.join(cwd, "report.json"), "w") as fh:
+            fh.write('{"site":[{"alerts":[{"alert":"X","riskcode":"2","instances":'
+                     '[{"uri":"https://app.example/a","method":"GET"}]}]}]}')
+        return _fake_proc(returncode=0)
+
+    monkeypatch.setattr(ZapAdapter, "available", lambda self: True)
+    monkeypatch.setattr(ZapAdapter, "_exec", fake_exec)
+    res = ZapAdapter().run(RunContext(target="https://app.example"))
+    assert captured["cwd"] and os.path.isdir(captured["cwd"])        # ran in a real dir
+    assert captured["home"] == captured["cwd"]                       # HOME made writable
+    assert res.ok and len(res.findings) == 1                        # report found + parsed
+    assert res.findings[0]["severity"] == "medium"
+
+
+def test_zap_surfaces_file_op_error(monkeypatch):
+    """When no report is produced, the note must carry ZAP's real multi-line error + rc, not a bland
+    '0 alerts' (so rc=3 'A file based operation failed' is diagnosable)."""
+    def fake_exec(self, args, timeout=3600, cwd=None, env=None):
+        return _fake_proc(returncode=3,
+                          stderr="starting ZAP\nA file based operation failed\nreport not written")
+
+    monkeypatch.setattr(ZapAdapter, "available", lambda self: True)
+    monkeypatch.setattr(ZapAdapter, "_exec", fake_exec)
+    # ensure no stray report.json in cwd is picked up
+    monkeypatch.setattr(os.path, "exists", lambda p: False)
+    res = ZapAdapter().run(RunContext(target="https://app.example"))
+    assert res.ok is False
+    assert "rc=3" in res.note and "file based operation failed" in res.note
