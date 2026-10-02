@@ -30,13 +30,22 @@ def normalize_url(raw: str) -> str:
 @dataclass
 class Frontier:
     max_rounds: int = 3
+    # Optional scope predicate f(url)->bool. When set, off-scope URLs are refused entry (and
+    # counted) so active/injection tools NEVER attack third-party hosts. None = no restriction.
+    in_scope: object = None
     _urls: set[str] = field(default_factory=set)
     _params: set[tuple[str, str]] = field(default_factory=set)  # (normalized_url, param)
     _round: int = 0
     _new_since_consume: bool = False
+    _off_scope_dropped: int = 0
     caps: list[str] = field(default_factory=list)
 
-    def add_url(self, url: str) -> bool:
+    def add_url(self, url: str, *, force: bool = False) -> bool:
+        # Scope gate: drop off-scope URLs before they enter the frontier (so every downstream
+        # consumer is scoped). `force=True` bypasses it for the operator's explicit target.
+        if not force and self.in_scope is not None and url and not self.in_scope(url):
+            self._off_scope_dropped += 1
+            return False
         key = normalize_url(url)
         if not key or key in self._urls:
             return False
@@ -84,10 +93,14 @@ class Frontier:
         self._new_since_consume = False
         return self._round
 
+    def off_scope_dropped(self) -> int:
+        return self._off_scope_dropped
+
     def stats(self) -> dict:
         return {
             "urls": len(self._urls),
             "params": len(self._params),
             "rounds": self._round,
+            "off_scope_dropped": self._off_scope_dropped,
             "caps": list(self.caps),
         }

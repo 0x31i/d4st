@@ -2677,13 +2677,12 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # to the client as findings — passive/roster otherwise scans them (8 of 14 off-target on scan 1).
     # Default scope = the target's EXACT host; D4ST_SCOPE_HOSTS widens it (comma list; a bare domain
     # also matches its subdomains). Everything downstream (passive/roster/authz/PII) sees only in-scope.
-    _tgt_host = urlsplit(target).netloc.split("@")[-1].split(":")[0].lower()
-    _scope_env = os.environ.get("D4ST_SCOPE_HOSTS", "").strip()
-    _scope = [h.strip().lower() for h in _scope_env.split(",") if h.strip()] or [_tgt_host]
-
+    # Scope: ONE canonical definition shared with the launch/WorkflowRunner path (d4st.scope).
+    from .scope import in_scope as _scope_in_scope
+    from .scope import scope_hosts as _scope_hosts
+    _scope = _scope_hosts(target)
     def _in_scope(u: str) -> bool:
-        h = urlsplit(u).netloc.split("@")[-1].split(":")[0].lower()
-        return any(h == s or h.endswith("." + s) for s in _scope)
+        return _scope_in_scope(u, _scope)
     _before = len(urls)
     urls = [u for u in urls if _in_scope(u)]
     if _before != len(urls):

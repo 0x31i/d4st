@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 
 from .base import AdapterResult, RunContext, ToolAdapter, register
-from .session_util import _cookie_header
+from .session_util import _cookie_header, _session_headers
 
 # ZAP riskcode -> severity
 _RISK = {"0": "info", "1": "low", "2": "medium", "3": "high"}
@@ -70,24 +71,40 @@ def _ajax_config(options: dict) -> str:
     )
 
 
-def _cookie_config(cookie: str) -> str:
-    """Best-effort auth: replace the Cookie header on every ZAP request."""
+def _replacer_config(idx: int, match: str, replacement: str) -> str:
+    """One ZAP `replacer` rule: set REQ_HEADER `match` to `replacement` on every request."""
     return (
-        "-config replacer.full_list(0).description=auth "
-        "-config replacer.full_list(0).enabled=true "
-        "-config replacer.full_list(0).matchtype=REQ_HEADER "
-        "-config replacer.full_list(0).matchstr=Cookie "
-        f"-config replacer.full_list(0).replacement={cookie}"
+        f"-config replacer.full_list({idx}).description=auth{idx} "
+        f"-config replacer.full_list({idx}).enabled=true "
+        f"-config replacer.full_list({idx}).matchtype=REQ_HEADER "
+        f"-config replacer.full_list({idx}).matchstr={match} "
+        f"-config replacer.full_list({idx}).replacement={replacement}"
     )
 
 
-def build_zap_args(target: str, cookie: str, options: dict) -> list[str]:
+def _auth_config(cookie: str, headers: dict | None) -> str:
+    """Best-effort auth for ZAP: inject the Cookie AND any non-cookie session headers
+    (e.g. `Authorization: Bearer <jwt>` for token/SPA sessions — the Cookie-only path left
+    JWT-authenticated apps scanned logged-out). One replacer rule per header."""
+    rules: list[str] = []
+    idx = 0
+    if cookie:
+        rules.append(_replacer_config(idx, "Cookie", cookie)); idx += 1
+    for k, v in (headers or {}).items():
+        if not k or k.lower() == "cookie" or v is None:
+            continue
+        rules.append(_replacer_config(idx, k, v)); idx += 1
+    return " ".join(rules)
+
+
+def build_zap_args(target: str, cookie: str, options: dict, headers: dict | None = None) -> list[str]:
     """Assemble the zap-full-scan.py argv. `-j` enables the AJAX Spider; we always tune it deeper.
     Extracted so the invocation is unit-testable without a ZAP install."""
     args = ["zap-full-scan.py", "-t", target, "-J", "report.json", "-j"]
     zcfg = _ajax_config(options)
-    if cookie:
-        zcfg = _cookie_config(cookie) + " " + zcfg
+    auth = _auth_config(cookie, headers)
+    if auth:
+        zcfg = auth + " " + zcfg
     args += ["-z", zcfg]
     return args
 
@@ -113,23 +130,43 @@ class ZapAdapter(ToolAdapter):
             workdir = tempfile.mkdtemp(prefix="zap_")
             report_path = os.path.join(workdir, "report.json")
             cookie = _cookie_header(ctx.session, ctx.target)
-            args = build_zap_args(ctx.target, cookie, ctx.options)
+            headers = _session_headers(ctx.session)
+            args = build_zap_args(ctx.target, cookie, ctx.options, headers=headers)
             proc = self._exec(args, timeout=ctx.options.get("timeout", 3600))
-            report = {}
+            report = None
             # zap-full-scan writes the report into its working directory
             for cand in (report_path, os.path.join(os.getcwd(), "report.json")):
                 if os.path.exists(cand):
                     with open(cand, "r", encoding="utf-8") as fh:
                         report = json.load(fh)
                     break
+        except subprocess.TimeoutExpired:
+            to = ctx.options.get("timeout", 3600)
+            return AdapterResult(tool=self.name, ok=False, command=cmd,
+                                 note=f"TIMEOUT after {to}s (killed) — raise options.timeout or "
+                                      f"narrow scope; partial report discarded")
         except Exception as exc:  # noqa: BLE001
             return AdapterResult(tool=self.name, ok=False, command=cmd, note=f"exec error: {exc}")
 
+        # Distinguish a real failure (no report / zap error rc>=3) from a clean 0-alert run.
+        # Previously any rc not in (0,1,2) was reported as a bland "0 alert(s), 0 url(s)" which
+        # hid the actual reason (ZAP couldn't start, AJAX browser missing, target unreachable…).
+        if report is None:
+            tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1][:200]
+            return AdapterResult(
+                tool=self.name, ok=False, command=cmd, raw=None,
+                note=f"no report produced (zap rc={proc.returncode}): {tail or 'see zap output'}",
+            )
+
         findings, urls = parse_zap(report)
-        # zap-full-scan exits non-zero when it finds alerts; treat that as success.
+        # zap-full-scan exits 0/1/2 for pass/fail/warn (all successful runs). rc>=3 is a run
+        # error, but if a report WAS written we still parse it and flag the anomaly in the note.
+        run_ok = proc.returncode in (0, 1, 2)
+        note = f"{len(findings)} alert(s), {len(urls)} url(s)"
+        if not run_ok:
+            note += f" (warning: zap rc={proc.returncode})"
         return AdapterResult(
-            tool=self.name, ok=proc.returncode in (0, 1, 2),
+            tool=self.name, ok=True,  # a report was produced → the stage succeeded
             findings=findings, discovered_urls=urls, command=cmd,
-            note=f"{len(findings)} alert(s), {len(urls)} url(s)",
-            raw=report,
+            note=note, raw=report,
         )

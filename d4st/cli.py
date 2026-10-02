@@ -91,10 +91,18 @@ def launch(workflow: str, target: str, session_path: str | None,
             ok, note = is_session_valid(
                 sess, probe_url, marker,
                 render=(bool(render_hint) if render_hint is not None else None))
+            # In --json mode these status lines must NOT go to stdout (they would prepend
+            # non-JSON text to the findings document). Route them to stderr instead.
             if ok:
-                console.print(f"[green]session valid[/green]: {note}")
+                if as_json:
+                    click.echo(f"session valid: {note}", err=True)
+                else:
+                    console.print(f"[green]session valid[/green]: {note}")
             elif force:
-                console.print(f"[yellow]session INVALID but --force set[/yellow]: {note}")
+                if as_json:
+                    click.echo(f"session INVALID but --force set: {note}", err=True)
+                else:
+                    console.print(f"[yellow]session INVALID but --force set[/yellow]: {note}")
             else:
                 raise click.ClickException(
                     f"session invalid ({note}); refusing to scan logged-out. Re-capture with "
