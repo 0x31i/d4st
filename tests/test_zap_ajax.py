@@ -32,21 +32,33 @@ def test_no_cookie_no_replacer():
 
 # ---- auth header injection (bearer/SPA) + failure surfacing ------------------------------
 
-def test_authorization_header_injected_alongside_cookie():
-    args = build_zap_args("https://app.example", "SESSION=abc",
-                          {}, headers={"Authorization": "Bearer JWT", "X-Env": "stg"})
+def test_authorization_header_goes_to_configfile_not_z():
+    # `Bearer <jwt>` has a space -> inlining it in `-z` breaks zap-full-scan's space-split (rc=3).
+    # With a configfile path, the auth rules go to `-configfile` and the bearer is NOT in `-z`.
+    from d4st.orchestrator.adapters.zap import _auth_rules, _replacer_properties
+    args = build_zap_args("https://app.example", "SESSION=abc", {},
+                          headers={"Authorization": "Bearer JWT", "X-Env": "stg"},
+                          auth_conf_path="/tmp/zap_auth.properties")
     z = args[args.index("-z") + 1]
-    assert "replacer.full_list(0).matchstr=Cookie" in z
-    assert "replacer.full_list(1).matchstr=Authorization" in z
-    assert "replacement=Bearer JWT" in z
-    assert "matchstr=X-Env" in z
+    assert "-configfile /tmp/zap_auth.properties" in z
+    assert "Bearer JWT" not in z                    # the space-bearing value never hits -z
+    assert "replacer.full_list" not in z            # no inline replacer when using the configfile
+    # the properties file (space-safe) carries both the cookie and the bearer
+    props = _replacer_properties(_auth_rules("SESSION=abc",
+                                             {"Authorization": "Bearer JWT", "X-Env": "stg"}))
+    assert "replacer.full_list(0).matchstr=Cookie" in props
+    assert "replacer.full_list(1).replacement=Bearer JWT" in props
+    assert "matchstr=X-Env" in props
 
 
 def test_bearer_only_session_still_injects_auth():
-    # JWT/SPA session has no cookie — ZAP must still carry the bearer (was scanned logged-out before)
-    args = build_zap_args("https://app.example", "", {}, headers={"Authorization": "Bearer JWT"})
+    # JWT/SPA session has no cookie — ZAP must still carry the bearer, via the configfile.
+    args = build_zap_args("https://app.example", "", {},
+                          headers={"Authorization": "Bearer JWT"},
+                          auth_conf_path="/tmp/zap_auth.properties")
     z = args[args.index("-z") + 1]
-    assert "replacer.full_list(0).matchstr=Authorization" in z
+    assert "-configfile /tmp/zap_auth.properties" in z
+    assert "Bearer JWT" not in z
 
 
 def test_duplicate_cookie_header_not_double_injected():
@@ -85,14 +97,16 @@ def test_zap_run_clean_zero_alert_is_ok(tmp_path, monkeypatch):
     ad = ZapAdapter()
     monkeypatch.setattr(ad, "available", lambda: True)
 
-    class FakeProc:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+    import os as _os
+    import types as _types
 
-    monkeypatch.setattr(ad, "_exec", lambda *a, **k: FakeProc())
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "report.json").write_text(_json.dumps({"site": []}))
+    def fake_exec(args, timeout=3600, cwd=None, env=None):
+        jname = args[args.index("-J") + 1]            # the unique per-run report name
+        with open(_os.path.join(cwd, jname), "w") as fh:
+            fh.write(_json.dumps({"site": []}))
+        return _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ad, "_exec", fake_exec)
     res = ad.run(RunContext(target="https://app.example", options={}))
     assert res.ok is True
     assert "0 alert(s)" in res.note
@@ -117,8 +131,9 @@ def test_zap_runs_in_writable_workdir_with_home(monkeypatch, tmp_path):
     def fake_exec(self, args, timeout=3600, cwd=None, env=None):
         captured["cwd"] = cwd
         captured["home"] = (env or {}).get("HOME")
-        # ZAP writes its report into the cwd it was handed
-        with open(os.path.join(cwd, "report.json"), "w") as fh:
+        # ZAP writes its report into the cwd it was handed, under the UNIQUE -J name
+        jname = args[args.index("-J") + 1]
+        with open(os.path.join(cwd, jname), "w") as fh:
             fh.write('{"site":[{"alerts":[{"alert":"X","riskcode":"2","instances":'
                      '[{"uri":"https://app.example/a","method":"GET"}]}]}]}')
         return _fake_proc(returncode=0)
