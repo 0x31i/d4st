@@ -54,9 +54,19 @@ def _sensitivity(body: str) -> tuple[int, str]:
     return 1, "non-empty data (no obvious sensitive markers — review)"
 
 
+# Header names that carry auth material — so the no-auth test actually strips the right one on
+# custom-header APIs (e.g. X-App-Token), not only standard Authorization/Cookie.
+_AUTH_HDR_RE = re.compile(
+    r"(?i)^(authorization|x-[a-z0-9-]*(auth|token)[a-z0-9-]*|[a-z0-9-]*-authentication-token"
+    r"|x-api-key|api-key|apikey|x-auth-token|x-access-token)$")
+
+
 def _auth_header_name(session: Session) -> str:
     for k in session.headers:
         if k.lower() == "authorization":
+            return k
+    for k in session.headers:                 # custom auth header (bearer-in-a-custom-header APIs)
+        if _AUTH_HDR_RE.match(k):
             return k
     return "Authorization"
 
@@ -88,7 +98,10 @@ def run_authz(session: Session, base: str, urls: list[str], *,
     cookie = session.cookie_header(base)
     if cookie:
         authed["Cookie"] = cookie
-    noauth = {k: v for k, v in authed.items() if k.lower() not in ("authorization", "cookie")}
+    # Strip EVERY auth-bearing header (standard + the detected custom one) so "no-auth" is truly
+    # unauthenticated — otherwise a custom-header API would still receive the real token.
+    _strip = {"authorization", "cookie", hname.lower()}
+    noauth = {k: v for k, v in authed.items() if k.lower() not in _strip}
     badtok = dict(noauth); badtok[hname] = f"Bearer {_BOGUS_JWT}"
 
     findings: list[dict] = []

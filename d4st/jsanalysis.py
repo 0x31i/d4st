@@ -333,6 +333,84 @@ def scan_js_secrets(js_text: str, url: str) -> list[tuple[str, str, str]]:
     return out
 
 
+# ----- token/secret-minting endpoint auto-probe -------------------------------------------------
+# jsdisclosure only flagged a reference like `getAccountSASToken` / `/api/SAS` as INFO. But such an
+# endpoint, if callable UNAUTHENTICATED, hands out a live credential (manual testing on this estate
+# showed `GET /api/SAS/getAccountSASToken` mints an Azure Storage SAS with no auth — a real High).
+# When a minting hint is seen, GET the standard mint paths WITHOUT auth and, if a token comes back,
+# raise it. Read-only (GET), never uses the returned token, and the signature value is redacted.
+_MINT_HINT_RE = re.compile(r"(?i)getAccountSASToken|getSASToken|/api/SAS\b|/api/token\b")
+_MINT_CANDIDATE_PATHS = (
+    "/api/SAS/getAccountSASToken", "/api/SAS", "/api/getAccountSASToken",
+    "/api/getSASToken", "/api/token/getSASToken",
+)
+# A returned Azure SAS carries both a signature and a storage-version date; a bearer/JWT is 3 b64 parts.
+_SAS_SIG_RE = re.compile(r"(?i)sig=[^&\"'\s]{10,}")
+_SAS_SV_RE = re.compile(r"(?i)sv=\d{4}-\d{2}-\d{2}")
+_JWT_TOKEN_RE = re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}")
+
+
+def _redact_token(text: str) -> str:
+    """Redact the usable secret material (SAS signature / JWT body) so the finding proves the leak
+    without storing a directly-replayable credential."""
+    text = _SAS_SIG_RE.sub("sig=<redacted>", text)
+    text = _JWT_TOKEN_RE.sub("<redacted-jwt>", text)
+    return text
+
+
+def probe_minting_endpoints(origin: str, fetch=None, timeout: int = 15) -> list[dict]:
+    """GET the standard SAS/token mint paths on `origin` UNAUTHENTICATED; return High findings for any
+    that return a live token. `fetch(url) -> (status, body)` is injectable for tests (default: httpx,
+    no auth headers — the point is proving it mints WITHOUT a session)."""
+    if not origin:
+        return []
+    if fetch is None:
+        import httpx
+
+        def fetch(url: str):  # noqa: ANN001 - unauth, no cookies/headers by design
+            try:
+                r = httpx.get(url, verify=False, follow_redirects=True, timeout=timeout)
+                return r.status_code, (r.text or "")
+            except Exception:  # noqa: BLE001
+                return None, ""
+
+    findings: list[dict] = []
+    seen: set = set()
+    for path in _MINT_CANDIDATE_PATHS:
+        url = origin.rstrip("/") + path
+        if url in seen:
+            continue
+        seen.add(url)
+        status, body = fetch(url)
+        if not body:
+            continue
+        snippet = body[:800]
+        is_sas = bool(_SAS_SIG_RE.search(snippet) and _SAS_SV_RE.search(snippet))
+        is_jwt = bool(_JWT_TOKEN_RE.search(snippet))
+        if not (is_sas or is_jwt):
+            continue
+        kind = "Azure Storage SAS token" if is_sas else "bearer/JWT token"
+        proof = _redact_token(snippet)[:400]
+        findings.append({
+            "category": "unauthenticated-token-minting",
+            "severity": "high",
+            "url": url, "param": None, "method": "GET",
+            "verified": True,
+            "verify_note": ("unauthenticated GET returned a live token (SAS sig+sv / JWT) — minted "
+                            "with no session; credential redacted in evidence"),
+            "detail": (f"Unauthenticated {kind} minting: GET {path} returns a usable token with no "
+                       f"authentication. Any anonymous caller can mint credentials."),
+            "evidence": proof,
+            "evidence_log": [{
+                "label": "PROOF — token minted by unauthenticated request (secret redacted)",
+                "request": {"method": "GET", "url": url, "headers": {}, "body": ""},
+                "response": {"status": status, "body": proof},
+            }],
+            "repro": f"curl -s '{url}'",
+        })
+    return findings
+
+
 def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
                        extra_headers: dict | None = None, workers: int = 8,
                        max_files: int = 8000) -> tuple[int, list[dict], list[str], bool]:
@@ -369,6 +447,7 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
     saved = 0
     idx = 0
     truncated = False
+    saw_mint_hint = False
 
     client = httpx.Client(verify=False, follow_redirects=True, timeout=15, headers=hdr)
 
@@ -430,6 +509,8 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
                                          "evidence_log": _js_proof(u, txt, status, ctype, vl.version),
                                          "repro": f"curl -i '{u}'"})
                 for label, cat, ev in scan_js_secrets(txt, u):
+                    if label == "azure-sas-endpoint" or _MINT_HINT_RE.search(ev or ""):
+                        saw_mint_hint = True
                     k = (cat, ev)
                     if k not in seen_find:
                         seen_find.add(k)
@@ -456,6 +537,14 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
                             queue.append(cu)
     finally:
         client.close()
+    # If the JS referenced a token/SAS-minting endpoint, prove whether it mints UNAUTHENTICATED
+    # (read-only GET; secret redacted). Promotes the info-level reference to a real High when live.
+    if origin and saw_mint_hint:
+        for mf in probe_minting_endpoints(origin):
+            k = ("mint", mf["url"])
+            if k not in seen_find:
+                seen_find.add(k)
+                findings.append(mf)
     # Authoritative pass: if the retire.js binary is installed, scan the downloaded JS dir with its
     # maintained vulnerability DB (far broader than the lite signatures above). No-op if retire is
     # absent — never auto-installs (no egress). Deduped against the lite findings by (lib, version).
@@ -477,6 +566,65 @@ def harvest_js_content(js_urls: list[str], cookie: str, host: str, out_dir: str,
                          "detail": f"{vl.library} {vl.version}: {vl.detail} (retire.js)",
                          "evidence_log": proof, "repro": f"curl -i '{src}'"})
     return saved, findings, endpoints, truncated
+
+
+def script_srcs(html: str, base_url: str, host: str) -> list[str]:
+    """Absolute, same-host .js bundle URLs referenced by <script src=...> in an HTML shell.
+    An SPA's index shell lists the bundles whose code holds the /api/* routes it calls."""
+    from urllib.parse import urljoin, urlsplit
+    out: list[str] = []
+    seen: set = set()
+    for m in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html or "", re.I):
+        u = urljoin(base_url, m.strip())
+        path = urlsplit(u).path.lower()
+        if not (path.endswith(".js") or path.endswith(".mjs")):
+            continue
+        if host and urlsplit(u).hostname and urlsplit(u).hostname != host:
+            continue
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def mine_api_endpoints(target: str, cookie: str = "", headers: dict | None = None,
+                       host: str | None = None, timeout: float = 20.0,
+                       max_js: int = 40) -> list[str]:
+    """SPA-aware API discovery: fetch the target shell, find its <script src> bundles, and
+    mine them for API endpoints — the same JS route-mining the unauth/engagement path uses,
+    made reusable for the authenticated `launch` discovery stage. Returns absolute, same-host
+    endpoint URLs. Best-effort and side-effect-free (never raises)."""
+    import httpx
+    from urllib.parse import urljoin, urlsplit
+    hdrs = dict(headers or {})
+    if cookie:
+        hdrs["Cookie"] = cookie
+    host = host or urlsplit(target).hostname or ""
+    try:
+        r = httpx.get(target, headers=hdrs, follow_redirects=True, timeout=timeout, verify=False)
+    except Exception:  # noqa: BLE001
+        return []
+    base = str(r.url)
+    js_urls = script_srcs(r.text or "", base, host)
+    if not js_urls:
+        return []
+    try:
+        endpoints, _libs = analyze_js(js_urls, cookie, host, cap=max_js)
+    except Exception:  # noqa: BLE001
+        return []
+    # Keep same-host absolute http(s) endpoints (extract_endpoints may return paths too).
+    out: list[str] = []
+    seen: set = set()
+    for ep in endpoints:
+        u = ep if ep.startswith("http") else urljoin(base, ep)
+        if not u.startswith("http"):
+            continue
+        if host and urlsplit(u).hostname and urlsplit(u).hostname != host:
+            continue
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 
 def analyze_js(js_urls: list[str], cookie: str, host: str,

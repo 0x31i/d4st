@@ -93,7 +93,10 @@ class ToolAdapter(ABC):
         ...
 
     # Small helper so adapters share one subprocess convention.
-    def _exec(self, args: list[str], timeout: int = 900, stdin: str | None = None):
+    # cwd/env are optional (default None -> inherit) so existing callers are unchanged; tools that
+    # must write to a guaranteed-writable location (e.g. ZAP's report/home/session files) pass them.
+    def _exec(self, args: list[str], timeout: int = 900, stdin: str | None = None,
+              cwd: str | None = None, env: dict | None = None):
         proc = subprocess.run(
             args,
             input=stdin,
@@ -101,6 +104,8 @@ class ToolAdapter(ABC):
             text=True,
             timeout=timeout,
             check=False,
+            cwd=cwd,
+            env=env,
         )
         return proc
 

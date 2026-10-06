@@ -31,3 +31,11 @@ def _session_header_args(session_dict, url: str | None = None) -> list[str]:
 def _cookie_header(session_dict, url: str | None = None) -> str:
     sess = _session(session_dict)
     return sess.cookie_header(url) if sess else ""
+
+
+def _session_headers(session_dict) -> dict:
+    """Non-cookie session headers (e.g. `Authorization: Bearer <jwt>` for token/SPA auth).
+    Empty dict when there is no session. Lets header-only (bearer) auth reach tools that
+    inject headers rather than a Cookie (e.g. ZAP's replacer)."""
+    sess = _session(session_dict)
+    return dict(sess.headers) if sess and getattr(sess, "headers", None) else {}

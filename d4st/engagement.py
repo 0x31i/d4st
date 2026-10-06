@@ -2677,13 +2677,12 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # to the client as findings — passive/roster otherwise scans them (8 of 14 off-target on scan 1).
     # Default scope = the target's EXACT host; D4ST_SCOPE_HOSTS widens it (comma list; a bare domain
     # also matches its subdomains). Everything downstream (passive/roster/authz/PII) sees only in-scope.
-    _tgt_host = urlsplit(target).netloc.split("@")[-1].split(":")[0].lower()
-    _scope_env = os.environ.get("D4ST_SCOPE_HOSTS", "").strip()
-    _scope = [h.strip().lower() for h in _scope_env.split(",") if h.strip()] or [_tgt_host]
-
+    # Scope: ONE canonical definition shared with the launch/WorkflowRunner path (d4st.scope).
+    from .scope import in_scope as _scope_in_scope
+    from .scope import scope_hosts as _scope_hosts
+    _scope = _scope_hosts(target)
     def _in_scope(u: str) -> bool:
-        h = urlsplit(u).netloc.split("@")[-1].split(":")[0].lower()
-        return any(h == s or h.endswith("." + s) for s in _scope)
+        return _scope_in_scope(u, _scope)
     _before = len(urls)
     urls = [u for u in urls if _in_scope(u)]
     if _before != len(urls):
@@ -2895,20 +2894,22 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 findings += _authz
                 print(f"[api-authz] {len(_authz)} BOLA/mass-assignment finding(s)", flush=True)
             _prog.update("api-authz", findings, urls=len(urls), targets=len(targets))
-        # Harvest-driven authorization tests — the schema-less path. Most real SPAs expose NO
-        # OpenAPI spec, so run_api_authz_tests above never fires. Instead replay the
-        # authenticated /api endpoints the harvest found under tampered identities (no-auth /
-        # bad-token / id-tamper) and diff against the authed baseline. READ-ONLY (GET only, no
-        # mutation) + throttled, so it is safe on live/production infra under any active profile;
-        # it finds broken authentication + IDOR that payload injection structurally cannot.
-        if _harvest_urls and session is not None and getattr(session, "session_storage", None):
-            _refresh_jwt("harvest-authz")
+        # Authenticated authorization tests — replay every /api endpoint under tampered identities
+        # (no-auth / bad-token / id-tamper) and diff against the authed baseline. READ-ONLY (GET
+        # only, no mutation) + throttled, so it is safe on live/production infra under any active
+        # profile; it finds broken authentication + IDOR that payload injection structurally cannot.
+        # Permanent coverage: runs for ANY authenticated session (a bearer/custom header is enough —
+        # not only sessionStorage-SPAs), and sources endpoints from the harvest OR, failing that,
+        # the full crawl/seed frontier. run_authz filters to same-origin /api GETs internally.
+        _authz_urls = _harvest_urls or [u for u in urls if "/api/" in u.lower()]
+        if session is not None and _authz_urls:
+            _refresh_jwt("authz")
             try:
                 from .auth.authz import run_authz
-                _hz = run_authz(session, target, _harvest_urls,
+                _hz = run_authz(session, target, _authz_urls,
                                 delay=max(0.1, 1.0 / (pol.rps or 4)) if pol else 0.15)
             except Exception as _hze:  # noqa: BLE001 - authz pass must never sink the scan
-                print(f"[authz] harvest-authz skipped: {_hze}", flush=True)
+                print(f"[authz] skipped: {_hze}", flush=True)
                 _hz = []
             for _d in _hz:
                 findings.append(Finding(
@@ -2917,10 +2918,10 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                     detection=f"authenticated authorization replay ({_d['type']})",
                     confidence="firm" if _d["type"] != "idor-suspect" else "tentative",
                     evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
-            if _hz:
-                print(f"[authz] {len(_hz)} authorization finding(s) from "
-                      f"{len(_harvest_urls)} harvested endpoint(s)", flush=True)
-            _prog.update("harvest-authz", findings, urls=len(urls), targets=len(targets))
+            _src = "harvested" if _harvest_urls else "frontier"
+            print(f"[authz] replayed {len(_authz_urls)} {_src} /api endpoint(s) under "
+                  f"tampered identities; {len(_hz)} authorization finding(s)", flush=True)
+            _prog.update("authz", findings, urls=len(urls), targets=len(targets))
 
         # ------------------------------------------------------------------ ACTIVE DEPTH SUITE ----
         # Runs authenticated (session present) OR in unauth-deep mode. The auth-only stages (JWT
@@ -3100,9 +3101,11 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                         param="", method=_d.get("method", "GET"), evidence=_d["evidence"],
                         verified=True, detection=_d["detection"], confidence="firm",
                         evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
-                if _ax:
-                    print(f"[api-exposure] {len(_ax)} data-exposure finding(s) "
-                          f"(unauthenticated bulk/credential data in API responses)", flush=True)
+                # Always report (even 0) — a permanent, watchable check: a silent "0 swept" would be
+                # visible instead of a detector that quietly stopped running.
+                _apic = sum(1 for u in urls if "/api/" in u.lower())
+                print(f"[api-exposure] swept {_apic} API endpoint(s) unauthenticated; "
+                      f"{len(_ax)} bulk/credential data-exposure finding(s)", flush=True)
             except Exception as _axe:  # noqa: BLE001
                 print(f"[api-exposure] skipped: {_axe}", flush=True)
             _prog.update("api-exposure", findings, urls=len(urls), targets=len(targets))

@@ -1,0 +1,59 @@
+# Login recipe for a CANVAS / token-SPA app (Flutter CanvasKit, Angular) that has NO DOM login
+# form to record or fill — the auth is just an XHR to an /api/.../AuthUser endpoint that returns a
+# JWT. `d4st auth mint -p <this> -b <host>` replays that request headlessly to mint a fresh token,
+# unattended and repeatably. Learn the request ONCE: DevTools -> Network -> log in -> right-click
+# the AuthUser request -> Copy as fetch, and translate it into auth_api below.
+#
+# Creds come from env so they never live in the file:  export APP_USERNAME=…  APP_PASSWORD=…
+# One-off override:  d4st auth mint -p spa-token-api -b https://host -u user -w pass
+name: spa-token-api
+type: spa-token-api
+base_url_env: D4ST_APP_URL
+login_url: "{base}/"            # app root — only loaded for cred_style=encrypted-paramtoken
+username_env: APP_USERNAME
+password_env: APP_PASSWORD
+
+auth_api:
+  url: "{base}/api/Login/AuthUser"
+  method: GET                   # GET or POST — match what DevTools shows
+  # cred_style picks how creds go into the request AND which replay path runs:
+  #   plaintext-query  -> httpx; creds in the query string (url-encoded)      {user}/{pass}
+  #   json-body        -> httpx; POST a JSON body                             {user}/{pass}
+  #   form-urlencoded  -> httpx; POST a urlencoded form                       {user}/{pass}
+  #   encrypted-paramtoken -> headless browser; the app encrypts creds client-side (see below)
+  cred_style: plaintext-query
+  request:
+    # plaintext-query:
+    query: "UserName={user}&Password={pass}"
+    # json-body (instead of query):
+    #   json: {"username": "{user}", "password": "{pass}"}
+    # form-urlencoded (instead of query):
+    #   form: {"username": "{user}", "password": "{pass}"}
+  headers:                      # any non-default headers DevTools shows (Content-Type, etc.)
+    Accept: "application/json"
+  # Where the JWT sits in the JSON response (dotted path). Omit to auto-find the first eyJ… value.
+  token_json_path: "Token"
+
+  # --- cred_style: encrypted-paramtoken ONLY -------------------------------------------------
+  # The app wraps creds in an opaque, often timestamped `paramToken`, so a captured blob is NOT
+  # replayable. We load the app headless and call its OWN encrypt function with fresh creds.
+  # paramtoken_param: paramToken          # the query/body field that carries the blob
+  # encrypt_js: "window.appEncrypt"       # an in-page expression that evaluates to fn(user,pass)->token
+  #                                       # (find the fn name in main.*.js; or inline a small arrow fn)
+
+# Where the minted JWT is stored + how it becomes an HTTP header for the scanners.
+token:
+  key: Token                    # the sessionStorage/localStorage key the app writes (encrypted path)
+  storage: session
+  header: Authorization
+  scheme: "Bearer "
+
+# Optional cheaper refresh than a full re-login (if the app exposes one, e.g. RenewAccessToken).
+renew_api: {}
+#   url: "{base}/api/Login/RenewAccessToken"
+#   method: POST
+
+# An authed API endpoint that returns 200 with a valid token and 401/redirects without one.
+# Used as the liveness probe (canvas apps have blank innerText, so we can't use a body marker).
+validity:
+  api: "{base}/api/Account/GetProfile"

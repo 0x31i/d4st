@@ -79,6 +79,33 @@ def _record_arrays(data) -> list[tuple[str, int, list]]:
     return found
 
 
+def _xml_hits(body: str):
+    """Conservative exposure check for XML API bodies. Returns (creds, arrays) in the same shape as
+    the JSON path. Flags only clear bulk (>=2 sibling record elements) and credential-named elements
+    with a value — so an XML-serialized API can't hide a bulk/credential dump behind its format."""
+    import xml.etree.ElementTree as ET
+
+    def _local(t: str) -> str:
+        return t.rsplit("}", 1)[-1].lower()
+
+    try:
+        root = ET.fromstring(body)
+    except Exception:  # noqa: BLE001
+        return [], []
+    # bulk: >=2 sibling elements that are themselves records (have children or text)
+    recs = [c for c in list(root) if len(list(c)) > 0 or (c.text and c.text.strip())]
+    arrays = []
+    if len(recs) >= 2:
+        sample = sorted({_local(x.tag) for c in recs[:3] for x in list(c)})[:8]
+        arrays = [("xml-records", len(recs), sample or [_local(recs[0].tag)])]
+    # creds: an element whose tag is a credential/secret key and carries a non-empty value
+    creds = []
+    for el in root.iter():
+        if _local(el.tag) in _CRED_KEYS and el.text and el.text.strip():
+            creds.append((_local(el.tag), el.text.strip()))
+    return creds, arrays
+
+
 def scan_api_exposure(urls: list[str], cookie: str = "", *, authed: bool = False,
                       cap: int = 120, timeout: float = 10.0) -> list[dict]:
     """GET each candidate URL (unauth unless a cookie is supplied) and flag JSON bodies that leak
@@ -88,6 +115,10 @@ def scan_api_exposure(urls: list[str], cookie: str = "", *, authed: bool = False
 
     from .safety import browser_headers
     headers = browser_headers({"Cookie": cookie} if cookie else None)
+    # Prefer JSON. Content-negotiating APIs (ASP.NET/WebAPI) return XML to a browser Accept header,
+    # which hid bulk data from this detector (a content-negotiating API served <ArrayOf...> XML to the default Accept).
+    # Ask for JSON explicitly while keeping the browser UA so WAFs don't tarpit us.
+    headers["Accept"] = "application/json, text/plain, */*"
     seen: set = set()
     out: list[dict] = []
     # focus on likely-JSON/API endpoints; skip static assets and spec docs
@@ -106,14 +137,28 @@ def scan_api_exposure(urls: list[str], cookie: str = "", *, authed: bool = False
             continue
         ct = r.headers.get("content-type", "").lower()
         body = r.text or ""
-        if r.status_code != 200 or ("json" not in ct and not body.lstrip()[:1] in ("{", "[")):
+        start = body.lstrip()[:1]
+        # any 2xx is a successful read — some APIs answer GETs with 202/203/206, not just 200
+        # (some APIs return 202). Hardcoding 200 silently skipped the entire API surface.
+        if not (200 <= r.status_code < 300):
             continue
-        try:
-            data = json.loads(body)
-        except Exception:  # noqa: BLE001
+        looks_json = ("json" in ct) or start in ("{", "[")
+        looks_xml = ("xml" in ct) or start == "<"
+        if not (looks_json or looks_xml):
             continue
-        creds = _cred_hits(data)
-        arrays = _record_arrays(data)
+        creds: list = []
+        arrays: list = []
+        if looks_json:
+            try:
+                data = json.loads(body)
+                creds = _cred_hits(data)
+                arrays = _record_arrays(data)
+            except Exception:  # noqa: BLE001
+                pass
+        # XML fallback — some APIs only speak XML (or content-negotiate to it); the same bulk /
+        # credential exposure still applies, so don't let a serialization format hide it.
+        if not creds and not arrays and looks_xml:
+            creds, arrays = _xml_hits(body)
         if not creds and not arrays:
             continue
         proof = [{

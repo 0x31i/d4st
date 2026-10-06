@@ -51,3 +51,49 @@ def test_parse_semgrep_json():
                       "extra": {"message": "DOM XSS", "metadata": {"cwe": ["CWE-79"]}}}]})
     out = parse_semgrep_json(doc)
     assert out[0]["category"] == "xss" and out[0]["line"] == 3
+
+
+# ----- SPA API discovery (script_srcs + mine_api_endpoints) ---------------- #
+
+import httpx  # noqa: E402
+
+from d4st.jsanalysis import script_srcs, mine_api_endpoints  # noqa: E402
+
+
+class _Resp:
+    def __init__(self, text, url):
+        self.text = text
+        self.url = url
+
+
+def test_script_srcs_same_host_js_only():
+    html = ('<script src="/main.1a2b.js"></script>'
+            '<script src="https://app.test/vendor.js"></script>'
+            '<script src="https://cdn.other.com/x.js"></script>'
+            '<script src="/styles.css"></script>'
+            '<script>inline()</script>')
+    out = script_srcs(html, "https://app.test/", "app.test")
+    assert "https://app.test/main.1a2b.js" in out
+    assert "https://app.test/vendor.js" in out
+    assert all("other.com" not in u for u in out)       # off-host dropped
+    assert all(not u.endswith(".css") for u in out)      # non-js dropped
+
+
+def test_mine_api_endpoints_glues_shell_to_analyze(monkeypatch):
+    import d4st.jsanalysis as J
+    monkeypatch.setattr(httpx, "get",
+                        lambda *a, **k: _Resp('<script src="/main.js"></script>', "https://app.test/"))
+    monkeypatch.setattr(J, "analyze_js",
+                        lambda js_urls, cookie, host, cap=30:
+                        (["https://app.test/api/Auth/Get/", "/api/Users/List/",
+                          "https://cdn.other.com/api/x"], []))
+    eps = mine_api_endpoints("https://app.test/", host="app.test")
+    assert "https://app.test/api/Auth/Get/" in eps
+    assert "https://app.test/api/Users/List/" in eps       # path absolutized
+    assert all("other.com" not in e for e in eps)          # off-host dropped
+
+
+def test_mine_api_endpoints_no_scripts_returns_empty(monkeypatch):
+    monkeypatch.setattr(httpx, "get",
+                        lambda *a, **k: _Resp("<html>no scripts</html>", "https://app.test/"))
+    assert mine_api_endpoints("https://app.test/", host="app.test") == []

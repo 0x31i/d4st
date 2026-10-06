@@ -56,8 +56,29 @@ def test_parse_ghauri():
 
 
 def test_parse_sstimap():
-    assert parse_sstimap("SSTImap ... Engine: Twig ... template injection")[0]["engine"] == "Twig"
+    # Only a CONFIRMED injection point is a finding. Progress/banner text that merely mentions
+    # "template injection" or "Engine: X" (SSTImap prints these while probing) must NOT become a
+    # finding — that was the evidence-less false-positive bug.
+    assert parse_sstimap("SSTImap ... Engine: Twig ... template injection") == []
     assert parse_sstimap("nothing here") == []
+    assert parse_sstimap("[-] SSTImap couldn't find any injection point. Engine: Twig tested") == []
+    # A confirmed hit → one finding carrying url/param/payload/engine + evidence.
+    confirmed = (
+        "[+] SSTImap identified the following injection point:\n"
+        "  Query parameter: name\n"
+        "  Engine: Twig\n"
+        "  Injection: * ${7*7}\n"
+        "  Context: text\n"
+    )
+    out = parse_sstimap(confirmed, url="https://app.example/p?name=x")
+    assert len(out) == 1
+    f = out[0]
+    assert f["engine"] == "Twig"
+    assert f["param"] == "name"
+    assert f["url"] == "https://app.example/p?name=x"
+    assert f["payload"] == "* ${7*7}"
+    assert f["severity"] == "high" and f["confidence"] == "confirmed"
+    assert "identified the following injection point" in f["evidence"]
 
 
 def test_parse_crlfuzz():

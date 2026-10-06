@@ -99,3 +99,46 @@ def probe_profile(session: Session, profile: AuthProfile, base: str,
     render = bool(profile.validity.get("render")) if isinstance(profile.validity, dict) else False
     return is_valid(session, profile.validity_url(base), profile.validity_marker(),
                     timeout, render=render)
+
+
+def session_is_token_auth(session: Session) -> bool:
+    """True when the session carries a bearer/custom auth header or a JWT-looking value in
+    sessionStorage — i.e. a token-auth SPA whose logged-in state lives in a token, not a
+    server-rendered 'Logout' link. For these, a raw GET of the SPA shell is NOT a valid
+    logged-in signal (the shell is identical logged-in or out)."""
+    for k in (session.headers or {}):
+        if k.lower() == "authorization" or k.lower().startswith("x-") and "auth" in k.lower():
+            return True
+    for v in (session.session_storage or {}).values():
+        if isinstance(v, str) and v.count(".") == 2 and len(v) > 40:  # JWT-ish: header.payload.sig
+            return True
+    return False
+
+
+def is_session_valid(session: Session, url: str, marker: str | None = None,
+                     *, timeout: float = 15.0, render: bool | None = None) -> tuple[bool, str]:
+    """Validity gate that understands token-auth sessions (the fix for JWT-SPAs that `launch`
+    previously rejected by defaulting to a 'Logout' text marker + raw GET).
+
+    - An explicit ``marker`` is always honored (rendered if ``render`` or token-auth).
+    - Otherwise, a **token-auth** session is valid when the token is present: the scanners
+      replay that bearer to the API, so presence is the actionable signal (an expired token
+      just yields 401s mid-scan, same as any session going stale). We still try a rendered
+      probe for extra confidence, but never fail a present-token session on an ambiguous SPA
+      shell — only on a positive bounce to a ``/login`` path.
+    - A non-token (cookie) session with no marker falls back to the raw 2xx/not-login heuristic.
+    """
+    token_auth = session_is_token_auth(session)
+    if render is None:
+        render = token_auth  # SPAs must be rendered to mean anything
+    if marker:
+        return is_valid(session, url, marker, timeout, render=render)
+    if token_auth:
+        ok, note = is_valid(session, url, None, timeout, render=render)
+        if ok:
+            return True, f"token session; {note}"
+        if "redirected to login" in note:   # positive logged-out signal
+            return False, f"token session but {note}"
+        # ambiguous (render unavailable / marker-less SPA shell): trust token presence
+        return True, "token session (bearer/JWT present; will replay to API)"
+    return is_valid(session, url, marker, timeout, render=render)

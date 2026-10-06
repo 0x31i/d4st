@@ -56,9 +56,18 @@ def version() -> None:
 @click.option("--dry-run", is_flag=True, default=False, help="Plan only; run no tools.")
 @click.option("--force", is_flag=True, default=False,
               help="Scan even if the session fails its validity probe (not recommended).")
+@click.option("--seed-url", "seed_url", multiple=True,
+              help="Extra URL to seed the frontier (repeatable) — e.g. a known /api endpoint a "
+                   "crawler won't find on a client-rendered SPA.")
+@click.option("--seed-file", "seed_file", default=None,
+              help="File of seed URLs (one per line) to add to the frontier.")
+@click.option("--no-js-mine", "no_js_mine", is_flag=True, default=False,
+              help="Disable automatic JS/route mining of the SPA shell for API endpoints.")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON.")
 def launch(workflow: str, target: str, session_path: str | None,
-           allow_active: bool, dry_run: bool, force: bool, as_json: bool) -> None:
+           allow_active: bool, dry_run: bool, force: bool,
+           seed_url: tuple = (), seed_file: str | None = None, no_js_mine: bool = False,
+           as_json: bool = False) -> None:
     """Run a scanning workflow against a target."""
     Config.from_env()  # loaded for side effects / future DB + egress wiring
     spec = load_workflow(workflow)
@@ -71,26 +80,62 @@ def launch(workflow: str, target: str, session_path: str | None,
         # instead of silently producing unauthenticated (garbage) results.
         if not dry_run:
             from .auth.session import Session
-            from .auth.validity import is_valid
+            from .auth.validity import is_session_valid
             sess = Session.from_dict(session)
-            marker = sess.meta.get("validity_marker") or "Logout"
+            # Honor the captured validity marker if one was recorded; do NOT default to
+            # 'Logout' (that false-negatives JWT-SPAs whose session is token-based, not a
+            # server-rendered logout link). is_session_valid() is token-aware.
+            marker = sess.meta.get("validity_marker") or None
             probe_url = sess.meta.get("validity_url") or sess.origin or target
-            ok, note = is_valid(sess, probe_url, marker)
+            render_hint = sess.meta.get("validity_render")
+            ok, note = is_session_valid(
+                sess, probe_url, marker,
+                render=(bool(render_hint) if render_hint is not None else None))
+            # In --json mode these status lines must NOT go to stdout (they would prepend
+            # non-JSON text to the findings document). Route them to stderr instead.
             if ok:
-                console.print(f"[green]session valid[/green]: {note}")
+                if as_json:
+                    click.echo(f"session valid: {note}", err=True)
+                else:
+                    console.print(f"[green]session valid[/green]: {note}")
             elif force:
-                console.print(f"[yellow]session INVALID but --force set[/yellow]: {note}")
+                if as_json:
+                    click.echo(f"session INVALID but --force set: {note}", err=True)
+                else:
+                    console.print(f"[yellow]session INVALID but --force set[/yellow]: {note}")
             else:
                 raise click.ClickException(
                     f"session invalid ({note}); refusing to scan logged-out. Re-capture with "
                     f"`d4st auth capture` (check credentials), or pass --force to override."
                 )
 
+    # Build the seed list: explicit --seed-url / --seed-file, plus (for authed SPA scans) the
+    # API endpoints JS-mined from the shell — so detection actually reaches the /api surface
+    # Burp would, instead of just the root on a client-rendered app.
+    _log = (lambda m: None) if as_json else console.print
+    seeds: list[str] = list(seed_url)
+    if seed_file:
+        try:
+            with open(seed_file, "r", encoding="utf-8") as fh:
+                seeds += [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+        except OSError as exc:
+            raise click.ClickException(f"cannot read --seed-file {seed_file!r}: {exc}")
+    if session is not None and not no_js_mine and not dry_run:
+        try:
+            from .auth.session import Session
+            from .jsanalysis import mine_api_endpoints
+            _s = Session.from_dict(session)
+            mined = mine_api_endpoints(target, cookie=_s.cookie_header(target), headers=_s.headers)
+            if mined:
+                _log(f"authed discovery: JS-mined {len(mined)} API endpoint(s) from the SPA shell")
+                seeds += mined
+        except Exception as exc:  # noqa: BLE001 — discovery is best-effort, never fatal
+            _log(f"authed JS-mine skipped: {exc}")
+
     runner = WorkflowRunner(
-        spec, allow_active=allow_active, dry_run=dry_run,
-        log=(lambda m: None) if as_json else console.print,
+        spec, allow_active=allow_active, dry_run=dry_run, log=_log,
     )
-    result = runner.run(target, session=session)
+    result = runner.run(target, session=session, seed_urls=seeds)
 
     if as_json:
         click.echo(json.dumps({
@@ -130,8 +175,11 @@ def auth() -> None:
 @click.option("--password", "-w", default=None,
               help="Login password (overrides profile/env creds). NOTE: visible in shell history/ps — "
                    "prefer the profile's *_env vars for anything you want to keep secret.")
+@click.option("--timeout", "timeout_ms", default=30000, type=int, show_default=True,
+              help="Per-step Playwright timeout in ms (raise for apps with a slow cold-start / SPA bootstrap).")
 def auth_capture(profile: str, base: str | None, out: str, security: str | None,
-                 interactive: bool, headed: bool, username: str | None, password: str | None) -> None:
+                 interactive: bool, headed: bool, username: str | None, password: str | None,
+                 timeout_ms: int = 30000) -> None:
     """Establish and persist a login session (the one-time set)."""
     from .auth.capture import capture_interactive, capture_scripted
     from .auth.profile import load_profile
@@ -142,12 +190,54 @@ def auth_capture(profile: str, base: str | None, out: str, security: str | None,
             session = capture_interactive(prof, base, security=security)
         else:
             session = capture_scripted(prof, base, headless=not headed, security=security,
-                                       username=username, password=password)
+                                       username=username, password=password, timeout_ms=timeout_ms)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
     session.save(out)
     console.print(f"[green]captured[/green] {session.summary()}")
     console.print(f"saved -> {out}")
+
+
+@auth.command("mint")
+@click.option("--profile", "-p", required=True, help="spa-token-api auth profile (bundled name or path).")
+@click.option("--base", "-b", default=None, help="Target base URL (or set the profile's base env).")
+@click.option("--out", "-o", default=None, help="Write the captured session JSON here (default: print header only).")
+@click.option("--username", "-u", default=None, help="Login username (overrides profile/env creds).")
+@click.option("--password", "-w", default=None,
+              help="Login password (overrides profile/env creds). NOTE: visible in shell history/ps — "
+                   "prefer the profile's *_env vars.")
+@click.option("--timeout", "timeout_ms", default=30000, type=int, show_default=True,
+              help="Per-step timeout in ms (raise for slow SPA cold-start).")
+@click.option("--verify/--no-verify", default=False, help="Verify TLS (default: off, for staging certs).")
+@click.option("--print-cookie", is_flag=True, default=False,
+              help="Also print a 'name=value; …' cookie line as the LAST stdout line (for D4ST_REAUTH_CMD).")
+def auth_mint(profile: str, base: str | None, out: str | None, username: str | None,
+              password: str | None, timeout_ms: int, verify: bool, print_cookie: bool) -> None:
+    """Mint a fresh token by REPLAYING the login API — DOM-free, unattended, repeatable.
+
+    For canvas / token-SPA apps (Flutter CanvasKit, Angular) where there is no DOM login form to
+    record or fill: the profile's `auth_api` block declares the AuthUser request (learned once from
+    DevTools), and this replays it to produce a fresh JWT session every time it is called. Safe to
+    run on a schedule or wire into D4ST_REAUTH_CMD so a long scan re-authenticates on token expiry.
+    """
+    from .auth.minter import mint_token
+    from .auth.profile import load_profile
+
+    prof = load_profile(profile)
+    try:
+        session = mint_token(prof, base, username=username, password=password,
+                             timeout_ms=timeout_ms, verify=verify)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print(f"[green]minted[/green] {session.summary()}")
+    for k, v in session.headers.items():
+        console.print(f"  {k}: {str(v)[:40]}…")
+    if out:
+        session.save(out)
+        console.print(f"saved -> {out}")
+    if print_cookie:
+        # Last stdout line = cookie string, the contract _env_reauth() expects.
+        click.echo("; ".join(f"{c['name']}={c['value']}" for c in session.cookies if c.get("name")))
 
 
 @auth.command("init")
@@ -237,6 +327,56 @@ def auth_show(session_path: str) -> None:
     for c in session.cookies:
         console.print(f"  cookie {c.get('name')}={str(c.get('value'))[:12]}... "
                       f"domain={c.get('domain')} path={c.get('path')}")
+
+
+@auth.command("probe")
+@click.option("--target", "-t", required=True, help="Login page URL to probe.")
+@click.option("--username", "-u", "usernames", multiple=True, required=True,
+              help="A real username to test (repeatable). Password comes from --password.")
+@click.option("--password", "-w", default=None,
+              help="Password for the tested usernames (shared weak/universal passwords are common). "
+                   "NOTE: visible in shell history/ps.")
+@click.option("--fake-user", default=None, help="Baseline non-existent username (default auto).")
+@click.option("--token-key", default=None,
+              help="SPA token key in session/localStorage that marks a successful login (e.g. JWTToken).")
+@click.option("--token-storage", default="session", type=click.Choice(["session", "local"]))
+@click.option("--timeout", "timeout_ms", default=30000, type=int, show_default=True,
+              help="Per-step Playwright timeout in ms (raise for slow cold-start / SPA bootstrap).")
+@click.option("--evidence-dir", "-o", default=None, help="Directory for per-attempt screenshots.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON.")
+def auth_probe(target: str, usernames: tuple, password: str | None, fake_user: str | None,
+               token_key: str | None, token_storage: str, timeout_ms: int,
+               evidence_dir: str | None, as_json: bool) -> None:
+    """Is this account provisioned here? Differential login probe (read-only, lockout-safe).
+
+    Submits a deliberately non-existent username alongside the real ones; a real account whose
+    response is identical to that baseline is NOT in this app's user store. Distinguishes
+    not-provisioned vs account-exists-but-refused vs logged-in, with evidence.
+    """
+    import json as _json
+    from .auth.differential import DEFAULT_FAKE_USER, discover_and_probe
+
+    creds = [(u, password or "") for u in usernames]
+    probe = discover_and_probe(target, creds, fake_user=fake_user or DEFAULT_FAKE_USER,
+                               timeout_ms=timeout_ms, out_dir=evidence_dir,
+                               token_key=token_key, token_storage=token_storage)
+    if as_json:
+        # click.echo (raw), NOT console.print — Rich line-wraps to terminal width and parses
+        # markup, which corrupts JSON (newlines injected into string values, [..] eaten) when
+        # the body carries raw HTTP response text. as_dict() centralizes the serialization.
+        click.echo(_json.dumps(probe.as_dict(), indent=2))
+        return
+    console.print(f"[bold]{probe.target}[/bold]")
+    if probe.api_endpoint:
+        console.print(f"  login API: {probe.api_endpoint}")
+    if probe.client_side_hashing:
+        console.print("  [yellow]client-side password handling detected — raw replay unreliable[/yellow]")
+    for a in probe.attempts:
+        console.print(f"  [{a.label:14}] HTTP {a.status}  logged_in={a.logged_in}  "
+                      f"body={a.body[:48]!r}  {a.note}")
+    for label, v in probe.verdicts.items():
+        color = {"LOGGED_IN": "green", "NOT_PROVISIONED": "red"}.get(v.value, "yellow")
+        console.print(f"  => {label}: [{color}]{v.value}[/{color}]")
 
 
 # Map result filenames (in a --results dir) to tools.

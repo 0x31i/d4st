@@ -28,15 +28,39 @@ def parse_ghauri(text: str) -> list[dict]:
     return out
 
 
-def parse_sstimap(text: str) -> list[dict]:
+# SSTImap prints this header ONLY when it has actually confirmed an injection point. The bare
+# phrases "template injection" and "Engine:" also show up in its banner/progress output, so matching
+# those emitted evidence-less false positives (e.g. a phantom 'Nunjucks' SSTI on an ASP.NET app, with
+# no URL/param/payload and the engine changing run to run). Gate strictly on the confirmation marker.
+_SSTI_CONFIRM = re.compile(r"identified the following injection point", re.IGNORECASE)
+
+
+def parse_sstimap(text: str, url: str | None = None) -> list[dict]:
     text = _ANSI.sub("", text or "")
-    out: list[dict] = []
-    # SSTImap: "SSTImap identified the following injection point" / "Engine: Twig" etc.
-    if re.search(r"template injection|injection point|Engine:\s*\w+", text, re.IGNORECASE):
-        m = re.search(r"Engine:\s*(?P<engine>\w+)", text)
-        out.append({"tool": "sstimap", "category": "ssti",
-                    "engine": m.group("engine") if m else ""})
-    return out
+    m_confirm = _SSTI_CONFIRM.search(text)
+    if not m_confirm:
+        return []   # unconfirmed / progress-only output is NOT a finding
+
+    def _grab(pat: str) -> str:
+        m = re.search(pat, text, re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    finding = {
+        "tool": "sstimap", "category": "ssti", "severity": "high",
+        "confidence": "confirmed",
+        "engine": _grab(r"Engine:\s*(\S+)"),
+    }
+    param = _grab(r"(?:Query parameter|Form parameter|Parameter|parameter):\s*(\S+)")
+    payload = _grab(r"Injection:\s*(.+)")
+    if url:
+        finding["url"] = url
+    if param:
+        finding["param"] = param
+    if payload:
+        finding["payload"] = payload
+    # a short, real excerpt around the confirmation so the finding is actionable + scope-checkable
+    finding["evidence"] = text[m_confirm.start():m_confirm.start() + 400].strip()
+    return [finding]
 
 
 def parse_crlfuzz(text: str) -> list[dict]:
@@ -119,7 +143,7 @@ class SstimapAdapter(ToolAdapter):
             if cookie:
                 args += ["--cookie", cookie]
             proc = self._exec(args, timeout=_to)
-            return parse_sstimap(proc.stdout)
+            return parse_sstimap(proc.stdout, url=url)
 
         findings: list[dict] = []
         for r in map_bounded(_probe, targets, ctx.options.get("workers", 1)):

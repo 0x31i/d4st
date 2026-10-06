@@ -30,6 +30,12 @@ class AuthProfile:
     post_login_cookies: list[dict] = field(default_factory=list)  # [{name, value, path}]
     totp: dict = field(default_factory=dict)             # {enabled, seed_env, selector}
     token: dict = field(default_factory=dict)            # {key, storage: session|local, header, scheme}
+    # ----- spa-token-api (DOM-free login replay; see minter.py) --------------
+    # The login is just an XHR to an /api/.../AuthUser endpoint; a canvas app (Flutter/Angular
+    # CanvasKit) has no DOM form to drive, so we replay that request directly instead of filling
+    # selectors. auth_api declares the request; renew_api (optional) is a cheaper refresh call.
+    auth_api: dict = field(default_factory=dict)         # {url, method, cred_style, request, headers, token_json_path}
+    renew_api: dict = field(default_factory=dict)        # {url, method, headers}
     raw: dict = field(default_factory=dict)
 
     # ----- resolution --------------------------------------------------------
@@ -68,6 +74,7 @@ def _from_dict(d: dict) -> AuthProfile:
         "name", "type", "login_url", "username_selector", "password_selector",
         "submit_selector", "username", "password", "username_env", "password_env",
         "success", "validity", "post_login_cookies", "totp", "token",
+        "auth_api", "renew_api",
     }
     kwargs = {k: v for k, v in d.items() if k in known}
     kwargs["raw"] = d

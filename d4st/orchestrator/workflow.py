@@ -16,6 +16,7 @@ from importlib import resources
 
 import yaml
 
+from ..scope import in_scope_pred, scope_hosts
 from .adapters import get_adapter
 from .adapters.base import AdapterResult, RunContext
 from .frontier import Frontier
@@ -65,10 +66,20 @@ class WorkflowRunner:
         self.workdir = workdir
         self.log = log or (lambda msg: None)
 
-    def run(self, target: str, session: dict | None = None) -> WorkflowResult:
+    def run(self, target: str, session: dict | None = None,
+            seed_urls: list | None = None) -> WorkflowResult:
         max_rounds = int(self.spec.get("max_rounds", 3))
-        frontier = Frontier(max_rounds=max_rounds)
-        frontier.add_url(target)
+        # Scope gate: restrict the whole frontier to in-scope hosts so active/injection tools
+        # never attack third-party resources (fonts.googleapis.com, docs.google.com, CDNs …)
+        # that discovery drags in. Same definition as the unauth path (d4st.scope).
+        hosts = scope_hosts(target)
+        frontier = Frontier(max_rounds=max_rounds, in_scope=in_scope_pred(hosts))
+        frontier.add_url(target, force=True)  # the operator's explicit target is always in-scope
+        # Pre-seed the frontier (e.g. SPA /api routes JS-mined from the authed shell, or an
+        # explicit --seed-url list) so detection has real surface on client-rendered apps
+        # where crawlers otherwise see only the root. Off-scope seeds are dropped by the gate.
+        if seed_urls:
+            frontier.add_urls([u for u in seed_urls if u])
 
         stages = self.spec.get("stages", [])
         discovery_stages = [s for s in stages if s.get("kind") == "discovery"]
@@ -97,6 +108,10 @@ class WorkflowRunner:
                 wf.results.append(res)
 
         wf.frontier_stats = frontier.stats()
+        dropped = wf.frontier_stats.get("off_scope_dropped", 0)
+        if dropped:
+            self.log(f"[scope] restricted to {', '.join(hosts)}: dropped {dropped} off-scope "
+                     f"URL(s) from the frontier (not scanned)")
         for cap in wf.frontier_stats.get("caps", []):
             self.log(f"COVERAGE CAP: {cap}")
         return wf
