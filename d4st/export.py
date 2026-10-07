@@ -253,7 +253,14 @@ def to_burp_xml(result: dict, path: str) -> int:
         lines.append(f"    <location>{_xesc(f.get('param') or path_q)}</location>")
         lines.append(f"    <severity>{_BURP_SEV.get(m['severity'], 'Information')}</severity>")
         lines.append(f"    <confidence>{_burp_confidence(f)}</confidence>")
-        lines.append(f"    <issueBackground>{_xesc(m['desc'])}</issueBackground>")
+        # Fold the specific evidence into issueBackground too. ASM-NG shows issueBackground
+        # as the vuln DESCRIPTION but does not surface issueDetail, so without this a
+        # PII/data-exposure finding reads "there's a problem" with no proof (the leaked value).
+        # Evidence-everything: the matched value belongs in front of the analyst.
+        _bg = m['desc']
+        if f.get("evidence"):
+            _bg = f"{_bg}\n\n— Evidence —\n{f['evidence']}"
+        lines.append(f"    <issueBackground>{_xesc(_bg)}</issueBackground>")
         lines.append(f"    <issueDetail>{_xesc(_issue_detail(f))}</issueDetail>")
         lines.append(f"    <remediationBackground>{_xesc(m['fix'])}</remediationBackground>")
         lines.append(f"    <references>{_xesc(refs)}</references>")
