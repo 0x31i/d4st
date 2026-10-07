@@ -1044,7 +1044,9 @@ def _render_finding(f: dict, anchor: str, nobreak: bool = False, concise: bool =
         badges += f"<span class='badge conf-{_esc(confidence)}'>{_esc(confidence)}</span>"
     if verified is True:
         badges += "<span class='badge v-yes'>confirmed &mdash; independently verified</span>"
-    elif verified is False:
+    else:
+        # None here = detected but d4st did not independently confirm it (findings it actively
+        # REFUTED as false positives, verified is False, are filtered out of the report upstream).
         badges += "<span class='badge v-no'>requires manual verification</span>"
 
     blocks = [f"<div class='block'><div class='h'>Description</div><div class='prose'>{_esc(meta['desc'])}</div></div>"]
