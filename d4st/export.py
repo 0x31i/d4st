@@ -56,11 +56,24 @@ def _specific_name(f: dict, m: dict) -> str:
     cat = f.get("category", "")
 
     if cat == "pii-disclosure":
-        kind = param.replace("_", " ").title() if param else "Sensitive Data"
-        # Keep the title GENERIC (by kind) so same-kind disclosures MERGE/group — ASM-NG groups by
-        # name, and a per-value title explodes 135 emails into 135 ungroupable rows. The specific
-        # value lives in the evidence/description (folded into issueBackground), not the title.
-        return "Email Address Disclosed" if kind.lower().startswith("email") else f"{kind} Disclosed"
+        # Title by PII TYPE, never by the value — so same-type disclosures MERGE in ASM-NG (groups
+        # by name). param is sometimes the entity (EMAIL_ADDRESS) and sometimes the raw value
+        # (support@q4inc.com, from JS scanning); both must collapse to one generic title. The
+        # specific value lives in the evidence/description (folded into issueBackground).
+        p = param.lower()
+        if "@" in param or p.startswith("email"):
+            return "Email Address Disclosed"
+        if "ssn" in p:
+            return "SSN Disclosed"
+        if "credit" in p or "card" in p:
+            return "Credit Card Disclosed"
+        if "phone" in p:
+            return "Phone Number Disclosed"
+        if "iban" in p or "bank" in p:
+            return "Bank Account (IBAN) Disclosed"
+        if param and " " not in param and "@" not in param and param.replace("_", "").isalpha() and param.isupper():
+            return param.replace("_", " ").title() + " Disclosed"   # other known entity type
+        return "Sensitive Data Disclosed"
 
     if cat == "tls-configuration":
         if param == "certificate-invalid":
