@@ -57,10 +57,10 @@ def _specific_name(f: dict, m: dict) -> str:
 
     if cat == "pii-disclosure":
         kind = param.replace("_", " ").title() if param else "Sensitive Data"
-        mm = _re.search(r"disclosed:\s*([^()\n]+)", ev)
-        val = mm.group(1).strip() if mm else ""
-        base = "Email Address Disclosed" if kind.lower().startswith("email") else f"{kind} Disclosed"
-        return f"{base}: {val}" if val else base
+        # Keep the title GENERIC (by kind) so same-kind disclosures MERGE/group — ASM-NG groups by
+        # name, and a per-value title explodes 135 emails into 135 ungroupable rows. The specific
+        # value lives in the evidence/description (folded into issueBackground), not the title.
+        return "Email Address Disclosed" if kind.lower().startswith("email") else f"{kind} Disclosed"
 
     if cat == "tls-configuration":
         if param == "certificate-invalid":
