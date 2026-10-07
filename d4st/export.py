@@ -93,10 +93,13 @@ def _specific_name(f: dict, m: dict) -> str:
         return "Insecure Cookie Flags"
     if lp.startswith("csp-"):
         return "Weak Content-Security-Policy"
-    # A hyphenated param is a CHECK name (self-describing) -> prettify it. A camelCase / single-word
-    # param is an INJECTED PARAMETER NAME (url, id, replaceCurrent) — that's a location, not an
-    # issue — so fall back to the family title instead of a meaningless "Url".
-    if "-" in param:
+    # A hyphenated param is a CHECK name (self-describing) -> prettify it. BUT a URL, a path, a
+    # dotted value, an @-value, or a long opaque id is a LOCATION/VALUE (it just happens to contain
+    # a hyphen) — titling by it yields "Https://.../Amazon-Cognito..." garbage that can't merge.
+    # Only prettify a SHORT, clean check-name; everything else uses the family title (merges, and
+    # the real location is in the Host/URL columns).
+    if ("-" in param and "/" not in param and "@" not in param
+            and param.count(".") < 2 and len(param) <= 40):
         return param.replace("-", " ").title()
     return m["title"]
 
