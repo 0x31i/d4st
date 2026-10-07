@@ -477,6 +477,119 @@ def _meta_for(cat: str) -> dict:
     return {**base, "classes": _CLASSES.get(cat, []), "refs": _REFS.get(cat, [])}
 
 
+# ── Manual-verification playbooks ───────────────────────────────────────────────
+# For findings d4st did NOT independently verify, the report says plainly "we found the
+# indicator — here is how to confirm it by hand" rather than implying certainty. Steps are
+# kept non-destructive on purpose (clients include production + healthcare systems).
+_GENERIC_VERIFY = [
+    "Reproduce the exact request above (same parameter + payload) and compare it against a benign "
+    "baseline value, to confirm the behaviour is caused by the payload and not by a WAF, cache, "
+    "redirect, or generic error page.",
+    "Confirm the effect is real and repeatable (run it two or three times) and that the target and "
+    "parameter are in scope.",
+    "Rule out the common false-positive causes for this issue class before reporting it as a vulnerability.",
+]
+_INJ_VERIFY = [
+    "Re-send the request with the flagged parameter at a normal/baseline value and record the response (status, length, timing).",
+    "Send a payload pair that should differ if injectable (a logically-true vs logically-false condition, or a metacharacter vs its encoded form) and compare the two responses.",
+    "If there is no visible difference, test an out-of-band or time-based variant and confirm the target reacts (an OOB callback, or a response delayed by the injected interval), repeatably.",
+    "Confirm the difference is caused by the payload, not a WAF/cache/error page. Keep payloads non-destructive — no stacked queries, writes, or deletes against a live system.",
+]
+_VERIFY_STEPS: dict[str, list[str]] = {
+    "sql-injection": _INJ_VERIFY, "command-injection": _INJ_VERIFY, "nosql-injection": _INJ_VERIFY,
+    "ldap-injection": _INJ_VERIFY, "xpath": _INJ_VERIFY, "parameter-pollution": _INJ_VERIFY,
+    "xss": [
+        "Open the flagged URL/parameter in a real browser with a unique, harmless marker (e.g. `d4st<svg/onload=console.log(1)>`).",
+        "View source and confirm the marker lands UN-encoded in an executable context (HTML body, an attribute, or a JS/DOM sink) — not HTML-entity-escaped.",
+        "Confirm it actually executes (the console/alert fires), not merely that it appears in the response.",
+        "Record whether it is reflected or stored and the injection context. Use harmless payloads only; never target real users or deface.",
+    ],
+    "reflected-input": [
+        "Confirm the input is reflected into the response unmodified (view source; check it is not entity-encoded).",
+        "Determine the reflection context (HTML / attribute / JS / URL) and whether a payload could break out of it to execute script.",
+        "If it cannot execute script, label this as input reflection / defence-in-depth, not XSS.",
+    ],
+    "ssrf": [
+        "Point the flagged parameter at a controlled out-of-band listener (interactsh/Collaborator) and confirm an inbound request arrives from the target.",
+        "If authorized and in scope, test reachability of internal targets (e.g. cloud metadata 169.254.169.254, internal hostnames) and compare reachable vs unreachable responses/timing.",
+        "Confirm the server — not your browser — makes the request. Avoid hitting sensitive internal services.",
+    ],
+    "open-redirect": [
+        "Set the redirect parameter to an external domain you control and confirm the response (a 3xx Location, or a JS/meta redirect) sends the browser off-site.",
+        "If the obvious case is blocked, test common bypasses (`//evil.tld`, `https:evil.tld`, `/\\/evil.tld`, whitelisted-host tricks).",
+        "Confirm the redirect target is attacker-controllable and not limited to a server-side allow-list.",
+    ],
+    "file-inclusion": [
+        "Request a known-safe, non-sensitive file through the parameter (a readable local path, or a short traversal to one) and confirm its contents appear in the response.",
+        "Vary the depth/encoding to confirm it is traversal, not a fixed include.",
+        "Keep strictly to read-only, non-sensitive files; do not attempt log-poisoning/RCE on a live host without explicit authorization.",
+    ],
+    "rfi": [
+        "Point the parameter at a URL you control and confirm the server fetches it (an out-of-band callback).",
+        "Confirm remote content is included/executed rather than merely fetched. Host only benign content.",
+    ],
+    "xxe": [
+        "Resubmit the XML with an external entity pointing at a controlled OOB listener; an inbound request proves the parser resolved it.",
+        "If reachable, test a local-file entity against a readable, non-sensitive file.",
+        "Avoid DoS payloads (e.g. billion-laughs) against live systems.",
+    ],
+    "bola": [
+        "Using TWO separate accounts, authenticate as account A and request an object identifier that belongs to account B.",
+        "Confirm A receives B's data (not a 403/404/empty). This REQUIRES a second account — never infer it from a single session.",
+        "Capture both requests/responses as proof of cross-user/cross-tenant access.",
+    ],
+    "idor-suspect": [
+        "Repeat the request as a different, lower-privileged user (or with no auth) against another user's object ID.",
+        "Confirm the response returns data the second identity should not see. A single-session observation is NOT sufficient.",
+    ],
+    "mass-assignment": [
+        "Add the sensitive/privileged field (e.g. role, is_admin, owner_id) to the request body and confirm the server accepts it.",
+        "Re-read the object to confirm the field actually changed; a 200 response alone is not proof.",
+    ],
+    "secret-disclosure": [
+        "Extract the token/key and identify its type (API key, cloud credential, JWT, etc.).",
+        "Determine whether it is LIVE and grants access — many client-side keys are public, scoped, or domain-locked and benign by design.",
+        "Only report it if it grants meaningful access, and state the scope/impact you confirmed.",
+    ],
+    "unauth-credential-exposure": [
+        "Confirm the credential/secret is returned to an UNAUTHENTICATED request (re-fetch with no session).",
+        "Validate whether it is actually usable (test an authenticated action) before rating impact.",
+    ],
+    "excessive-data-exposure": [
+        "Confirm the endpoint returns more fields/records than the role/UI should expose, to an unauthenticated or lower-privileged caller.",
+        "Check whether any returned fields are sensitive (PII/PHI, secrets) before rating severity.",
+    ],
+    "vulnerable-js-dependency": [
+        "Confirm the library AND its exact version from the served file (not a stale version string in a comment).",
+        "Confirm the specific vulnerable feature/code path is actually used by the application.",
+        "Confirm the CVE is reachable in this deployment, not merely present on disk.",
+    ],
+    "cors-credentialed-reflection": [
+        "Send a cross-origin request with a test Origin and credentials; confirm the response reflects that Origin in Access-Control-Allow-Origin AND sets Access-Control-Allow-Credentials: true.",
+        "Confirm a sensitive, authenticated endpoint is actually readable cross-origin this way.",
+    ],
+    "web-cache-poisoning": [
+        "Send the unkeyed input (e.g. X-Forwarded-Host) and confirm it is reflected into a cacheable response.",
+        "Confirm the poisoned response is then served to a separate, clean request for the same URL (i.e. it was cached).",
+        "Test on a low-impact path first — cache poisoning affects every user of that URL.",
+    ],
+    "csrf": [
+        "Build a minimal cross-site request that performs the state-changing action and confirm it succeeds with the victim's session and no anti-CSRF token / SameSite protection.",
+        "Confirm the action has a real security effect before reporting.",
+    ],
+}
+
+
+def _verify_block(cat: str) -> str:
+    """'How to verify manually' box, shown for findings d4st did not independently confirm."""
+    steps = _VERIFY_STEPS.get(cat, _GENERIC_VERIFY)
+    items = "".join(f"<li>{_esc(s)}</li>" for s in steps)
+    return ("<div class='block verifyhow'><div class='h'>How to verify manually</div>"
+            "<div class='prose'>d4st flagged this from an indicator but did <b>not</b> independently "
+            "confirm it. Treat it as a lead and confirm it by hand before reporting it as a vulnerability:</div>"
+            f"<ol class='verifysteps'>{items}</ol></div>")
+
+
 def _sev_donut(counts: dict, total: int) -> str:
     """conic-gradient stops for a findings donut proportioned by the severity mix.
     No grade/verdict — the ring just shows the shape of what was found."""
@@ -661,6 +774,10 @@ p{margin:0 0 12px}
 .badge.v-no{color:var(--high);border-color:#f3d6bf;background:var(--high-wash)}
 .badge.conf-firm{color:var(--accent-ink);border-color:#d3d4f7;background:var(--accent-wash)}
 .badge.conf-tentative{color:var(--ink3)}
+.verifyhow{border:1px solid #f3d6bf;background:var(--high-wash);border-radius:11px;padding:14px 17px}
+.verifyhow>.h{color:var(--high)}
+.verifysteps{margin:10px 0 0;padding-left:20px;font-size:14px;color:var(--ink);max-width:72ch}
+.verifysteps li{margin:6px 0}
 .fbody{padding:2px 24px 22px}
 .block{margin:20px 0}
 .block>.h{font-size:11px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;color:var(--ink3);margin-bottom:9px}
@@ -896,7 +1013,8 @@ def _render_finding(f: dict, anchor: str, nobreak: bool = False, concise: bool =
     """MAX DETAIL: render every field the pipeline captured for this finding.
     In concise mode, medium/low/info findings cap giant response bodies + raw output;
     critical/high always keep full evidence."""
-    meta = _meta_for(f.get("category", "other"))
+    cat = f.get("category", "other")
+    meta = _meta_for(cat)
     sev = meta["severity"]
     # concise mode bounds giant blobs: a GENEROUS cap on crit/high (full request + headers +
     # substantial response body) and a tight cap on medium/low/info noise. The full report
@@ -925,9 +1043,9 @@ def _render_finding(f: dict, anchor: str, nobreak: bool = False, concise: bool =
     if confidence:
         badges += f"<span class='badge conf-{_esc(confidence)}'>{_esc(confidence)}</span>"
     if verified is True:
-        badges += "<span class='badge v-yes'>independently verified</span>"
+        badges += "<span class='badge v-yes'>confirmed &mdash; independently verified</span>"
     elif verified is False:
-        badges += "<span class='badge v-no'>tool-reported, unconfirmed</span>"
+        badges += "<span class='badge v-no'>requires manual verification</span>"
 
     blocks = [f"<div class='block'><div class='h'>Description</div><div class='prose'>{_esc(meta['desc'])}</div></div>"]
     if reason:
@@ -968,6 +1086,8 @@ def _render_finding(f: dict, anchor: str, nobreak: bool = False, concise: bool =
     if meta["refs"]:
         refs = "".join(f"<li><a href='{_esc(u)}'>{_esc(t)}</a></li>" for t, u in meta["refs"])
         blocks.append(f"<div class='block'><div class='h'>References</div><ul class='reflist'>{refs}</ul></div>")
+    if verified is not True:
+        blocks.append(_verify_block(cat))
     blocks.append(f"<div class='block'><div class='h'>Remediation</div><div class='remedy'>{_esc(meta['fix'])}</div></div>")
 
     nb = " nobreak" if nobreak else ""
