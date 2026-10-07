@@ -30,7 +30,7 @@ services:
       # OAST/interactsh server (blank = the hosted default)
       D4ST_INTERACTSH_SERVER: "${D4ST_INTERACTSH_SERVER:-}"
     volumes:
-      - ./d4st:/app/d4st      # LIVE code — git pull + restart updates the tool, no rebuild
+      - ./d4st:/app/d4st      # LIVE code — the PACKAGE dir (<repo>/d4st), NOT the repo root. Run compose from the repo root so ./d4st resolves to it. git pull + restart updates the tool, no rebuild.
       - ./data:/data              # SQLite store (scans + findings)
       - ./runs:/app/runs          # seed URL lists
       - ./sessions:/app/sessions  # captured auth sessions

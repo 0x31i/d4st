@@ -134,4 +134,10 @@ EXPOSE 8810
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS http://localhost:8810/ >/dev/null || exit 1
 
+# Validate the /app/d4st code mount before starting (catches the repo-root-vs-package
+# bind-mount mistake with a clear message instead of a cryptic ModuleNotFoundError).
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
 CMD ["d4st", "serve", "--host", "0.0.0.0", "--port", "8810"]

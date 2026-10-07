@@ -86,6 +86,9 @@ render the client report any time with `d4st report <name> --from-db --client "E
   docker compose pull && docker compose up -d
   docker compose exec d4st d4st doctor
   ```
+  > Rolling your own `docker run` with a code mount? The target is the **package** dir, not the
+  > repo root: `-v <repo>/d4st:/app/d4st` (note the repeated `d4st`). Mounting the repo root
+  > buries the package a level too deep; the container now fails fast with a clear message if so.
 - **Windows**: see [`docs/deploy-windows.md`](docs/deploy-windows.md) (runs under WSL2).
 
 </details>
