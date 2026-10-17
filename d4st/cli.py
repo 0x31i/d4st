@@ -511,8 +511,25 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
     from .updater import stale_components
     stale = stale_components()
     if stale:
-        console.print(f"[yellow]stale detection content[/yellow]: {', '.join(stale)} "
-                      f"— run `d4st update` for freshest templates/rules (or proceed offline).")
+        _sca_stale = "retirejs-db" in stale
+        if os.environ.get("D4ST_AUTO_UPDATE") == "1":
+            from .updater import update_all
+            console.print(f"[yellow]stale detection content[/yellow]: {', '.join(stale)} "
+                          f"— [bold]D4ST_AUTO_UPDATE=1[/bold], refreshing before scan...")
+            try:
+                _m, _notes = update_all(stale)
+                for _n in _notes:
+                    console.print(f"  [green]updated[/green] {_n}")
+            except Exception as _exc:  # noqa: BLE001 - fail-soft: a refresh failure must not abort the scan
+                console.print(f"  [yellow]auto-update could not complete[/yellow] ({_exc}); "
+                              f"proceeding with existing content.")
+        else:
+            console.print(f"[yellow]stale detection content[/yellow]: {', '.join(stale)} "
+                          f"— run `d4st update` for freshest templates/rules, or set "
+                          f"[bold]D4ST_AUTO_UPDATE=1[/bold] to refresh automatically (or proceed offline).")
+            if _sca_stale:
+                console.print("  [yellow]note[/yellow]: a stale retire.js DB means SCA / "
+                              "vulnerable-dependency coverage can silently lag a Burp baseline.")
     if profile in ("production-safe", "passive-only"):
         console.print(f"[cyan]safety policy[/cyan]: [bold]{profile}[/bold] — throttled, "
                       f"{'no attack traffic' if profile == 'passive-only' else 'no data mutation / no destructive endpoints / safe sqlmap'}")
