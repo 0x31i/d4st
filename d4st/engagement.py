@@ -242,6 +242,9 @@ def blind_crawl(target: str, cookie: str, depth: int = 3, duration: str = "3m",
     Precedence: explicit D4ST_HEADLESS_CRAWL env (operator override) > `headless` arg
     (fingerprint) > legacy default (on). Pass `seeds` to crawl several entry roots (used when
     the landing page is link-poor and the fingerprint discovered richer entry points)."""
+    # Exhaustive overrides: deeper/longer katana crawl when requested. Defaults unchanged.
+    depth = int(os.environ.get("D4ST_CRAWL_DEPTH") or depth)
+    duration = os.environ.get("D4ST_CRAWL_DURATION") or duration
     env = os.environ.get("D4ST_HEADLESS_CRAWL")
     if env is not None:
         use_headless = env != "0"                # operator override wins
@@ -2763,7 +2766,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # self-lower the rate and abort if the target struggles, so this is a ceiling, not a floor.
     _ferox_threads = max(4, pol.concurrency * 2) if pol else 8
     _ferox_rate = max(10, int(pol.rps * pol.concurrency * 2)) if pol else 15
-    _dopts = {"cookie": cookie, "harvest_rounds": 3, "ferox_depth": 2, "timeout": 1500,
+    _dopts = {"cookie": cookie, "harvest_rounds": int(os.environ.get("D4ST_HARVEST_ROUNDS") or 3), "ferox_depth": 2, "timeout": 1500,
               "ferox_threads": _ferox_threads, "ferox_rate": _ferox_rate}
     if os.environ.get("D4ST_FEROX_WORDLIST"):   # operator override (e.g. a fast list)
         _dopts["ferox_wordlist"] = os.environ["D4ST_FEROX_WORDLIST"]

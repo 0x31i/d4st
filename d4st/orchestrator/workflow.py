@@ -68,7 +68,10 @@ class WorkflowRunner:
 
     def run(self, target: str, session: dict | None = None,
             seed_urls: list | None = None) -> WorkflowResult:
-        max_rounds = int(self.spec.get("max_rounds", 3))
+        # Exhaustive override: D4ST_MAX_ROUNDS raises the convergence cap. The frontier's
+        # should_continue() still stops early once no new surface appears, so a higher cap
+        # only costs rounds when there is genuinely more to reach (not a flat multiplier).
+        max_rounds = int(os.environ.get("D4ST_MAX_ROUNDS") or self.spec.get("max_rounds", 3))
         # Scope gate: restrict the whole frontier to in-scope hosts so active/injection tools
         # never attack third-party resources (fonts.googleapis.com, docs.google.com, CDNs …)
         # that discovery drags in. Same definition as the unauth path (d4st.scope).
