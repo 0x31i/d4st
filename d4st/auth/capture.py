@@ -13,6 +13,8 @@ model) works without the browser binaries installed. Install once with:
 
 from __future__ import annotations
 
+import os
+
 from urllib.parse import urlsplit
 
 from .profile import AuthProfile
@@ -136,7 +138,8 @@ def capture_scripted(profile: AuthProfile, base: str | None = None, *,
                 try:
                     page.wait_for_function(
                         "a => !!window[a.s] && !!window[a.s].getItem(a.k)",
-                        arg={"s": store_obj, "k": tkey}, timeout=8000)
+                        arg={"s": store_obj, "k": tkey},
+                        timeout=int(os.environ.get("D4ST_TOKEN_WAIT_MS", "8000")))
                     ok = True
                     print(f"[capture] success via {store_obj}.{tkey} present at {page.url} "
                           f"(page-marker not required — transient-redirect tolerant)", flush=True)

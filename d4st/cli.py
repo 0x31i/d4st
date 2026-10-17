@@ -482,7 +482,7 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
     from urllib.parse import urlsplit
 
     from .auth.session import Session
-    from .auth.validity import is_valid
+    from .auth.validity import is_valid, is_session_valid
     from .engagement import run_engagement
 
     sess = Session.load(session_path)
@@ -490,9 +490,12 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
     cookie = sess.cookie_header(host)
     # token-in-sessionStorage SPAs (bearer auth) can only be validated by a rendered browser
     # probe — a raw GET sees the logged-out shell. render when the session carries sessionStorage.
-    ok, note = is_valid(sess, sess.meta.get("validity_url") or target,
-                        sess.meta.get("validity_marker") or "Logout",
-                        render=bool(sess.session_storage))
+    # is_session_valid() is token-aware: a JWT/bearer SPA that carries a live token in sessionStorage
+    # is valid even when no server-rendered "Logout" marker is present (the old is_valid() default
+    # marker false-rejected these otherwise-good sessions). Marker None => don't require a text marker.
+    ok, note = is_session_valid(sess, sess.meta.get("validity_url") or target,
+                                sess.meta.get("validity_marker") or None,
+                                render=bool(sess.session_storage) or None)
     if not ok:
         raise click.ClickException(f"session invalid ({note}); re-capture before an engagement.")
 
