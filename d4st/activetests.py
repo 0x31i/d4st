@@ -168,9 +168,17 @@ def run_verb_tampering(session, base: str, urls: list[str], *,
                 continue
             protected = n.status_code in (401, 403)
 
-            # 1) verb-tampering auth bypass (SAFE — HEAD + GET-case only, unauthenticated)
+            # 1) verb-tampering auth bypass (SAFE — GET-case + HEAD only, unauthenticated).
+            # Try the GET-case variants FIRST: a bypass via "get"/"Get" returns the actual response
+            # BODY (a confirmed data leak, the strongest evidence), whereas HEAD only proves the
+            # authorization filter is method-specific (no body is returned). OPTIONS is intentionally
+            # NOT treated as a bypass here — an allowed CORS preflight is benign and would
+            # false-positive; advertised write methods are reported separately below.
             if protected:
-                for meth in _SAFE_METHODS + _CASE_VARIANTS:
+                best = None  # (label, rr, has_body, body_len) — prefer a body-returning bypass
+                for meth in _CASE_VARIANTS + _SAFE_METHODS:
+                    if meth == "OPTIONS":
+                        continue
                     try:
                         rr = c.request(meth.strip() or "GET", u, headers=noauth)
                         pace(throttle, delay, rr.status_code)
@@ -178,20 +186,38 @@ def run_verb_tampering(session, base: str, urls: list[str], *,
                         continue
                     # a protected GET (401/403) that answers <400 to a different method/case = bypass
                     if rr.status_code < 400 and rr.status_code != n.status_code:
-                        findings.append({
-                            "type": "verb-tampering-auth-bypass", "name": "verb-tampering-auth-bypass",
-                            "severity": "high", "url": u, "method": meth.strip() or "GET",
-                            "category": "broken-access-control", "verified": True,
-                            "detail": f"endpoint returns {n.status_code} to an unauthenticated GET but "
-                                      f"{rr.status_code} to an unauthenticated '{meth.strip() or 'GET'}' "
-                                      f"request — the authorization filter is method-specific and can be "
-                                      f"bypassed by altering the HTTP method/case.",
-                            "evidence_log": [
-                                exchange("Unauthenticated GET (correctly rejected)", n),
-                                exchange(f"Unauthenticated '{meth.strip() or 'GET'}' (BYPASS — accepted)", rr)],
-                            "repro": curl(rr),
-                        })
-                        break
+                        label = meth.strip() or "GET"
+                        body_len = 0 if label.upper() == "HEAD" else len(rr.content or b"")
+                        has_body = body_len > 32
+                        if has_body:
+                            best = (label, rr, True, body_len)
+                            break  # strongest evidence (data returned) — stop here
+                        if best is None:
+                            best = (label, rr, False, body_len)  # remember a no-body bypass (HEAD)
+                if best is not None:
+                    label, rr, has_body, body_len = best
+                    if has_body:
+                        sev = "high"
+                        detail = (f"endpoint returns {n.status_code} to an unauthenticated GET but "
+                                  f"{rr.status_code} with a {body_len}-byte body to an unauthenticated "
+                                  f"'{label}' request — the authorization filter is method/case-specific "
+                                  f"and LEAKS DATA when bypassed.")
+                    else:
+                        sev = "medium"
+                        detail = (f"endpoint returns {n.status_code} to an unauthenticated GET but "
+                                  f"{rr.status_code} to an unauthenticated '{label}' request (no response "
+                                  f"body) — the authorization filter is method-specific; the gate is "
+                                  f"bypassable though this verb returns no data.")
+                    findings.append({
+                        "type": "verb-tampering-auth-bypass", "name": "verb-tampering-auth-bypass",
+                        "severity": sev, "url": u, "method": label,
+                        "category": "broken-access-control", "verified": True,
+                        "detail": detail,
+                        "evidence_log": [
+                            exchange("Unauthenticated GET (correctly rejected)", n),
+                            exchange(f"Unauthenticated '{label}' (BYPASS — accepted)", rr)],
+                        "repro": curl(rr),
+                    })
 
             # 2) advertised-method enumeration (informational, safe)
             try:

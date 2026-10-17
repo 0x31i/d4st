@@ -681,9 +681,8 @@ p{margin:0 0 12px}
     radial-gradient(680px 420px at 82% 6%, #5b5bd63d, transparent 60%),
     radial-gradient(560px 380px at 8% 96%, #e5484d24, transparent 62%),
     linear-gradient(158deg,#111420 0%,#151a2b 46%,#10131f 100%)}
-.cover::before{content:"";position:absolute;inset:0;opacity:.5;pointer-events:none;
-  background-image:linear-gradient(rgba(255,255,255,.028) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.028) 1px,transparent 1px);
-  background-size:34px 34px;mask-image:radial-gradient(circle at 60% 34%,#000,transparent 78%)}
+.cover::before{content:"";position:absolute;left:0;top:0;bottom:0;width:6px;pointer-events:none;
+  background:linear-gradient(180deg,var(--accent),var(--accent2))}
 .cover>*{position:relative}
 .cover .brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:.30em;text-transform:uppercase;font-size:12px;color:#aab4d6}
 .cover .brand .logo{max-height:40px;max-width:160px}
