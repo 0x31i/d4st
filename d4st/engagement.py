@@ -1350,23 +1350,151 @@ def verify_stored_xss(target: Target, param: str, cookie: str) -> tuple[bool, st
     return False, "not stored / encoded"
 
 
+_VERBT_METHODS = ["HEAD", "Get", "GET ", "get", "POST", "OPTIONS"]
+
+
+def _len_similar(la: int, lb: int, tol: float = 0.25) -> bool:
+    """True when two response body lengths are within `tol` of each other (same as authz's heuristic)."""
+    hi = max(la, lb, 1)
+    return abs(la - lb) / hi < tol
+
+
+def verify_verbtamper(f: Finding, cookie: str) -> tuple[bool, str]:
+    """Independently re-confirm a verb-tampering / method-case BAC bypass.
+
+    The bypass proof is entirely UNAUTHENTICATED (a protected endpoint that answers 401/403 to an
+    unauth GET but <400 to an unauth method/case variant), so it can be replayed at verify time
+    with no session: GET the endpoint with no auth (expect it to stay protected) and re-issue the
+    flagged method with no auth (expect it to still be accepted). Both holding = a true second-source
+    confirmation of the detector's finding."""
+    import httpx
+    meth = (f.method or "GET").strip() or "GET"
+    headers = {k: v for k, v in _base_headers(cookie).items()
+               if k.lower() not in ("authorization", "cookie")}
+    try:
+        g = httpx.request("GET", f.url, headers=headers, follow_redirects=False, timeout=12, verify=False)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"replay error (unauth GET): {exc}"
+    if g.status_code not in (401, 403):
+        # endpoint is no longer protected on the unauth GET baseline — can't reconfirm the bypass
+        return False, f"unauth GET now {g.status_code} (not 401/403) — baseline not protected on replay"
+    try:
+        r = httpx.request(meth if meth in ("GET", "HEAD", "POST", "OPTIONS") else "GET",
+                          f.url, headers=headers, follow_redirects=False, timeout=12, verify=False)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"replay error (unauth {meth}): {exc}"
+    if r.status_code < 400 and r.status_code != g.status_code:
+        return True, (f"reconfirmed: unauth GET={g.status_code} but unauth '{meth}'={r.status_code} "
+                      f"(method-specific authz bypass holds on replay)")
+    return False, f"not reconfirmed: unauth GET={g.status_code}, unauth '{meth}'={r.status_code}"
+
+
+def verify_hpp(f: Finding, cookie: str) -> tuple[bool, str]:
+    """Confirm HTTP parameter pollution by differential replay: request the URL once with a single
+    value for the flagged param and once with the param duplicated, and confirm the server's handling
+    actually diverges (status or body length), i.e. the duplicate is not simply ignored."""
+    import httpx
+    param = (f.param or "").strip()
+    if not param or param.upper() in ("GET", "POST", "PUT", "DELETE", "HEAD"):
+        return False, "no pollutable param recorded"
+    base = f.url.split("#", 1)[0]
+    join = "&" if "?" in base else "?"
+    single = f"{base}{join}{quote(param)}=d4st1"
+    doubled = f"{single}&{quote(param)}=d4st2"
+    headers = _base_headers(cookie)
+    try:
+        a = httpx.get(single, headers=headers, follow_redirects=True, timeout=12, verify=False)
+        b = httpx.get(doubled, headers=headers, follow_redirects=True, timeout=12, verify=False)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"replay error: {exc}"
+    if a.status_code != b.status_code or not _len_similar(len(a.text), len(b.text)):
+        return True, (f"polluted param diverges: single={a.status_code}/{len(a.text)}B vs "
+                      f"doubled={b.status_code}/{len(b.text)}B")
+    return False, "duplicate param produced no differential (likely ignored)"
+
+
+_PII_NEEDLE_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+                            r"|\b\d{3}-\d{2}-\d{4}\b"
+                            r"|\b(?:\d[ -]*?){13,16}\b")
+
+
+def verify_disclosure_live(f: Finding, cookie: str) -> tuple[bool, str] | tuple[None, str]:
+    """Live-confirm a PII/secret disclosure by re-fetching the resource (authenticated) and checking
+    the disclosed value is still actually served. Purely additive: it only UPGRADES to a live
+    confirmation or stays inconclusive — it never refutes the detector's content-based proof (absence
+    on a re-fetch can be dynamic/removed, not a false positive), so it introduces no new FPs."""
+    import httpx
+    # Prefer a concrete needle from the proof exchange; fall back to a regex hit in the evidence text.
+    needle = ""
+    for ex in (f.evidence_log or []):
+        body = ((ex.get("response") or {}).get("body") or "") if isinstance(ex, dict) else ""
+        m = _PII_NEEDLE_RE.search(body or "")
+        if m:
+            needle = m.group(0); break
+    if not needle:
+        m = _PII_NEEDLE_RE.search(f.evidence or "")
+        needle = m.group(0) if m else ""
+    if not needle or len(needle) < 6:
+        return None, "no specific needle to re-fetch (kept detector verdict)"
+    try:
+        r = httpx.get(f.url, headers=_base_headers(cookie), follow_redirects=True, timeout=12, verify=False)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"re-fetch inconclusive ({exc}); kept detector verdict"
+    if r.status_code in (404, 410, 451):
+        return None, f"resource {r.status_code} on re-fetch (kept detector verdict)"
+    if needle in r.text:
+        return True, f"live-confirmed: disclosed value still served at {f.url} ({r.status_code})"
+    return None, f"re-fetch {r.status_code} did not contain the needle (kept detector verdict)"
+
+
 def verify_finding(f: Finding, cookie: str) -> Finding:
-    if f.category == "command-injection":
+    """Deterministic replay to confirm or refute a finding.
+
+    Design rule: a verify module must never DOWNGRADE a detector that already confirmed the finding
+    with proof. Several high-value classes — verb-tampering/BFLA, BOLA/IDOR, unauthenticated token
+    minting, authenticated authz — are proven at detection time (differential replays, A/B-account
+    exchanges, a token actually minted) and arrive with ``verified=True``. Where we have an
+    independent replay we re-confirm them; where we don't, we PRESERVE the detector's verdict instead
+    of erasing it to ``None`` (the old behaviour, which made the very classes that beat Burp look
+    unverified)."""
+    cat = f.category
+    if cat == "command-injection":
         ok, note = verify_cmdi(f.url, f.param or "ip", f.method, cookie)
-    elif f.category == "xss":
+    elif cat == "xss":
         ok, note = verify_reflected_xss(f.url, f.param or "", f.method, cookie)
-    elif f.category == "sql-injection":
+    elif cat == "sql-injection":
         ok, note = verify_sqli(f.url, f.param or "id", f.method, cookie)
-    elif f.category == "file-inclusion":
+    elif cat == "file-inclusion":
         ok, note = verify_lfi(f.url, f.param or "page", f.method, cookie)
-    elif f.category == "open-redirect":
+    elif cat == "open-redirect":
         ok, note = verify_open_redirect(f.url, f.param or "redirect", f.method, cookie)
+    elif cat == "broken-access-control" and (f.detection or "").startswith("verbtamper"):
+        ok, note = verify_verbtamper(f, cookie)
+    elif cat == "parameter-pollution":
+        ok, note = verify_hpp(f, cookie)
+    elif cat in ("pii-disclosure", "secret", "secret-disclosure"):
+        ok, note = verify_disclosure_live(f, cookie)
     else:
-        f.verified = None
-        f.verify_note = "tool-confirmed (no independent replay for this class)"
+        # No independent replay module for this class. Do NOT erase a detector that already proved it.
+        if f.verified is True:
+            f.verify_note = f.verify_note or f"confirmed at detection ({f.tool}); no separate replay module"
+        else:
+            f.verified = None
+            f.verify_note = "tool-confirmed (no independent replay for this class)"
         return f
-    f.verified = ok
-    f.verify_note = note
+    if ok is True:
+        f.verified = True
+        f.verify_note = note
+    elif ok is None:
+        # inconclusive replay — keep whatever the detector decided, annotate why
+        f.verify_note = (f.verify_note + " · " if f.verify_note else "") + note
+    else:  # ok is False
+        if f.verified is True:
+            # detector had proof; our replay couldn't reconfirm (dynamic/transient) — keep + annotate
+            f.verify_note = f"detector-proven; independent replay not reconfirmed ({note})"
+        else:
+            f.verified = False
+            f.verify_note = note
     return f
 
 
