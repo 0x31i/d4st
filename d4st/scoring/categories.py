@@ -25,12 +25,13 @@ XXE = "xxe"
 SSTI = "ssti"
 INFO_DISCLOSURE = "info-disclosure"
 MISCONFIGURATION = "misconfiguration"
+VULN_JS_DEPENDENCY = "vulnerable-js-dependency"
 OTHER = "other"
 
 CANONICAL = {
     SQL_INJECTION, XSS, COMMAND_INJECTION, FILE_INCLUSION, FILE_UPLOAD, CSRF,
     OPEN_REDIRECT, WEAK_SESSION, SSRF, XXE, XPATH, NOSQL, LDAP, HPP, SSTI,
-    INFO_DISCLOSURE, MISCONFIGURATION, OTHER,
+    INFO_DISCLOSURE, MISCONFIGURATION, VULN_JS_DEPENDENCY, OTHER,
 }
 
 # CWE id -> canonical category.
@@ -50,8 +51,13 @@ _CWE = {
     "90": LDAP,
     "235": HPP,
     "1336": SSTI, "94": SSTI,
-    "200": INFO_DISCLOSURE,
+    "200": INFO_DISCLOSURE, "209": INFO_DISCLOSURE, "548": INFO_DISCLOSURE, "315": INFO_DISCLOSURE,
     "16": MISCONFIGURATION, "693": MISCONFIGURATION,
+    # config/header/transport/cookie hygiene ZAP & co. commonly report (were falling to OTHER)
+    "345": MISCONFIGURATION, "346": MISCONFIGURATION, "319": MISCONFIGURATION,
+    "524": MISCONFIGURATION, "525": MISCONFIGURATION, "1021": MISCONFIGURATION,
+    "614": MISCONFIGURATION, "1004": MISCONFIGURATION, "1275": MISCONFIGURATION,
+    "1104": VULN_JS_DEPENDENCY, "937": VULN_JS_DEPENDENCY, "1395": VULN_JS_DEPENDENCY,
 }
 
 # keyword (regex) -> canonical category, checked against alert/template names + tags.
@@ -73,6 +79,22 @@ _KEYWORDS = [
     (r"ldap\s*inject", LDAP),
     (r"parameter\s*pollution|(?<![a-z])hpp(?![a-z])", HPP),
     (r"template\s*injection|(?<![a-z])ssti(?![a-z])", SSTI),
+    (r"vulnerable\s*(javascript|js)?\s*(library|dependenc|component)|retire\.?js|"
+     r"outdated\s*(javascript|js)?\s*(library|component)", VULN_JS_DEPENDENCY),
+    # information disclosure (error/debug leakage, sensitive-info exposure)
+    (r"error\s*disclosure|debug\s*error|application\s*error|stack\s*trace|"
+     r"information\s*disclosure|sensitive\s*info(rmation)?|info(rmation)?\s*leak|"
+     r"directory\s*(browsing|listing)|email\s*address(es)?\s*disclosed|"
+     r"private\s*ip\s*disclosure|source\s*code\s*disclosure", INFO_DISCLOSURE),
+    # config / header / transport / cookie hygiene (ZAP & Burp passive classes)
+    (r"header\s*(missing|not\s*set)|content[\s-]*type\s*(header\s*)?(missing|options)|"
+     r"strict[\s-]*transport[\s-]*security|(?<![a-z])hsts(?![a-z])|"
+     r"x[\s-]*frame[\s-]*options|x[\s-]*content[\s-]*type[\s-]*options|"
+     r"content\s*security\s*policy|(?<![a-z])csp(?![a-z])|cache[\s-]*control|cacheable|"
+     r"clickjack|frameable|anti[\s-]*clickjacking|"
+     r"cookie.*(httponly|secure|samesite|without)|(httponly|secure|samesite).*cookie|"
+     r"cross[\s-]*origin\s*resource\s*sharing|(?<![a-z])cors(?![a-z])|"
+     r"cross[\s-]*domain\s*(script\s*include|misconfiguration)", MISCONFIGURATION),
 ]
 
 
