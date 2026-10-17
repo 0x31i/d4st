@@ -132,6 +132,30 @@ def launch(workflow: str, target: str, session_path: str | None,
         except Exception as exc:  # noqa: BLE001 — discovery is best-effort, never fatal
             _log(f"authed JS-mine skipped: {exc}")
 
+    # OpenAPI/Swagger discovery: for an API-only app (Flutter/CanvasKit, headless API) the crawler
+    # reaches ~1 URL and JS-mining finds little — the spec IS the sitemap. Probe conventional spec
+    # paths and, if found, seed every documented endpoint so detectors cover the real API surface.
+    # This is the depth an `engagement` scan already gets; `launch` was missing it (why servicestage/
+    # lensstage stayed shallow). Best-effort, never fatal.
+    if session is not None and not dry_run:
+        try:
+            from .auth.session import Session
+            from .engagement import discover_api_surface, seed_targets_from_openapi
+            _s2 = Session.from_dict(session)
+            _ck = _s2.cookie_header(target)
+            _surface = discover_api_surface(target, seeds, _ck)
+            _schema = _surface.get("openapi_schema")
+            if _schema:
+                _tgts, _api_urls = seed_targets_from_openapi(_schema, _ck)
+                if _api_urls:
+                    _log(f"authed discovery: OpenAPI schema at {_schema} -> "
+                         f"{len(_api_urls)} documented endpoint(s)")
+                    seeds += _api_urls
+        except Exception as exc:  # noqa: BLE001 — discovery is best-effort, never fatal
+            _log(f"OpenAPI discovery skipped: {exc}")
+
+    seeds = list(dict.fromkeys(seeds))  # de-dup, preserve order
+
     runner = WorkflowRunner(
         spec, allow_active=allow_active, dry_run=dry_run, log=_log,
     )
