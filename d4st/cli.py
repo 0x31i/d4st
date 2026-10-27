@@ -1486,6 +1486,52 @@ def authz_diff_cmd(method: str, url: str, sessions: tuple, owner: str | None, bo
     console.print(table)
 
 
+# ---- screenshot capture (visual evidence) ----------------------------------------------------
+
+def _parse_cookies(pairs, url: str) -> list:
+    """Turn repeated --cookie name=value options into Playwright cookie dicts scoped to the URL host."""
+    from urllib.parse import urlsplit
+    host = urlsplit(url).hostname or ""
+    out: list = []
+    for raw in pairs or ():
+        name, _, value = str(raw).partition("=")
+        name = name.strip()
+        if not name:
+            continue
+        out.append({"name": name, "value": value, "domain": host, "path": "/"})
+    return out
+
+
+@main.command("shot")
+@click.option("--url", required=True, help="URL to render and capture.")
+@click.option("--out", "out_path", default=None, help="Where to write the PNG (default: a temp dir).")
+@click.option("--cookie", "cookies", multiple=True,
+              help="Cookie 'name=value' scoped to the URL host (repeatable) — for an authed render.")
+@click.option("--header", "-H", "headers", multiple=True,
+              help="Extra request header 'Key: value' (repeatable).")
+@click.option("--eval-js", default=None,
+              help="JS evaluated AFTER load, BEFORE capture (may have side effects — pass benign JS "
+                   "only for read-only evidence).")
+@click.option("--wait-selector", default=None, help="Wait for this CSS selector before capturing (best-effort).")
+@click.option("--full-page/--no-full-page", default=True, show_default=True,
+              help="Capture the full scrollable page.")
+@click.option("--element", "element_selector", default=None,
+              help="Screenshot only this CSS selector (overrides --full-page).")
+@click.option("--timeout", default=30.0, type=float, show_default=True, help="Per-operation timeout (seconds).")
+def shot_cmd(url: str, out_path: str | None, cookies: tuple, headers: tuple, eval_js: str | None,
+             wait_selector: str | None, full_page: bool, element_selector: str | None,
+             timeout: float) -> None:
+    """Capture a headless-Chrome screenshot of a rendered page as visual evidence (PNG + sha256)."""
+    from .shot import capture
+    try:
+        res = capture(url, out_path=out_path, cookies=_parse_cookies(cookies, url),
+                      headers=_parse_headers(headers), eval_js=eval_js, wait_selector=wait_selector,
+                      full_page=full_page, element_selector=element_selector, timeout=timeout)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc))
+    click.echo(json.dumps(res.__dict__, indent=2, default=str))
+
+
 # ---- intercepting proxy (Burp-Proxy) ---------------------------------------------------------
 
 @main.group("proxy")
