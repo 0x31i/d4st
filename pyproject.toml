@@ -30,6 +30,9 @@ dependencies = [
 
 [project.optional-dependencies]
 pii = ["presidio-analyzer>=2.2", "spacy>=3.7,<3.8"]
+# Intercepting-proxy feature (d4st proxy ...). mitmproxy needs Python >= 3.10, so it is an opt-in
+# extra rather than a core dep (d4st's core floor is 3.9): pip install 'd4st[proxy]'.
+proxy = ["mitmproxy>=10.0; python_version >= '3.10'"]
 dev = [
     "pytest>=7.0",
     "ruff>=0.1",

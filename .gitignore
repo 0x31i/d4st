@@ -25,3 +25,4 @@ vendor/
 # internal reports / client-laden artifacts (never public)
 progress/
 d4st/auth/profiles/*.client.yaml
+.venv-proxy/

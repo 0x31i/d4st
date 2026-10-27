@@ -1486,5 +1486,89 @@ def authz_diff_cmd(method: str, url: str, sessions: tuple, owner: str | None, bo
     console.print(table)
 
 
+# ---- intercepting proxy (Burp-Proxy) ---------------------------------------------------------
+
+@main.group("proxy")
+def proxy_grp() -> None:
+    """Intercepting proxy: capture / pause / modify / replay live HTTP(S) traffic.
+
+    Needs the proxy extra (Python >= 3.10): pip install 'd4st[proxy]'. Point a browser at the
+    listener and trust the mitmproxy CA once (`d4st proxy ca`) to see HTTPS.
+    """
+
+
+@proxy_grp.command("start")
+@click.option("--host", "listen_host", default="127.0.0.1", help="Listener bind host.")
+@click.option("--port", "listen_port", default=8080, type=int, help="Listener port.")
+@click.option("--scope", default=None,
+              help="Comma-separated in-scope hosts (bare domain also covers subdomains). "
+                   "Guards tool-initiated replay only; passive browser capture is observe-only.")
+@click.option("--intercept", "intercept_filter", default=None,
+              help="mitmproxy filter to pause matching flows on capture (e.g. '~m POST & ~d api.x').")
+@click.option("--save", "save_path", default=None,
+              help="Tee captured flows to a native .flows file (readable with `d4st proxy ls`).")
+def proxy_start(listen_host: str, listen_port: int, scope: str | None,
+                intercept_filter: str | None, save_path: str | None) -> None:
+    """Start the proxy and run until Ctrl-C (prints the CA path + macOS trust hint)."""
+    try:
+        from .proxy import BackgroundProxy, _MACOS_CA_HINT, ca_cert_path
+    except ImportError as exc:  # noqa: BLE001
+        raise click.ClickException(
+            f"the proxy feature needs mitmproxy (Python >= 3.10): pip install 'd4st[proxy]' ({exc})")
+    scope_hosts = [h.strip() for h in (scope or "").split(",") if h.strip()]
+    bp = BackgroundProxy(listen_host=listen_host, listen_port=listen_port,
+                         scope_hosts=scope_hosts, persist_path=save_path)
+    info = bp.start()
+    if intercept_filter:
+        bp.set_intercept(intercept_filter)
+    console.print(f"[green]proxy listening[/green] on http://{info['listen']}  "
+                  f"(scope={scope_hosts or 'unset'})")
+    console.print(f"[dim]CA cert:[/dim] {ca_cert_path()}")
+    console.print(f"[dim]{_MACOS_CA_HINT}[/dim]")
+    if save_path:
+        console.print(f"[dim]saving flows ->[/dim] {save_path}")
+    console.print("[dim]Ctrl-C to stop.[/dim]")
+    try:
+        import time as _t
+        while True:
+            _t.sleep(1)
+    except KeyboardInterrupt:
+        console.print("\nstopping…")
+    finally:
+        bp.stop()
+
+
+@proxy_grp.command("ca")
+@click.option("--export", "dest", default=None, help="Copy the CA cert to this path (else print it).")
+def proxy_ca(dest: str | None) -> None:
+    """Show or export the mitmproxy CA cert the browser must trust once."""
+    from .proxy import export_ca, _MACOS_CA_HINT
+    try:
+        path = export_ca(dest)
+    except FileNotFoundError as exc:
+        raise click.ClickException(str(exc))
+    console.print(path if dest else f"[dim]CA cert:[/dim] {path}")
+    console.print(f"[dim]{_MACOS_CA_HINT}[/dim]")
+
+
+@proxy_grp.command("ls")
+@click.argument("flows_file")
+def proxy_ls(flows_file: str) -> None:
+    """List captured flows from a saved .flows file (offline triage)."""
+    from mitmproxy.io import FlowReader
+    table = Table(title=flows_file)
+    table.add_column("method")
+    table.add_column("status", justify="right")
+    table.add_column("url")
+    with open(flows_file, "rb") as fh:
+        for flow in FlowReader(fh).stream():
+            req = getattr(flow, "request", None)
+            resp = getattr(flow, "response", None)
+            if req is None:
+                continue
+            table.add_row(req.method, str(getattr(resp, "status_code", "")), req.pretty_url)
+    console.print(table)
+
+
 if __name__ == "__main__":
     main()
