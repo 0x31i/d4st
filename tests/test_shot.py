@@ -175,3 +175,85 @@ def test_loopback_capture(tmp_path):
     # PNG magic bytes
     with open(res.path, "rb") as fh:
         assert fh.read(8) == b"\x89PNG\r\n\x1a\n"
+
+
+# --------------------------------------------------------------------------- per-request route guard
+
+def test_normalize_policy_raise_via_policy_allows():
+    """A raise-style hook is a DENY (fail-closed): _policy_allows converts the exception to
+    (False, reason) instead of letting it crash the capture."""
+    def _raises(method, url):
+        raise RuntimeError("out of scope")
+
+    ok, reason = S._policy_allows(_raises, "GET", "http://x/y")
+    assert ok is False and "out of scope" in reason
+    # a clean hook still normalizes the same as the bare top-level check
+    assert S._policy_allows(lambda m, u: True, "GET", "http://x/y")[0] is True
+    assert S._policy_allows(lambda m, u: (False, "nope"), "GET", "http://x/y") == (False, "nope")
+
+
+def test_policy_that_raises_denies_top_level(monkeypatch):
+    """A top-level navigation whose policy RAISES must be refused with PermissionError (fail-closed)
+    BEFORE Playwright is imported — not propagate the raw exception."""
+    def _boom():
+        raise AssertionError("playwright import reached despite a raising policy")
+
+    monkeypatch.setattr(S, "_require_playwright", _boom)
+
+    def _raises(method, url):
+        raise RuntimeError("blocked by raising hook")
+
+    with pytest.raises(PermissionError) as exc:
+        S.capture("http://127.0.0.1:1/x", policy=_raises)
+    assert "blocked by raising hook" in str(exc.value)
+
+
+@requires_playwright
+def test_route_policy_aborts_eval_js_delete(tmp_path):
+    """C1: a page whose JS fires fetch('/danger', {method:'DELETE'}) must have that DELETE aborted
+    by the per-request route-guard (a policy that denies DELETE), while the GET navigation still
+    renders. The DELETE must NEVER reach the local server."""
+    seen: list = []
+    html = (b"<!doctype html><html><head><title>C1 OK</title></head><body>"
+            b"<h1>route-guard-proof</h1>"
+            b"<script>fetch('/danger',{method:'DELETE'}).catch(function(){});</script>"
+            b"</body></html>")
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            seen.append(("GET", self.path))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+
+        def do_DELETE(self):  # noqa: N802
+            seen.append(("DELETE", self.path))
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *a):  # silence
+            pass
+
+    def _policy(method, url):
+        return method != "DELETE"  # allow the GET nav + resources, deny any DELETE
+
+    with socketserver.TCPServer(("127.0.0.1", 0), _Handler) as srv:
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            out = str(tmp_path / "c1.png")
+            # wait_ms gives the aborted fetch time to be attempted (and rejected) before we shoot.
+            res = S.capture(f"http://127.0.0.1:{port}/", out_path=out, policy=_policy,
+                            wait_ms=700, timeout=15.0)
+        finally:
+            srv.shutdown()
+
+    # GET navigation succeeded and rendered.
+    assert os.path.exists(res.path) and os.path.getsize(res.path) > 0
+    assert res.title == "C1 OK"
+    assert ("GET", "/") in seen
+    # The DELETE was aborted at the route layer — it never reached the server.
+    assert all(method != "DELETE" for method, _ in seen), seen

@@ -14,9 +14,16 @@ so a blocked URL never renders.
 
 Read-only posture: the top-level navigation is a GET. `eval_js`, however, is operator-supplied and
 CAN cause side effects — it runs real JavaScript in the page and may trigger state-changing
-requests (clicking, submitting, fetch()). This module deliberately does NOT police `eval_js`: a
-caller that wants strictly read-only evidence must pass benign JS only (e.g. reveal/scroll/read
-DOM), and the pluggable `policy` hook is where an embedding driver enforces that decision.
+requests (clicking, submitting, fetch()). To keep the `policy` hook honest, when a policy IS
+provided it is enforced per-request, not just on the top-level URL: a route interceptor consults
+`policy(method, url)` for EVERY request the page makes — the navigation itself AND every
+sub-request a script issues (fetch/XHR, form posts), including anything `eval_js` triggers — and
+aborts any request the policy denies before it leaves the browser. So `eval_js` can no longer
+launder a same-origin mutation/DELETE past the hook, and off-scope sub-resources are blocked too.
+A policy that RAISES is treated as a denial (fail-closed). With no policy there is no interception
+(unchanged behavior): a caller that wants strictly read-only evidence then must pass benign JS only
+(reveal/scroll/read-DOM), and the pluggable `policy` hook is where an embedding driver pins scope /
+egress / ROE for both the navigation and every sub-request.
 
 Playwright is imported lazily inside `capture()` so `import d4st.shot` never fails on a host
 without the browser engine; a clear RuntimeError with an install hint is raised if it is missing
@@ -70,6 +77,21 @@ def _normalize_policy(result: PolicyResult) -> "tuple[bool, str]":
         return ok, reason
     ok = bool(result)
     return ok, ("allowed" if ok else "blocked by policy")
+
+
+def _policy_allows(policy: Policy, method: str, url: str) -> "tuple[bool, str]":
+    """Call a policy hook and return (ok, reason), treating a RAISE as DENY (fail-closed).
+
+    A policy may signal deny two ways: by RETURNING a falsy bool / (False, reason) tuple, OR by
+    RAISING (some embedding hooks are raise-style). Either way the request is denied — the
+    top-level gate and the per-request route interceptor both fail closed if the hook throws, so a
+    caller whose policy raises on a blocked URL can never accidentally let it through. A clean
+    return is normalized exactly as the bare top-level check does."""
+    try:
+        result = policy(method, url)
+    except Exception as exc:  # noqa: BLE001 — a throwing policy denies; it must never crash capture
+        return False, (str(exc).strip() or "blocked by policy (hook raised)")
+    return _normalize_policy(result)
 
 
 def _build_result(png_bytes: bytes, *, path: str, requested_url: str, final_url: str, title: str,
@@ -146,13 +168,18 @@ def capture(
     AFTER load and BEFORE the shot — use it to reveal or trigger the state you want to prove.
 
     WARNING: `eval_js` is operator-supplied JavaScript and MAY cause side effects / state-changing
-    requests (it can click, submit, or fetch()). This primitive does not police it. For strictly
-    read-only visual evidence, pass only benign JS (reveal/scroll/read-DOM); the `policy` hook is
-    where an embedding driver enforces scope / egress / ROE.
+    requests (it can click, submit, or fetch()). When a `policy` is provided it is enforced
+    per-request (see below), so an `eval_js`-issued mutation/DELETE is still subject to the hook and
+    aborted if denied. With NO policy there is no interception: for strictly read-only visual
+    evidence then pass only benign JS (reveal/scroll/read-DOM).
 
     Policy ordering (a security property): if `policy` is provided it is called as policy("GET",
-    url) FIRST, before Playwright is imported or the browser launched. A denial raises
-    PermissionError and nothing on the network is touched.
+    url) FIRST, before Playwright is imported or the browser launched. A denial (a falsy return, an
+    (False, reason) tuple, OR a raised exception) raises PermissionError and nothing on the network
+    is touched. Then, once the browser is up, a route interceptor re-consults policy(method, url)
+    for EVERY request — the navigation and every sub-request (fetch/XHR/form, including those
+    `eval_js` triggers) — and aborts any the policy denies, so the hook enforces per-request, not
+    just on the top-level URL. A policy that raises is treated as DENY (fail-closed).
 
     `wait_selector` is best-effort: if it times out the page is still captured and `error` is set,
     so a flaky/500-prone bench target almost never hard-fails a capture.
@@ -179,9 +206,10 @@ def capture(
         RuntimeError: Playwright/Chromium is not installed.
     """
     # 1. Policy gate FIRST — before the lazy import, before any network. This ordering is the
-    #    security property the private driver pins egress/scope through; keep it first.
+    #    security property the private driver pins egress/scope through; keep it first. A policy
+    #    that raises is treated as a denial (fail-closed) so a raise-style hook can't slip through.
     if policy is not None:
-        ok, reason = _normalize_policy(policy("GET", url))
+        ok, reason = _policy_allows(policy, "GET", url)
         if not ok:
             raise PermissionError(reason)
 
@@ -210,6 +238,26 @@ def capture(
                 # Cookie dicts are already Playwright-shaped; inject before navigation so the
                 # authenticated render is served.
                 context.add_cookies(cookies)
+
+            # Per-request policy enforcement: when a policy hook is provided, consult it for EVERY
+            # request the page makes — the top-level navigation AND every sub-request a script
+            # issues (fetch/XHR/form, including anything `eval_js` triggers). A denied request is
+            # aborted before it leaves the browser, so `eval_js` cannot launder a same-origin
+            # mutation/DELETE past the hook, and off-scope sub-resources are blocked too. A policy
+            # that RAISES is treated as DENY (fail-closed, via _policy_allows). No policy => no
+            # interception (identical to the prior behavior).
+            if policy is not None:
+                def _on_route(route) -> None:
+                    req = route.request
+                    ok, _reason = _policy_allows(policy, req.method, req.url)
+                    try:
+                        if ok:
+                            route.continue_()
+                        else:
+                            route.abort()
+                    except Exception:  # noqa: BLE001 — request may already be handled/closed
+                        pass
+                context.route("**/*", _on_route)
 
             page = context.new_page()
             page.set_default_timeout(timeout_ms)
