@@ -1319,5 +1319,172 @@ def serve(host: str, port: int, db_path_opt: str | None) -> None:
     run_server(host=host, port=port, db_path=db_path_opt)
 
 
+# ---- interactive primitives (Repeater / Intruder / authz diff) -------------------------------
+
+def _parse_headers(pairs) -> dict:
+    """Turn repeated 'Key: value' CLI options into a header dict."""
+    out: dict = {}
+    for raw in pairs or ():
+        k, _, v = str(raw).partition(":")
+        if k.strip():
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _read_body(arg) -> str:
+    """A --body option value: literal text, or @path to read the body from a file."""
+    if not arg:
+        return ""
+    if str(arg).startswith("@"):
+        with open(str(arg)[1:], "r", encoding="utf-8") as fh:
+            return fh.read()
+    return str(arg)
+
+
+def _load_session(path):
+    from .auth.session import Session
+    return Session.load(path) if path else None
+
+
+@main.command("replay")
+@click.argument("method")
+@click.argument("url")
+@click.option("--header", "-H", "headers", multiple=True, help="Request header 'Key: value' (repeatable).")
+@click.option("--body", default=None, help="Request body text, or @file to read it from a file.")
+@click.option("--session", "-s", "session_path", default=None, help="Captured session JSON for auth.")
+@click.option("--cookie", default="", help="Raw Cookie header value (alternative to --session).")
+@click.option("--follow", is_flag=True, default=False, help="Follow redirects.")
+@click.option("--allow-state-changing", is_flag=True, default=False,
+              help="Authorize a write verb / destructive or auth path (default: read-only only).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the evidence JSON.")
+def replay_cmd(method: str, url: str, headers: tuple, body: str | None, session_path: str | None,
+               cookie: str, follow: bool, allow_state_changing: bool, as_json: bool) -> None:
+    """Send ONE request (Repeater) and print the raw request/response + evidence."""
+    from .replay import replay
+    try:
+        res = replay(method, url, headers=_parse_headers(headers), body=_read_body(body),
+                     session=_load_session(session_path), cookie=cookie, follow_redirects=follow,
+                     allow_state_changing=allow_state_changing)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+    if as_json:
+        click.echo(json.dumps(res, indent=2, default=str))
+        return
+    console.print(f"[bold]{res['status']}[/bold]  {res['size']} bytes  {res['elapsed_ms']} ms")
+    console.print("[dim]--- request ---[/dim]")
+    console.print(res["raw_request"])
+    console.print("[dim]--- response ---[/dim]")
+    console.print(res["raw_response"][:4000])
+    console.print(f"[dim]repro:[/dim] {res['repro']}")
+
+
+def _parse_positions(specs) -> dict:
+    """--pos name=@wordlist (one payload per line) or --pos name=v1,v2,v3 -> {name: [payloads]}."""
+    out: dict = {}
+    for raw in specs or ():
+        name, _, val = str(raw).partition("=")
+        name = name.strip()
+        if not name:
+            continue
+        if val.startswith("@"):
+            with open(val[1:], "r", encoding="utf-8") as fh:
+                out[name] = [ln.rstrip("\n") for ln in fh if ln.strip()]
+        else:
+            out[name] = [v for v in val.split(",") if v != ""]
+    return out
+
+
+@main.command("sweep")
+@click.argument("method")
+@click.argument("url_template")
+@click.option("--pos", "positions", multiple=True, required=True,
+              help="Position payloads: name=@wordlist or name=v1,v2 (repeatable). §name§ marks it "
+                   "in the URL/body template.")
+@click.option("--mode", default="sniper",
+              type=click.Choice(["sniper", "pitchfork", "cluster-bomb"]))
+@click.option("--body-template", default=None, help="Body template with §name§ markers, or @file.")
+@click.option("--session", "-s", "session_path", default=None, help="Captured session JSON for auth.")
+@click.option("--cookie", default="", help="Raw Cookie header value.")
+@click.option("--max-requests", default=500, type=int, help="Cap on requests sent.")
+@click.option("--allow-state-changing", is_flag=True, default=False,
+              help="Authorize a write verb / destructive or auth path (default: read-only only).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the full JSON result.")
+def sweep_cmd(method: str, url_template: str, positions: tuple, mode: str,
+              body_template: str | None, session_path: str | None, cookie: str,
+              max_requests: int, allow_state_changing: bool, as_json: bool) -> None:
+    """Run an Intruder-style §position§ x payload sweep and print status/length outliers."""
+    from .sweep import sweep
+    try:
+        res = sweep(method, url_template, _parse_positions(positions), mode=mode,
+                    body_template=_read_body(body_template), session=_load_session(session_path),
+                    cookie=cookie, max_requests=max_requests,
+                    allow_state_changing=allow_state_changing)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+    if as_json:
+        click.echo(json.dumps(res, indent=2, default=str))
+        return
+    console.print(f"[bold]{res['mode']}[/bold]  sent {res['sent']}/{res['total']}  "
+                  f"modal status {res['modal_status']}  notable {len(res['notable'])}")
+    table = Table(title="notable (status/length outliers)")
+    table.add_column("payloads")
+    table.add_column("status", justify="right")
+    table.add_column("size", justify="right")
+    table.add_column("ms", justify="right")
+    for row in res["notable"][:50]:
+        table.add_row(str(row.get("payloads")), str(row.get("status")),
+                      str(row.get("size")), str(row.get("elapsed_ms")))
+    console.print(table)
+
+
+@main.command("authz-diff")
+@click.argument("method")
+@click.argument("url")
+@click.option("--session", "sessions", multiple=True, required=True,
+              help="Identity name=PATH (repeatable). The first is the owner unless --owner is set.")
+@click.option("--owner", default=None, help="Which identity owns the resource (the baseline).")
+@click.option("--body", default=None, help="Request body text, or @file.")
+@click.option("--base", default="", help="Base URL for cookie scoping (defaults to the request URL).")
+@click.option("--allow-state-changing", is_flag=True, default=False,
+              help="Authorize a write verb / destructive or auth path (default: read-only only).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the full JSON result.")
+def authz_diff_cmd(method: str, url: str, sessions: tuple, owner: str | None, body: str | None,
+                   base: str, allow_state_changing: bool, as_json: bool) -> None:
+    """Replay ONE request across N identities and print whether access is enforced or bypassed."""
+    from .auth.authz import diff_identities
+    ident: dict = {}
+    first = None
+    for spec in sessions:
+        name, _, path = str(spec).partition("=")
+        name = name.strip()
+        if not name or not path:
+            raise click.ClickException(f"--session must be name=PATH (got {spec!r})")
+        ident[name] = _load_session(path)
+        first = first or name
+    try:
+        res = diff_identities(method, url, ident, body=_read_body(body),
+                              owner=owner or first, base=base,
+                              allow_state_changing=allow_state_changing)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+    if as_json:
+        click.echo(json.dumps(res, indent=2, default=str))
+        return
+    verdict = res["verdict"]
+    color = {"bypassed": "red", "mixed": "yellow", "enforced": "green"}.get(verdict, "white")
+    console.print(f"verdict: [{color}]{verdict}[/{color}]  (owner={res['owner']})")
+    table = Table(title=f"{res['method']} {res['url']}")
+    table.add_column("identity")
+    table.add_column("status", justify="right")
+    table.add_column("size", justify="right")
+    table.add_column("allowed")
+    table.add_column("matches owner")
+    table.add_column("sensitivity", justify="right")
+    for p in res["per_identity"]:
+        table.add_row(str(p["name"]), str(p["status"]), str(p["size"]),
+                      str(p["allowed"]), str(p["matches_owner"]), str(p["sensitivity"]))
+    console.print(table)
+
+
 if __name__ == "__main__":
     main()
