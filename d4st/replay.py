@@ -14,7 +14,8 @@ knowing anything about it.
 from __future__ import annotations
 
 from .evidence import curl, exchange, raw_request, raw_response
-from .safety import browser_headers, is_auth_endpoint, is_state_changing
+from .safety import (browser_headers, is_auth_endpoint, is_session_destroying_endpoint,
+                     is_state_changing)
 
 _READ_ONLY_VERBS = {"GET", "HEAD", "OPTIONS"}
 
@@ -49,6 +50,8 @@ def replay(method: str, url: str, *, headers: dict | None = None, body: str | by
     - `method` and `body` are honored for ALL verbs (GET/POST/PUT/PATCH/DELETE/...).
     - Read-only by default: a write verb, or a destructive/auth path (safety.is_state_changing /
       safety.is_auth_endpoint), raises ValueError unless allow_state_changing=True.
+    - A DELETE verb or a session-destroying endpoint is HARD-REFUSED even with
+      allow_state_changing=True (a primitive never auto-fires a deletion / logout).
     - `policy` (optional) is a pluggable pre-request hook called as policy(method, url) BEFORE the
       request is sent; raising from it aborts the replay. d4st attaches no meaning to it — an
       outside driver uses it to add its own checks.
@@ -61,6 +64,13 @@ def replay(method: str, url: str, *, headers: dict | None = None, body: str | by
     m = (method or "GET").upper()
     if policy is not None:
         policy(m, url)
+    # HARD RULE (mirrors engagement.capture_full_evidence): a DELETE verb or a session-destroying
+    # (logout) endpoint is NEVER auto-fired by a primitive, even with allow_state_changing=True.
+    # Deletion / session teardown stays a deliberate manual action elsewhere.
+    if m == "DELETE" or is_session_destroying_endpoint(url):
+        raise ValueError(
+            f"{m} {url} is refused outright: DELETE / session-destroying requests are never "
+            "auto-fired by a primitive; allow_state_changing cannot authorize it")
     if not allow_state_changing and (m not in _READ_ONLY_VERBS
                                      or is_state_changing(url) or is_auth_endpoint(url)):
         raise ValueError(

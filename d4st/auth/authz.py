@@ -202,10 +202,14 @@ def diff_identities(method: str, url: str, sessions: dict, *, body: str = "",
     a non-owner 401/403 (or a non-matching body) = enforced.
 
     Read-only by default: a write verb or a destructive/auth path raises ValueError unless
-    allow_state_changing=True. `policy(method, url)` runs before each identity's request.
+    allow_state_changing=True. `policy(method, url)` runs before each identity's request; a policy
+    raise ABORTS that one identity distinctly — it is recorded blocked (blocked=True, status=None),
+    NOT as a network error (blocked=False, error=<str>) — so a deliberate block is never confused
+    with a request failure.
 
     Returns: {url, method, owner, verdict: 'enforced'|'bypassed'|'mixed'|'n/a',
-              per_identity:[{name, status, size, allowed, matches_owner, sensitivity}],
+              per_identity:[{name, status, size, allowed, matches_owner, sensitivity,
+                             blocked, error}],
               evidence_log:[exchange per identity]}."""
     import httpx
 
@@ -229,12 +233,26 @@ def diff_identities(method: str, url: str, sessions: dict, *, body: str = "",
     owner_body: str | None = None
     with httpx.Client(verify=verify, follow_redirects=False, timeout=timeout) as c:
         for name in order:
+            # A policy raise is a DELIBERATE block of this identity's probe — it must abort this
+            # identity distinctly (recorded blocked/skipped), not be swallowed by the broad except
+            # below that only means "the request failed on the network". Evaluate policy here and
+            # pass policy=None into replay_once so it is not run (and caught) twice.
+            if policy is not None:
+                try:
+                    policy(m, url)
+                except Exception as exc:  # noqa: BLE001
+                    per_identity.append({"name": name, "status": None, "size": 0,
+                                         "allowed": False, "matches_owner": False,
+                                         "sensitivity": 0, "blocked": True, "error": None,
+                                         "note": f"policy blocked: {exc}"})
+                    continue
             try:
                 r = replay_once(sessions[name], m, url, body=body, base=base,
-                                policy=policy, client=c)
-            except Exception:  # noqa: BLE001
+                                policy=None, client=c)
+            except Exception as exc:  # noqa: BLE001
                 per_identity.append({"name": name, "status": None, "size": 0, "allowed": False,
-                                     "matches_owner": False, "sensitivity": 0})
+                                     "matches_owner": False, "sensitivity": 0,
+                                     "blocked": False, "error": str(exc)})
                 continue
             pace(throttle, delay, r.status_code)
             txt = r.text or ""
@@ -246,7 +264,7 @@ def diff_identities(method: str, url: str, sessions: dict, *, body: str = "",
             per_identity.append({"name": name, "status": r.status_code,
                                  "size": len(r.content or b""), "allowed": allowed,
                                  "matches_owner": matches, "sensitivity": rank,
-                                 "sensitivity_label": label})
+                                 "sensitivity_label": label, "blocked": False, "error": None})
             evidence_log.append(_exchange(
                 f"identity {name!r}" + (" — owner (baseline)" if name == owner else " — PROOF"), r))
 

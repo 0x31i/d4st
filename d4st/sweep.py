@@ -16,7 +16,8 @@ import re
 from itertools import product
 
 from .evidence import exchange
-from .safety import AdaptiveThrottle, browser_headers, is_auth_endpoint, is_state_changing
+from .safety import (AdaptiveThrottle, browser_headers, is_auth_endpoint,
+                     is_session_destroying_endpoint, is_state_changing)
 
 _READ_ONLY_VERBS = {"GET", "HEAD", "OPTIONS"}
 _POS = re.compile(r"§([A-Za-z0-9_.\-]+)§")
@@ -82,8 +83,10 @@ def sweep(method: str, url_template: str, positions: dict, *,
            'cluster-bomb' (cartesian product, capped at max_requests).
 
     Throttled with safety.AdaptiveThrottle(base_delay) (backs off on 429/503). Read-only by default
-    (write verb or destructive/auth path refused unless allow_state_changing=True). `policy`, if
-    given, is called policy(method, url) before each request; raising aborts that request.
+    (write verb or destructive/auth path refused unless allow_state_changing=True). A DELETE verb or
+    a session-destroying endpoint is HARD-REFUSED even with allow_state_changing=True (a sweep never
+    auto-fires a deletion / logout). `policy`, if given, is called policy(method, url) before each
+    request; raising aborts that request.
 
     Returns: {ok, mode, total, sent, results:[{payloads, status, size, elapsed_ms, anomalous}],
               notable:[...]} — `anomalous` marks status/length outliers vs the modal response; full
@@ -92,6 +95,12 @@ def sweep(method: str, url_template: str, positions: dict, *,
     import httpx
 
     m = (method or "GET").upper()
+    # HARD RULE (mirrors engagement.capture_full_evidence): a sweep fires N requests, so a DELETE
+    # verb is NEVER auto-fired even with allow_state_changing=True. Deletion stays manual elsewhere.
+    if m == "DELETE":
+        raise ValueError(
+            f"{m} sweep is refused outright: DELETE is never auto-fired by a primitive "
+            "(a sweep fires many requests); allow_state_changing cannot authorize it")
     if not allow_state_changing and (m not in _READ_ONLY_VERBS):
         raise ValueError(f"{m} sweep is not read-only; pass allow_state_changing=True to authorize it")
 
@@ -106,6 +115,10 @@ def sweep(method: str, url_template: str, positions: dict, *,
         for combo in combos:
             url = _substitute(url_template, combo)
             body = _substitute(body_template, combo) if body_template else ""
+            # A session-destroying (logout) endpoint is HARD-REFUSED even on opt-in.
+            if is_session_destroying_endpoint(url):
+                raise ValueError(
+                    f"{url} is a session-destroying endpoint; a primitive never auto-fires it")
             if not allow_state_changing and (is_state_changing(url) or is_auth_endpoint(url)):
                 raise ValueError(
                     f"{url} is a destructive/auth path; pass allow_state_changing=True to authorize it")
