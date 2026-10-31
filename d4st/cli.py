@@ -661,8 +661,16 @@ def _normalize_target(raw: str) -> str:
               help="Findings JSON path. Default: ./d4st-unauth-<host>.json")
 @click.option("--report/--no-report", "want_report", default=True, show_default=True,
               help="Also write a client-grade HTML report next to the JSON.")
+@click.option("--enumerate", "-e", "do_enumerate", is_flag=True, default=False,
+              help="Discover subdomains FIRST (crt.sh + subfinder), widen scope to every LIVE "
+                   "in-scope host, and sweep each one. Dead/NXDOMAIN hosts are never scanned.")
+@click.option("--deep", "-D", "deep_enum", is_flag=True, default=False,
+              help="With --enumerate: also use amass passive (if installed) for deeper discovery.")
+@click.option("--resolver", "resolvers", multiple=True,
+              help="Custom DNS resolver for --enumerate (repeatable; needs dnspython). "
+                   "Default 1.1.1.1, 8.8.8.8.")
 def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | None,
-           want_report: bool) -> None:
+           want_report: bool, do_enumerate: bool, deep_enum: bool, resolvers: tuple) -> None:
     """Deep UNAUTHENTICATED scan of a domain — the external-attacker viewpoint, authorized targets only.
 
     One command, no login, no config: crawl + content discovery + JS route mining + historical URLs,
@@ -683,6 +691,38 @@ def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | No
 
     base = _normalize_target(target)
     host = urlsplit(base).hostname or ""
+
+    # --enumerate: discover live subdomains FIRST, widen scope to the union, and fan the sweep
+    # out across every LIVE in-scope host. Dead/NXDOMAIN/wildcard-only hosts are never seeded —
+    # seeding ghost hosts is the exact failure that poisons a frontier with false targets.
+    scan_bases = [base]
+    disco = None
+    if do_enumerate:
+        from .art import phase as _phase
+        _phase("DISCOVERY", f"enumerating subdomains of {host}", "discover")
+        from .discovery import discover_subdomains
+        disco = discover_subdomains(host, deep=deep_enum,
+                                    resolvers=list(resolvers) or None)
+        _print_discovery_table(disco)
+        # widen scope so cross-links between discovered in-scope hosts aren't dropped at the frontier
+        scope_list = disco.to_scope_list()
+        os.environ["D4ST_SCOPE_HOSTS"] = scope_list
+        console.print(f"[green]scope widened[/green] -> {scope_list}")
+        # one base URL per LIVE in-scope host; always include the operator's original target host
+        live = disco.live_in_scope()
+        roots = {base}
+        for h in live:
+            rec = disco.records.get(h)
+            scheme = "https"
+            if rec and rec.probes:
+                live_p = [p for p in rec.probes if p.get("classification") == "LIVE"]
+                if live_p:
+                    scheme = live_p[0]["scheme"]
+            roots.add(f"{scheme}://{h}")
+        scan_bases = sorted(roots)
+        console.print(f"[bold]fan-out:[/bold] {len(scan_bases)} live host(s) to sweep: "
+                      f"{', '.join(scan_bases)}")
+
     # Keep the unauth sweep bounded so it always completes in a predictable window (the deep
     # engagement's default nuclei budget is an hour — too long for a one-command scan). Operators
     # can still override D4ST_NUCLEI_TIMEOUT. --fast additionally trims the heavy CVE/takeover
@@ -713,11 +753,34 @@ def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | No
                   "CORS / host-header / verb-tampering run unauthenticated[/dim]")
 
     from .art import phase
-    phase("CRAWLER", f"mapping {host or base} · depth {depth}", "crawl")
 
-    # unauth: empty cookie, no session, but run the unauth-safe depth suite
-    result = run_engagement(base, "", host, depth=depth, profile=profile,
-                            auth_headers={}, session=None, unauth_deep=True)
+    # Fan-out choice: LOOP run_engagement per live host and merge findings (rather than widening
+    # scope + seeding one crawl). run_engagement has no frontier-seed hook and crawls from a single
+    # base, so a per-host loop is the clean fit — each host gets a full roster pass and its own
+    # fingerprint-driven crawl strategy, and the scope env (widened above) keeps cross-host links
+    # in-scope. Dead hosts are already excluded from scan_bases, so none can be seeded.
+    def _scan_one(one_base: str) -> dict:
+        one_host = urlsplit(one_base).hostname or ""
+        phase("CRAWLER", f"mapping {one_host or one_base} · depth {depth}", "crawl")
+        # unauth: empty cookie, no session, but run the unauth-safe depth suite
+        return run_engagement(one_base, "", one_host, depth=depth, profile=profile,
+                              auth_headers={}, session=None, unauth_deep=True)
+
+    if len(scan_bases) == 1:
+        result = _scan_one(scan_bases[0])
+    else:
+        result = None
+        for i, one_base in enumerate(scan_bases, 1):
+            console.print(f"[bold cyan]── host {i}/{len(scan_bases)}:[/bold cyan] {one_base}")
+            r = _scan_one(one_base)
+            if result is None:
+                result = r
+            else:
+                result["urls"] = sorted(set(result.get("urls", [])) | set(r.get("urls", [])))
+                result["targets"] = result.get("targets", 0) + r.get("targets", 0)
+                result["findings"] = result.get("findings", []) + r.get("findings", [])
+        result = result or {"urls": [], "targets": 0, "findings": []}
+        result["discovery"] = disco.to_dict() if disco else None
 
     console.print(f"crawled {len(result['urls'])} urls · {result['targets']} injection targets")
     table = Table(title=f"unauth scan · {base}")
@@ -757,6 +820,73 @@ def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | No
                           f"({summ['findings']} findings)[/dim]")
         except Exception as e:  # noqa: BLE001
             console.print(f"[yellow]store ingest skipped[/yellow]: {e}")
+
+
+def _print_discovery_table(disco) -> None:
+    """Render a discovery result as a rich table (host | IPs | server | status | classification)."""
+    table = Table(title=f"subdomain discovery · {disco.domain}")
+    table.add_column("host")
+    table.add_column("IPs")
+    table.add_column("server")
+    table.add_column("status", justify="right")
+    table.add_column("classification")
+    _CLASS_STYLE = {"LIVE": "green", "REDIRECT-OFFSITE": "yellow",
+                    "RESOLVES-DEAD": "dim", "NXDOMAIN": "red"}
+    # resolved/interesting hosts first, then the rest; dead/NXDOMAIN at the bottom
+    _order = {"LIVE": 0, "REDIRECT-OFFSITE": 1, "RESOLVES-DEAD": 2, "NXDOMAIN": 3}
+    for name in sorted(disco.records,
+                       key=lambda n: (_order.get(disco.records[n].classification, 9), n)):
+        rec = disco.records[name]
+        # best probe (prefer the LIVE one) for server/status display
+        probe = None
+        for p in rec.probes:
+            if p.get("classification") == "LIVE":
+                probe = p
+                break
+        probe = probe or (rec.probes[0] if rec.probes else None)
+        server = (probe or {}).get("server") or ""
+        status = str((probe or {}).get("status") or "")
+        cls = rec.classification
+        style = _CLASS_STYLE.get(cls, "white")
+        table.add_row(name, (", ".join(rec.ips) or (rec.cname or ""))[:40],
+                      (server or "")[:28], status, f"[{style}]{cls}[/{style}]")
+    console.print(table)
+    console.print(f"[dim]{disco.summary()}[/dim]")
+
+
+@main.command()
+@click.argument("domain")
+@click.option("--deep", "-D", "deep", is_flag=True, default=False,
+              help="Also use amass passive (if installed) for deeper enumeration.")
+@click.option("--resolver", "resolvers", multiple=True,
+              help="Custom DNS resolver (repeatable; needs dnspython). Default 1.1.1.1, 8.8.8.8.")
+@click.option("--json", "json_path", default=None,
+              help="Write the full DiscoveryResult JSON to this path.")
+@click.option("--probe/--no-probe", "probe", default=True, show_default=True,
+              help="Liveness-probe each resolved host (HEAD/GET, no attack traffic).")
+def discover(domain: str, deep: bool, resolvers: tuple, json_path: str | None, probe: bool) -> None:
+    """Passively enumerate subdomains of a DOMAIN, resolve + wildcard-filter them, and probe
+    each for liveness — the recon front-end that feeds d4st's scope model.
+
+    Sources: crt.sh (always), subfinder and amass (if installed). No AI, no attack traffic — pure
+    discovery. Feed the result into a scan with `d4st unauth <domain> --enumerate`.
+
+        d4st discover example.com
+        d4st discover example.com --deep --json out.json
+    """
+    from .art import phase
+    phase("DISCOVERY", f"enumerating subdomains of {domain}", "discover")
+    from .discovery import discover_subdomains
+
+    disco = discover_subdomains(domain, deep=deep, resolvers=list(resolvers) or None, probe=probe)
+    _print_discovery_table(disco)
+    console.print(f"[green]live in-scope hosts[/green] ({len(disco.live_in_scope())}): "
+                  f"{disco.to_scope_list()}")
+    if json_path:
+        import json as _json
+        with open(json_path, "w", encoding="utf-8") as fh:
+            _json.dump(disco.to_dict(), fh, indent=2)
+        console.print(f"discovery JSON -> {json_path}")
 
 
 def _ensure_session(auth: dict, target: str) -> str:
@@ -1317,6 +1447,303 @@ def serve(host: str, port: int, db_path_opt: str | None) -> None:
     """Start the d4st web console (observability dashboard + report viewer)."""
     from .server import run_server
     run_server(host=host, port=port, db_path=db_path_opt)
+
+
+# ---- interactive primitives (Repeater / Intruder / authz diff) -------------------------------
+
+def _parse_headers(pairs) -> dict:
+    """Turn repeated 'Key: value' CLI options into a header dict."""
+    out: dict = {}
+    for raw in pairs or ():
+        k, _, v = str(raw).partition(":")
+        if k.strip():
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _read_body(arg) -> str:
+    """A --body option value: literal text, or @path to read the body from a file."""
+    if not arg:
+        return ""
+    if str(arg).startswith("@"):
+        with open(str(arg)[1:], "r", encoding="utf-8") as fh:
+            return fh.read()
+    return str(arg)
+
+
+def _load_session(path):
+    from .auth.session import Session
+    return Session.load(path) if path else None
+
+
+@main.command("replay")
+@click.argument("method")
+@click.argument("url")
+@click.option("--header", "-H", "headers", multiple=True, help="Request header 'Key: value' (repeatable).")
+@click.option("--body", default=None, help="Request body text, or @file to read it from a file.")
+@click.option("--session", "-s", "session_path", default=None, help="Captured session JSON for auth.")
+@click.option("--cookie", default="", help="Raw Cookie header value (alternative to --session).")
+@click.option("--follow", is_flag=True, default=False, help="Follow redirects.")
+@click.option("--allow-state-changing", is_flag=True, default=False,
+              help="Authorize a write verb / destructive or auth path (default: read-only only).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the evidence JSON.")
+def replay_cmd(method: str, url: str, headers: tuple, body: str | None, session_path: str | None,
+               cookie: str, follow: bool, allow_state_changing: bool, as_json: bool) -> None:
+    """Send ONE request (Repeater) and print the raw request/response + evidence."""
+    from .replay import replay
+    try:
+        res = replay(method, url, headers=_parse_headers(headers), body=_read_body(body),
+                     session=_load_session(session_path), cookie=cookie, follow_redirects=follow,
+                     allow_state_changing=allow_state_changing)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+    if as_json:
+        click.echo(json.dumps(res, indent=2, default=str))
+        return
+    console.print(f"[bold]{res['status']}[/bold]  {res['size']} bytes  {res['elapsed_ms']} ms")
+    console.print("[dim]--- request ---[/dim]")
+    console.print(res["raw_request"])
+    console.print("[dim]--- response ---[/dim]")
+    console.print(res["raw_response"][:4000])
+    console.print(f"[dim]repro:[/dim] {res['repro']}")
+
+
+def _parse_positions(specs) -> dict:
+    """--pos name=@wordlist (one payload per line) or --pos name=v1,v2,v3 -> {name: [payloads]}."""
+    out: dict = {}
+    for raw in specs or ():
+        name, _, val = str(raw).partition("=")
+        name = name.strip()
+        if not name:
+            continue
+        if val.startswith("@"):
+            with open(val[1:], "r", encoding="utf-8") as fh:
+                out[name] = [ln.rstrip("\n") for ln in fh if ln.strip()]
+        else:
+            out[name] = [v for v in val.split(",") if v != ""]
+    return out
+
+
+@main.command("sweep")
+@click.argument("method")
+@click.argument("url_template")
+@click.option("--pos", "positions", multiple=True, required=True,
+              help="Position payloads: name=@wordlist or name=v1,v2 (repeatable). §name§ marks it "
+                   "in the URL/body template.")
+@click.option("--mode", default="sniper",
+              type=click.Choice(["sniper", "pitchfork", "cluster-bomb"]))
+@click.option("--body-template", default=None, help="Body template with §name§ markers, or @file.")
+@click.option("--session", "-s", "session_path", default=None, help="Captured session JSON for auth.")
+@click.option("--cookie", default="", help="Raw Cookie header value.")
+@click.option("--max-requests", default=500, type=int, help="Cap on requests sent.")
+@click.option("--allow-state-changing", is_flag=True, default=False,
+              help="Authorize a write verb / destructive or auth path (default: read-only only).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the full JSON result.")
+def sweep_cmd(method: str, url_template: str, positions: tuple, mode: str,
+              body_template: str | None, session_path: str | None, cookie: str,
+              max_requests: int, allow_state_changing: bool, as_json: bool) -> None:
+    """Run an Intruder-style §position§ x payload sweep and print status/length outliers."""
+    from .sweep import sweep
+    try:
+        res = sweep(method, url_template, _parse_positions(positions), mode=mode,
+                    body_template=_read_body(body_template), session=_load_session(session_path),
+                    cookie=cookie, max_requests=max_requests,
+                    allow_state_changing=allow_state_changing)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+    if as_json:
+        click.echo(json.dumps(res, indent=2, default=str))
+        return
+    console.print(f"[bold]{res['mode']}[/bold]  sent {res['sent']}/{res['total']}  "
+                  f"modal status {res['modal_status']}  notable {len(res['notable'])}")
+    table = Table(title="notable (status/length outliers)")
+    table.add_column("payloads")
+    table.add_column("status", justify="right")
+    table.add_column("size", justify="right")
+    table.add_column("ms", justify="right")
+    for row in res["notable"][:50]:
+        table.add_row(str(row.get("payloads")), str(row.get("status")),
+                      str(row.get("size")), str(row.get("elapsed_ms")))
+    console.print(table)
+
+
+@main.command("authz-diff")
+@click.argument("method")
+@click.argument("url")
+@click.option("--session", "sessions", multiple=True, required=True,
+              help="Identity name=PATH (repeatable). The first is the owner unless --owner is set.")
+@click.option("--owner", default=None, help="Which identity owns the resource (the baseline).")
+@click.option("--body", default=None, help="Request body text, or @file.")
+@click.option("--base", default="", help="Base URL for cookie scoping (defaults to the request URL).")
+@click.option("--allow-state-changing", is_flag=True, default=False,
+              help="Authorize a write verb / destructive or auth path (default: read-only only).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the full JSON result.")
+def authz_diff_cmd(method: str, url: str, sessions: tuple, owner: str | None, body: str | None,
+                   base: str, allow_state_changing: bool, as_json: bool) -> None:
+    """Replay ONE request across N identities and print whether access is enforced or bypassed."""
+    from .auth.authz import diff_identities
+    ident: dict = {}
+    first = None
+    for spec in sessions:
+        name, _, path = str(spec).partition("=")
+        name = name.strip()
+        if not name or not path:
+            raise click.ClickException(f"--session must be name=PATH (got {spec!r})")
+        ident[name] = _load_session(path)
+        first = first or name
+    try:
+        res = diff_identities(method, url, ident, body=_read_body(body),
+                              owner=owner or first, base=base,
+                              allow_state_changing=allow_state_changing)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+    if as_json:
+        click.echo(json.dumps(res, indent=2, default=str))
+        return
+    verdict = res["verdict"]
+    color = {"bypassed": "red", "mixed": "yellow", "enforced": "green"}.get(verdict, "white")
+    console.print(f"verdict: [{color}]{verdict}[/{color}]  (owner={res['owner']})")
+    table = Table(title=f"{res['method']} {res['url']}")
+    table.add_column("identity")
+    table.add_column("status", justify="right")
+    table.add_column("size", justify="right")
+    table.add_column("allowed")
+    table.add_column("matches owner")
+    table.add_column("sensitivity", justify="right")
+    for p in res["per_identity"]:
+        table.add_row(str(p["name"]), str(p["status"]), str(p["size"]),
+                      str(p["allowed"]), str(p["matches_owner"]), str(p["sensitivity"]))
+    console.print(table)
+
+
+# ---- screenshot capture (visual evidence) ----------------------------------------------------
+
+def _parse_cookies(pairs, url: str) -> list:
+    """Turn repeated --cookie name=value options into Playwright cookie dicts scoped to the URL host."""
+    from urllib.parse import urlsplit
+    host = urlsplit(url).hostname or ""
+    out: list = []
+    for raw in pairs or ():
+        name, _, value = str(raw).partition("=")
+        name = name.strip()
+        if not name:
+            continue
+        out.append({"name": name, "value": value, "domain": host, "path": "/"})
+    return out
+
+
+@main.command("shot")
+@click.option("--url", required=True, help="URL to render and capture.")
+@click.option("--out", "out_path", default=None, help="Where to write the PNG (default: a temp dir).")
+@click.option("--cookie", "cookies", multiple=True,
+              help="Cookie 'name=value' scoped to the URL host (repeatable) — for an authed render.")
+@click.option("--header", "-H", "headers", multiple=True,
+              help="Extra request header 'Key: value' (repeatable).")
+@click.option("--eval-js", default=None,
+              help="JS evaluated AFTER load, BEFORE capture (may have side effects — pass benign JS "
+                   "only for read-only evidence).")
+@click.option("--wait-selector", default=None, help="Wait for this CSS selector before capturing (best-effort).")
+@click.option("--full-page/--no-full-page", default=True, show_default=True,
+              help="Capture the full scrollable page.")
+@click.option("--element", "element_selector", default=None,
+              help="Screenshot only this CSS selector (overrides --full-page).")
+@click.option("--timeout", default=30.0, type=float, show_default=True, help="Per-operation timeout (seconds).")
+def shot_cmd(url: str, out_path: str | None, cookies: tuple, headers: tuple, eval_js: str | None,
+             wait_selector: str | None, full_page: bool, element_selector: str | None,
+             timeout: float) -> None:
+    """Capture a headless-Chrome screenshot of a rendered page as visual evidence (PNG + sha256)."""
+    from .shot import capture
+    try:
+        res = capture(url, out_path=out_path, cookies=_parse_cookies(cookies, url),
+                      headers=_parse_headers(headers), eval_js=eval_js, wait_selector=wait_selector,
+                      full_page=full_page, element_selector=element_selector, timeout=timeout)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc))
+    click.echo(json.dumps(res.__dict__, indent=2, default=str))
+
+
+# ---- intercepting proxy (Burp-Proxy) ---------------------------------------------------------
+
+@main.group("proxy")
+def proxy_grp() -> None:
+    """Intercepting proxy: capture / pause / modify / replay live HTTP(S) traffic.
+
+    Needs the proxy extra (Python >= 3.10): pip install 'd4st[proxy]'. Point a browser at the
+    listener and trust the mitmproxy CA once (`d4st proxy ca`) to see HTTPS.
+    """
+
+
+@proxy_grp.command("start")
+@click.option("--host", "listen_host", default="127.0.0.1", help="Listener bind host.")
+@click.option("--port", "listen_port", default=8080, type=int, help="Listener port.")
+@click.option("--scope", default=None,
+              help="Comma-separated in-scope hosts (bare domain also covers subdomains). "
+                   "Guards tool-initiated replay only; passive browser capture is observe-only.")
+@click.option("--intercept", "intercept_filter", default=None,
+              help="mitmproxy filter to pause matching flows on capture (e.g. '~m POST & ~d api.x').")
+@click.option("--save", "save_path", default=None,
+              help="Tee captured flows to a native .flows file (readable with `d4st proxy ls`).")
+def proxy_start(listen_host: str, listen_port: int, scope: str | None,
+                intercept_filter: str | None, save_path: str | None) -> None:
+    """Start the proxy and run until Ctrl-C (prints the CA path + macOS trust hint)."""
+    try:
+        from .proxy import BackgroundProxy, _MACOS_CA_HINT, ca_cert_path
+    except ImportError as exc:  # noqa: BLE001
+        raise click.ClickException(
+            f"the proxy feature needs mitmproxy (Python >= 3.10): pip install 'd4st[proxy]' ({exc})")
+    scope_hosts = [h.strip() for h in (scope or "").split(",") if h.strip()]
+    bp = BackgroundProxy(listen_host=listen_host, listen_port=listen_port,
+                         scope_hosts=scope_hosts, persist_path=save_path)
+    info = bp.start()
+    if intercept_filter:
+        bp.set_intercept(intercept_filter)
+    console.print(f"[green]proxy listening[/green] on http://{info['listen']}  "
+                  f"(scope={scope_hosts or 'unset'})")
+    console.print(f"[dim]CA cert:[/dim] {ca_cert_path()}")
+    console.print(f"[dim]{_MACOS_CA_HINT}[/dim]")
+    if save_path:
+        console.print(f"[dim]saving flows ->[/dim] {save_path}")
+    console.print("[dim]Ctrl-C to stop.[/dim]")
+    try:
+        import time as _t
+        while True:
+            _t.sleep(1)
+    except KeyboardInterrupt:
+        console.print("\nstopping…")
+    finally:
+        bp.stop()
+
+
+@proxy_grp.command("ca")
+@click.option("--export", "dest", default=None, help="Copy the CA cert to this path (else print it).")
+def proxy_ca(dest: str | None) -> None:
+    """Show or export the mitmproxy CA cert the browser must trust once."""
+    from .proxy import export_ca, _MACOS_CA_HINT
+    try:
+        path = export_ca(dest)
+    except FileNotFoundError as exc:
+        raise click.ClickException(str(exc))
+    console.print(path if dest else f"[dim]CA cert:[/dim] {path}")
+    console.print(f"[dim]{_MACOS_CA_HINT}[/dim]")
+
+
+@proxy_grp.command("ls")
+@click.argument("flows_file")
+def proxy_ls(flows_file: str) -> None:
+    """List captured flows from a saved .flows file (offline triage)."""
+    from mitmproxy.io import FlowReader
+    table = Table(title=flows_file)
+    table.add_column("method")
+    table.add_column("status", justify="right")
+    table.add_column("url")
+    with open(flows_file, "rb") as fh:
+        for flow in FlowReader(fh).stream():
+            req = getattr(flow, "request", None)
+            resp = getattr(flow, "response", None)
+            if req is None:
+                continue
+            table.add_row(req.method, str(getattr(resp, "status_code", "")), req.pretty_url)
+    console.print(table)
 
 
 if __name__ == "__main__":
