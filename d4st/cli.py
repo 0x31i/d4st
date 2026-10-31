@@ -661,8 +661,16 @@ def _normalize_target(raw: str) -> str:
               help="Findings JSON path. Default: ./d4st-unauth-<host>.json")
 @click.option("--report/--no-report", "want_report", default=True, show_default=True,
               help="Also write a client-grade HTML report next to the JSON.")
+@click.option("--enumerate", "-e", "do_enumerate", is_flag=True, default=False,
+              help="Discover subdomains FIRST (crt.sh + subfinder), widen scope to every LIVE "
+                   "in-scope host, and sweep each one. Dead/NXDOMAIN hosts are never scanned.")
+@click.option("--deep", "-D", "deep_enum", is_flag=True, default=False,
+              help="With --enumerate: also use amass passive (if installed) for deeper discovery.")
+@click.option("--resolver", "resolvers", multiple=True,
+              help="Custom DNS resolver for --enumerate (repeatable; needs dnspython). "
+                   "Default 1.1.1.1, 8.8.8.8.")
 def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | None,
-           want_report: bool) -> None:
+           want_report: bool, do_enumerate: bool, deep_enum: bool, resolvers: tuple) -> None:
     """Deep UNAUTHENTICATED scan of a domain — the external-attacker viewpoint, authorized targets only.
 
     One command, no login, no config: crawl + content discovery + JS route mining + historical URLs,
@@ -683,6 +691,38 @@ def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | No
 
     base = _normalize_target(target)
     host = urlsplit(base).hostname or ""
+
+    # --enumerate: discover live subdomains FIRST, widen scope to the union, and fan the sweep
+    # out across every LIVE in-scope host. Dead/NXDOMAIN/wildcard-only hosts are never seeded —
+    # seeding ghost hosts is the exact failure that poisons a frontier with false targets.
+    scan_bases = [base]
+    disco = None
+    if do_enumerate:
+        from .art import phase as _phase
+        _phase("DISCOVERY", f"enumerating subdomains of {host}", "discover")
+        from .discovery import discover_subdomains
+        disco = discover_subdomains(host, deep=deep_enum,
+                                    resolvers=list(resolvers) or None)
+        _print_discovery_table(disco)
+        # widen scope so cross-links between discovered in-scope hosts aren't dropped at the frontier
+        scope_list = disco.to_scope_list()
+        os.environ["D4ST_SCOPE_HOSTS"] = scope_list
+        console.print(f"[green]scope widened[/green] -> {scope_list}")
+        # one base URL per LIVE in-scope host; always include the operator's original target host
+        live = disco.live_in_scope()
+        roots = {base}
+        for h in live:
+            rec = disco.records.get(h)
+            scheme = "https"
+            if rec and rec.probes:
+                live_p = [p for p in rec.probes if p.get("classification") == "LIVE"]
+                if live_p:
+                    scheme = live_p[0]["scheme"]
+            roots.add(f"{scheme}://{h}")
+        scan_bases = sorted(roots)
+        console.print(f"[bold]fan-out:[/bold] {len(scan_bases)} live host(s) to sweep: "
+                      f"{', '.join(scan_bases)}")
+
     # Keep the unauth sweep bounded so it always completes in a predictable window (the deep
     # engagement's default nuclei budget is an hour — too long for a one-command scan). Operators
     # can still override D4ST_NUCLEI_TIMEOUT. --fast additionally trims the heavy CVE/takeover
@@ -713,11 +753,34 @@ def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | No
                   "CORS / host-header / verb-tampering run unauthenticated[/dim]")
 
     from .art import phase
-    phase("CRAWLER", f"mapping {host or base} · depth {depth}", "crawl")
 
-    # unauth: empty cookie, no session, but run the unauth-safe depth suite
-    result = run_engagement(base, "", host, depth=depth, profile=profile,
-                            auth_headers={}, session=None, unauth_deep=True)
+    # Fan-out choice: LOOP run_engagement per live host and merge findings (rather than widening
+    # scope + seeding one crawl). run_engagement has no frontier-seed hook and crawls from a single
+    # base, so a per-host loop is the clean fit — each host gets a full roster pass and its own
+    # fingerprint-driven crawl strategy, and the scope env (widened above) keeps cross-host links
+    # in-scope. Dead hosts are already excluded from scan_bases, so none can be seeded.
+    def _scan_one(one_base: str) -> dict:
+        one_host = urlsplit(one_base).hostname or ""
+        phase("CRAWLER", f"mapping {one_host or one_base} · depth {depth}", "crawl")
+        # unauth: empty cookie, no session, but run the unauth-safe depth suite
+        return run_engagement(one_base, "", one_host, depth=depth, profile=profile,
+                              auth_headers={}, session=None, unauth_deep=True)
+
+    if len(scan_bases) == 1:
+        result = _scan_one(scan_bases[0])
+    else:
+        result = None
+        for i, one_base in enumerate(scan_bases, 1):
+            console.print(f"[bold cyan]── host {i}/{len(scan_bases)}:[/bold cyan] {one_base}")
+            r = _scan_one(one_base)
+            if result is None:
+                result = r
+            else:
+                result["urls"] = sorted(set(result.get("urls", [])) | set(r.get("urls", [])))
+                result["targets"] = result.get("targets", 0) + r.get("targets", 0)
+                result["findings"] = result.get("findings", []) + r.get("findings", [])
+        result = result or {"urls": [], "targets": 0, "findings": []}
+        result["discovery"] = disco.to_dict() if disco else None
 
     console.print(f"crawled {len(result['urls'])} urls · {result['targets']} injection targets")
     table = Table(title=f"unauth scan · {base}")
@@ -757,6 +820,73 @@ def unauth(target: str, depth: int, fast: bool, profile: str, out_path: str | No
                           f"({summ['findings']} findings)[/dim]")
         except Exception as e:  # noqa: BLE001
             console.print(f"[yellow]store ingest skipped[/yellow]: {e}")
+
+
+def _print_discovery_table(disco) -> None:
+    """Render a discovery result as a rich table (host | IPs | server | status | classification)."""
+    table = Table(title=f"subdomain discovery · {disco.domain}")
+    table.add_column("host")
+    table.add_column("IPs")
+    table.add_column("server")
+    table.add_column("status", justify="right")
+    table.add_column("classification")
+    _CLASS_STYLE = {"LIVE": "green", "REDIRECT-OFFSITE": "yellow",
+                    "RESOLVES-DEAD": "dim", "NXDOMAIN": "red"}
+    # resolved/interesting hosts first, then the rest; dead/NXDOMAIN at the bottom
+    _order = {"LIVE": 0, "REDIRECT-OFFSITE": 1, "RESOLVES-DEAD": 2, "NXDOMAIN": 3}
+    for name in sorted(disco.records,
+                       key=lambda n: (_order.get(disco.records[n].classification, 9), n)):
+        rec = disco.records[name]
+        # best probe (prefer the LIVE one) for server/status display
+        probe = None
+        for p in rec.probes:
+            if p.get("classification") == "LIVE":
+                probe = p
+                break
+        probe = probe or (rec.probes[0] if rec.probes else None)
+        server = (probe or {}).get("server") or ""
+        status = str((probe or {}).get("status") or "")
+        cls = rec.classification
+        style = _CLASS_STYLE.get(cls, "white")
+        table.add_row(name, (", ".join(rec.ips) or (rec.cname or ""))[:40],
+                      (server or "")[:28], status, f"[{style}]{cls}[/{style}]")
+    console.print(table)
+    console.print(f"[dim]{disco.summary()}[/dim]")
+
+
+@main.command()
+@click.argument("domain")
+@click.option("--deep", "-D", "deep", is_flag=True, default=False,
+              help="Also use amass passive (if installed) for deeper enumeration.")
+@click.option("--resolver", "resolvers", multiple=True,
+              help="Custom DNS resolver (repeatable; needs dnspython). Default 1.1.1.1, 8.8.8.8.")
+@click.option("--json", "json_path", default=None,
+              help="Write the full DiscoveryResult JSON to this path.")
+@click.option("--probe/--no-probe", "probe", default=True, show_default=True,
+              help="Liveness-probe each resolved host (HEAD/GET, no attack traffic).")
+def discover(domain: str, deep: bool, resolvers: tuple, json_path: str | None, probe: bool) -> None:
+    """Passively enumerate subdomains of a DOMAIN, resolve + wildcard-filter them, and probe
+    each for liveness — the recon front-end that feeds d4st's scope model.
+
+    Sources: crt.sh (always), subfinder and amass (if installed). No AI, no attack traffic — pure
+    discovery. Feed the result into a scan with `d4st unauth <domain> --enumerate`.
+
+        d4st discover example.com
+        d4st discover example.com --deep --json out.json
+    """
+    from .art import phase
+    phase("DISCOVERY", f"enumerating subdomains of {domain}", "discover")
+    from .discovery import discover_subdomains
+
+    disco = discover_subdomains(domain, deep=deep, resolvers=list(resolvers) or None, probe=probe)
+    _print_discovery_table(disco)
+    console.print(f"[green]live in-scope hosts[/green] ({len(disco.live_in_scope())}): "
+                  f"{disco.to_scope_list()}")
+    if json_path:
+        import json as _json
+        with open(json_path, "w", encoding="utf-8") as fh:
+            _json.dump(disco.to_dict(), fh, indent=2)
+        console.print(f"discovery JSON -> {json_path}")
 
 
 def _ensure_session(auth: dict, target: str) -> str:

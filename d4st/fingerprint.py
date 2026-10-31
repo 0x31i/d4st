@@ -22,10 +22,13 @@ the only entry point) rather than sinking the scan.
 """
 from __future__ import annotations
 
+import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlsplit
+
+from .scope import in_scope as _scope_in_scope, scope_hosts
 
 try:
     import requests
@@ -164,31 +167,68 @@ def _get(url: str, cookie: str, timeout: int = 12):
         return None
 
 
-def _in_scope(url: str, want_host: str) -> bool:
-    h = (urlsplit(url).hostname or '').lower()
-    return h == want_host or not h  # relative URLs resolve in-scope
+# Common second-level public-suffix labels (the `co` in example.CO.UK). Keeps the
+# registrable-domain guess from collapsing a ccTLD site down to a bare ccTLD.
+_MULTI_SLD = frozenset({'co', 'com', 'org', 'net', 'gov', 'edu', 'ac', 'gob', 'or', 'ne'})
 
 
-def _count_anchors(body: str, base: str, want_host: str) -> tuple[int, list[str]]:
-    """Count in-scope, in-page navigation links (ignoring fragments/mailto/js)."""
+def _registrable_domain(host: str) -> str:
+    """Best-effort registrable domain (eTLD+1) without a public-suffix list.
+
+    'www.bristolglobal.com' -> 'bristolglobal.com'; 'app.example.co.uk' ->
+    'example.co.uk'. Fail-safe by design: a host we cannot reduce is returned
+    unchanged, and the ccTLD guard errs toward KEEPING more labels (a narrower
+    scope), so a bad guess never widens scope past the host itself.
+    """
+    h = (host or '').lower().strip('.')
+    labels = [p for p in h.split('.') if p]
+    if len(labels) < 3:
+        return h  # 'example.com' or a bare/host-less value — already minimal
+    # ccTLD + known second level (example.co.uk) keeps three labels.
+    if len(labels[-1]) == 2 and labels[-2] in _MULTI_SLD:
+        return '.'.join(labels[-3:])
+    return '.'.join(labels[-2:])
+
+
+def _in_scope(url: str, hosts) -> bool:
+    """In-scope iff the URL's host matches an engagement scope host or is a
+    subdomain of one — the SAME subdomain-aware test the live crawl applies
+    (scope.in_scope). Using it here keeps the fingerprint from under-counting a
+    surface the crawl itself would accept (e.g. a cross-subdomain redirect).
+    Relative / host-less URLs resolve against the target and stay in-scope."""
+    return _scope_in_scope(url, hosts)
+
+
+def _count_anchors(body: str, base: str, hosts) -> tuple[int, list[str]]:
+    """Count in-scope, in-page navigation links (ignoring fragments/mailto/js).
+
+    `base` is the FINAL (post-redirect) landing URL so relative anchors resolve
+    against where we actually landed, and `hosts` is the subdomain-aware scope
+    list, so anchors on a sibling/parent/child subdomain of the landing host
+    are counted rather than silently dropped by an exact-host test."""
     links = []
     for href in _ANCHOR.findall(body or ''):
         href = href.strip()
         if not href or href.startswith(('#', 'mailto:', 'javascript:', 'tel:')):
             continue
         absu = urljoin(base, href)
-        if urlsplit(absu).scheme in ('http', 'https') and _in_scope(absu, want_host):
+        if urlsplit(absu).scheme in ('http', 'https') and _in_scope(absu, hosts):
             links.append(absu.split('#')[0])
     return len(set(links)), sorted(set(links))
 
 
-def _discover_entry_seeds(target: str, body: str, cookie: str, want_host: str,
+def _discover_entry_seeds(base: str, body: str, cookie: str, hosts,
                           signals: list[str]) -> list[str]:
     """When the landing page is link-poor, find real entry points from robots.txt,
     sitemap.xml, in-page text path hints, and conventional index files. Only keep a
-    candidate if it returns 200 AND exposes MORE in-scope links than the seed did."""
-    root = f"{urlsplit(target).scheme}://{urlsplit(target).netloc}/"
-    base_path = target.rsplit('/', 1)[0] + '/'
+    candidate if it returns 200 AND exposes MORE in-scope links than the seed did.
+
+    `base` is the FINAL landing URL (post-redirect), so robots/sitemap and the
+    conventional index files are discovered relative to where we actually landed
+    (e.g. the www host after an apex->www redirect), and `hosts` is the
+    subdomain-aware scope list used to keep candidates in-scope."""
+    root = f"{urlsplit(base).scheme}://{urlsplit(base).netloc}/"
+    base_path = base.rsplit('/', 1)[0] + '/'
     candidates: list[str] = []
 
     # (a) robots.txt Disallow/Allow paths + Sitemap directives.
@@ -222,7 +262,7 @@ def _discover_entry_seeds(target: str, body: str, cookie: str, want_host: str,
     seen, kept = set(), []
     for c in candidates:
         c = c.split('#')[0]
-        if c in seen or not _in_scope(c, want_host):
+        if c in seen or not _in_scope(c, hosts):
             continue
         seen.add(c)
         if len(seen) > 40:  # hard probe budget — never hammer a real target
@@ -230,7 +270,7 @@ def _discover_entry_seeds(target: str, body: str, cookie: str, want_host: str,
         rr = _get(c, cookie, timeout=8)
         if rr is None or rr.status_code != 200:
             continue
-        n, _ = _count_anchors(rr.text, c, want_host)
+        n, _ = _count_anchors(rr.text, c, hosts)
         if n > _LINK_POOR:
             kept.append(c)
     if kept:
@@ -251,6 +291,35 @@ def fingerprint_target(target: str, host: str, cookie: str = '') -> AppProfile:
 
     body = r.text or ''
     ctype = r.headers.get('content-type', '').lower()
+
+    # The fetch follows redirects (allow_redirects=True), so `body` is the REAL
+    # landing page. Anchor counting + seed discovery must therefore use the FINAL
+    # landing URL as their base, and a subdomain-aware scope derived from where we
+    # landed — otherwise a cross-subdomain redirect (apex 301=>www) leaves base/
+    # want_host on the original host, every landing-page anchor fails an exact-host
+    # test, and a site with a full surface reads as "link-poor" (links=1).
+    try:
+        landing = str(r.url) or target
+    except Exception:  # noqa: BLE001
+        landing = target
+    base = landing
+    landing_host = (urlsplit(landing).hostname or want_host or '').lower()
+
+    # Scope for anchor counting + seed discovery:
+    #   * explicit engagement scope (D4ST_SCOPE_HOSTS) is honored EXACTLY and
+    #     never widened — same list scope.scope_hosts() hands the live crawl;
+    #   * otherwise derive a subdomain-aware scope from the registrable domain of
+    #     BOTH the requested host and the landing host, so a cross-subdomain
+    #     redirect and sibling/parent/child subdomains are in-scope, matching
+    #     scope.in_scope instead of the old exact-host match.
+    if os.environ.get('D4ST_SCOPE_HOSTS', '').strip():
+        scope = scope_hosts(target)
+    else:
+        scope = []
+        for _h in (want_host, landing_host):
+            _reg = _registrable_domain(_h)
+            if _reg and _reg not in scope:
+                scope.append(_reg)
 
     # tech from headers
     for h, fn in _HEADER_TECH.items():
@@ -274,7 +343,7 @@ def fingerprint_target(target: str, host: str, cookie: str = '') -> AppProfile:
     for _m in re.findall(r'\.(php|jsp|jspx|aspx?|cfm|do|action)\b', body, re.I):
         prof.tech.append(_ext_tech.get(_m.lower(), _m))
 
-    n_links, _ = _count_anchors(body, target, want_host)
+    n_links, _ = _count_anchors(body, base, scope)
     prof.seed_link_count = n_links
     spa_body = any(rx.search(body) for rx in _SPA_BODY)
     spa_bundle = bool(_SPA_BUNDLE.search(body))
@@ -307,7 +376,7 @@ def fingerprint_target(target: str, host: str, cookie: str = '') -> AppProfile:
 
     # ---- entry-seed discovery for link-poor landings ------------------------
     if n_links <= _LINK_POOR and prof.app_type != 'api':
-        prof.entry_seeds = _discover_entry_seeds(target, body, cookie, want_host, prof.signals)
+        prof.entry_seeds = _discover_entry_seeds(base, body, cookie, scope, prof.signals)
         # Reclassify spa=>mpa ONLY when the discovered pages are themselves server-rendered
         # (.jsp/.php/.aspx) AND there is no framework-root marker. A true SPA has a link-less
         # shell BY DESIGN, so finding a stray richer page must never downgrade a page whose
@@ -318,17 +387,24 @@ def fingerprint_target(target: str, host: str, cookie: str = '') -> AppProfile:
             prof.headless = False
             prof.signals.append('reclassified spa=>mpa: server-rendered page tree, no framework root')
 
-    # Capture the redirect LANDING url (with its query string) as a crawl seed. A login/return
-    # flow like OWA 302s the seed to logon.aspx?url=...&reason=0, whose reflected return-URL param
-    # is a real injection point that is otherwise lost — the crawler only ever sees the base path.
+    # Capture the redirect LANDING url as a crawl seed whenever the fetch landed
+    # somewhere other than the requested target. Two cases, both otherwise lost:
+    #   * a cross-subdomain redirect (apex 301=>www) — the landing host carries
+    #     the real surface and must seed the crawl even without a query string;
+    #   * a login/return flow (OWA 302s to logon.aspx?url=...&reason=0) whose
+    #     reflected return-URL param is a real injection point.
+    # Scope is the subdomain-aware engagement scope, so an off-scope redirect
+    # (e.g. to an IdP) is still correctly refused.
     try:
-        landing = str(r.url)
-        if (landing and landing != target
-                and (urlsplit(landing).hostname or '').lower() == want_host
-                and urlsplit(landing).query
-                and landing not in prof.entry_seeds):
-            prof.entry_seeds.append(landing)
-            prof.signals.append(f'redirect landing captured as seed ({urlsplit(landing).path})')
+        seed = (landing or '').split('#')[0]
+        if (seed and seed != target
+                and _in_scope(seed, scope)
+                and seed not in prof.entry_seeds):
+            prof.entry_seeds.append(seed)
+            _q = urlsplit(seed).query
+            prof.signals.append(
+                'redirect landing captured as seed '
+                f'({urlsplit(seed).path}{"?" + _q if _q else ""})')
     except Exception:  # noqa: BLE001
         pass
 
