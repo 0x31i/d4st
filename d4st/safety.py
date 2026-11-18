@@ -113,7 +113,34 @@ _STATE_CHANGING = re.compile(
 
 def is_state_changing(url: str) -> bool:
     """True if the URL path looks like a destructive/notifying action (fuzz it only when the
-    policy allows). Checks path only, so a benign ?q=... query is not misclassified."""
+    policy allows). Checks path only, so a benign ?q=... query is not misclassified.
+
+    NOTE: path-only / method-agnostic. For the ACTIVE-TEST exclusion gate prefer the
+    method-aware :func:`is_write_action`, which does not drop a GET read whose path merely
+    mentions a verb (e.g. ``OrderDetail.asp?id=`` / ``OrderList.asp``)."""
+    return bool(_STATE_CHANGING.search(urlsplit(url).path))
+
+
+def is_write_action(url: str, method: str = "GET") -> bool:
+    """Method-aware destructive-action gate for the ACTIVE-TEST exclusion filter.
+
+    A request is a genuine state-changing WRITE — and so excluded from active fuzzing — ONLY
+    when BOTH hold:
+      * the method is non-GET (POST/PUT/PATCH/DELETE), AND
+      * the path/action carries a destructive/notifying verb (:data:`_STATE_CHANGING`).
+
+    A GET is a READ even when its path contains a verb like ``order``/``export``/``confirm``/
+    ``cancel`` (``OrderDetail.asp?id=`` reads one order; it does not place/cancel it), so a GET
+    STAYS in active testing. This fixes the surface-starvation bug where every GET whose path
+    merely mentioned a verb was dropped from injection/IDOR testing.
+
+    Genuine writes (a POST/PUT/PATCH/DELETE to a destructive path — ConfirmOrder / SendMail /
+    DeleteItem / checkout / payment) are still excluded so the scanner never fuzzes them.
+
+    ``is_state_changing(url)`` is kept for callers that have no method (and for back-compat);
+    this is the preferred gate wherever a method is available."""
+    if (method or "GET").upper() == "GET":
+        return False
     return bool(_STATE_CHANGING.search(urlsplit(url).path))
 
 
@@ -321,39 +348,62 @@ class TargetHealth:
     base_url: str
     cookie: str = ""
     slow_ms: float = 6000.0
-    ping_timeout: float = 10.0
+    # ping_timeout RAISED 10s -> 25s. v3 post-mortem: a legacy app that merely got SLOW (its response
+    # blew past a 10s deadline) threw a timeout and was scored a DOUBLE-weight "dead" hard-fail (+2)
+    # instead of a single "slow" strike (+1) — 2 such pings HALTed the gate and silently skipped ZAP +
+    # deep injection. With a 25s deadline a 6-25s response now actually returns and is scored +1 slow.
+    ping_timeout: float = 25.0
+    confirm_delay: float = 6.0       # a failed ping is RE-probed after this pause; only a confirmed fail is hard
     stage: int = 0
     strikes: int = 0
     pings: int = 0
     events: list = field(default_factory=list)
 
-    def ping(self) -> tuple[bool, float]:
-        """Active liveness GET on the base URL. Returns (alive, elapsed_ms). alive is False on
-        connection error/timeout or any 5xx (the signals a stressed app emits before dying)."""
+    def ping(self) -> tuple[bool, float, str]:
+        """Active liveness GET on the base URL. Returns (alive, elapsed_ms, reason). alive is False
+        on connection error / timeout / any 5xx. reason in {ok,slow,5xx,timeout,error} so a
+        post-mortem can tell a genuinely-dead target apart from a merely-slow one (the v3 gap:
+        both failure modes were logged identically as "unresponsive/5xx")."""
         import httpx
-        # verify=False: an invalid/self-signed cert (routine in pentests — islclinic.net IS the cert
-        # finding) must NOT read as "target down". Without it every ping throws SSLError -> the target
-        # is falsely halted, silently skipping the DOM stage, ZAP, and deep injection. browser UA so a
-        # WAF doesn't tarpit the liveness ping either.
+        # verify=False: an invalid/self-signed cert (routine in pentests) must NOT read as "down".
+        # browser UA so a WAF doesn't tarpit the liveness ping either.
         headers = browser_headers({"Cookie": self.cookie} if self.cookie else None)
         t0 = time.monotonic()
         try:
             r = httpx.get(self.base_url, headers=headers, timeout=self.ping_timeout,
                           follow_redirects=True, verify=False)
-            return (r.status_code < 500, (time.monotonic() - t0) * 1000.0)
-        except Exception:  # noqa: BLE001 - any failure = not alive
-            return (False, (time.monotonic() - t0) * 1000.0)
+            el = (time.monotonic() - t0) * 1000.0
+            if r.status_code >= 500:
+                return (False, el, "5xx")
+            return (True, el, "slow" if el > self.slow_ms else "ok")
+        except Exception as exc:  # noqa: BLE001 - any failure = not alive
+            el = (time.monotonic() - t0) * 1000.0
+            reason = "timeout" if isinstance(exc, httpx.TimeoutException) else "error"
+            return (False, el, reason)
 
     def check(self) -> int:
-        """Ping and update the stress stage. Returns the current stage (0/1/2). Once halted it
-        stays halted (no thrashing back to active scanning)."""
+        """Ping and update the stress stage. Returns the current stage (0/1/2). Once halted it stays
+        halted UNLESS recover_check() later proves the target came back (used before the heaviest
+        engine). A failed ping is CONFIRMED by an immediate re-probe before counting as a hard fail,
+        so two unlucky liveness blips can no longer HALT the whole active scan (the v3 bug)."""
         if self.stage >= 2:
             return self.stage
-        alive, el = self.ping()
+        alive, el, reason = self.ping()
         self.pings += 1
         if not alive:
-            self.strikes += 2
-            self.events.append(f"target unresponsive/5xx (strikes={self.strikes})")
+            # Confirm-before-penalise: one re-probe after a short pause. Only a SECOND failure is a
+            # real hard-fail (+2); a recovered re-probe is a transient blip worth just +1.
+            time.sleep(self.confirm_delay)
+            alive2, el2, reason2 = self.ping()
+            self.pings += 1
+            if not alive2:
+                self.strikes += 2
+                self.events.append(f"target {reason}/{reason2} x2 confirmed "
+                                   f"({int(el)}ms/{int(el2)}ms, strikes={self.strikes})")
+            else:
+                self.strikes += 1
+                self.events.append(f"target transient {reason} then alive "
+                                   f"({int(el2)}ms, strikes={self.strikes})")
         elif el > self.slow_ms:
             self.strikes += 1
             self.events.append(f"target slow {int(el)}ms (strikes={self.strikes})")
@@ -365,6 +415,34 @@ class TargetHealth:
         elif self.strikes >= 2 and self.stage < 1:
             self.stage = 1
             self.events.append("BACKOFF: reducing injection depth (L5 -> L3)")
+        return self.stage
+
+    def recover_check(self, attempts: int = 3, delay: float = 20.0) -> int:
+        """Called ONCE before the heaviest engine (ZAP). If the scan HALTed on a transient stress
+        window, give the target a cooldown and re-probe: two healthy pings in a row demonstrate it
+        recovered, so step the gate back from HALT(2) to BACKOFF(1) and let the cross-check engine
+        run at reduced intensity rather than silently skipping it. A genuinely dead target keeps
+        failing the probes and stays halted — protection intact. (v3: a mid-run dip during the
+        hour-long nuclei-exposures stage permanently skipped ZAP; this gives it a second chance.)"""
+        if self.stage < 2:
+            return self.stage
+        healthy = 0
+        for _i in range(max(1, attempts)):
+            time.sleep(delay)
+            alive, el, reason = self.ping()
+            self.pings += 1
+            if alive:
+                healthy += 1
+                if healthy >= 2:
+                    self.stage = 1
+                    self.strikes = 2
+                    self.events.append(f"RECOVERY: target responsive again after cooldown "
+                                       f"({int(el)}ms) — re-enabling active scan at reduced depth")
+                    return self.stage
+            else:
+                healthy = 0
+                self.events.append(f"recovery probe {_i + 1}: still {reason} ({int(el)}ms)")
+        self.events.append("recovery failed: target stayed unhealthy — active scan stays halted")
         return self.stage
 
     @property
