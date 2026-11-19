@@ -427,3 +427,117 @@ def test_config_programmatic_install_enforces(monkeypatch):
     Config(exclude_paths=["/api/captures"])          # __post_init__ installs it
     assert S.is_path_excluded(EXCL)
     assert S.is_write_action(EXCL, "GET") is True     # free-function gate now enforces it
+
+
+# =============================================================================================
+# RESIDUAL-CLOSURE CANARIES (defense-in-depth): all-methods consistency + internal backstops.
+# =============================================================================================
+def test_canary_api_authz_read_gets_never_hit_excluded(monkeypatch, _record_http):
+    """api-authz BOLA victim-enumeration + read-back GETs must also be withheld from an excluded
+    path — an excluded endpoint gets ZERO requests of ANY method (GET included)."""
+    import httpx
+
+    def _body(props):
+        sp = {p: {"type": "string"} for p in props}
+        return {"requestBody": {"content": {"application/json": {"schema": {"properties": sp}}}}}
+
+    schema = {
+        "servers": [{"url": "http://fixture.local/"}],
+        "paths": {
+            # create + read-back on the excluded path (drives the registration + read-back GET loop)
+            "/api/captures/create": {"post": _body(["username", "password"])},
+            "/api/captures/{id}": {"get": {}, "put": _body(["name"])},
+            "/api/captures": {"get": {}},          # BOLA victim-enumeration collection GET
+            # an allowed collection so the enumeration loop still runs somewhere
+            "/api/users": {"get": {}},
+        },
+    }
+
+    def _get(url, *a, **kw):
+        _record_http.append(("GET", url))
+        r = _FakeResp(url)
+        r.json = lambda: schema if url.endswith("openapi.json") else {}
+        return r
+    monkeypatch.setattr(httpx, "get", _get)
+    _arm_aggressive(monkeypatch)
+
+    E.run_api_authz_tests("http://fixture.local/openapi.json", cookie="", fuzz_forms=True)
+    hits = [(m, u) for (m, u) in _record_http
+            if "/api/captures" in urlsplit(u).path]   # ANY method, incl. GET
+    assert hits == [], f"api-authz LEAKED a request (any method) to excluded path: {hits}"
+    # NON-VACUOUS: the allowed collection WAS enumerated (recorder is live; gate is real)
+    assert any("/api/users" in urlsplit(u).path for (_m, u) in _record_http)
+
+
+def _spy_filter_excluded(monkeypatch):
+    """Wrap safety.filter_excluded to record the frontier it is handed + what it returns, so we can
+    prove a dispatcher ran it internally (non-vacuous even when the engine bails early)."""
+    import d4st.safety as _S
+    calls = {"inputs": [], "outputs": []}
+    real = _S.filter_excluded
+
+    def _wrap(urls, **kw):
+        out = real(urls, **kw)
+        calls["inputs"].append(list(urls))
+        calls["outputs"].append(list(out))
+        return out
+    monkeypatch.setattr(_S, "filter_excluded", _wrap)
+    return calls
+
+
+def test_canary_jwt_internal_backstop_with_raw_urls(monkeypatch, _record_http):
+    """Prove the INTERNAL backstop (not just the engine filter): run_jwt_attacks with RAW urls →
+    its own filter_excluded strips the excluded URL before any use, AND zero requests reach it."""
+    from d4st import jwtattacks
+    _arm_aggressive(monkeypatch)
+    calls = _spy_filter_excluded(monkeypatch)
+
+    class _JwtSession:
+        def __init__(self):
+            self.headers = {"Authorization": "Bearer aaa.bbb.ccc"}
+            self.session_storage = {"t": "x"}
+
+        def cookie_header(self, _b=""):
+            return ""
+
+    try:
+        jwtattacks.run_jwt_attacks(_JwtSession(), "http://fixture.local/", [EXCL, ALLOW], delay=0.0)
+    except Exception:  # noqa: BLE001,S110
+        pass
+    # the dispatcher ran its internal backstop on the raw frontier...
+    assert any(EXCL in i for i in calls["inputs"]), "run_jwt_attacks did not run its internal filter"
+    assert all(EXCL not in o for o in calls["outputs"]), "internal filter did not strip excluded URL"
+    # ...and nothing leaked to the excluded path
+    assert _hits(_record_http, "/api/captures") == [], "jwt internal backstop LEAKED"
+
+
+def test_canary_ws_internal_backstop_with_raw_urls(monkeypatch, _record_http):
+    """Prove the INTERNAL backstop: run_ws_tests with RAW urls → its own filter_excluded strips the
+    excluded URL before use, AND zero requests reach it."""
+    from d4st import wstests
+    _arm_aggressive(monkeypatch)
+    calls = _spy_filter_excluded(monkeypatch)
+    try:
+        wstests.run_ws_tests(_FakeSession(), "http://fixture.local/", [EXCL, ALLOW], delay=0.0)
+    except Exception:  # noqa: BLE001,S110
+        pass
+    assert any(EXCL in i for i in calls["inputs"]), "run_ws_tests did not run its internal filter"
+    assert all(EXCL not in o for o in calls["outputs"]), "internal filter did not strip excluded URL"
+    assert _hits(_record_http, "/api/captures") == [], "ws internal backstop LEAKED"
+
+
+def test_exclude_guard_filters_urls_as_keyword():
+    """@_exclude_guard must filter `urls` whether positional OR keyword (no silent skip)."""
+    import d4st.activetests as A
+    S.set_exclude_matcher("/api/captures")
+    seen = {}
+
+    @A._exclude_guard
+    def _probe(session, base, urls, **kw):
+        seen["urls"] = urls
+        return []
+
+    _probe("s", "http://fixture.local/", urls=[EXCL, ALLOW])   # urls as KEYWORD
+    assert EXCL not in seen["urls"] and ALLOW in seen["urls"]
+    _probe("s", "http://fixture.local/", [EXCL, ALLOW])        # urls POSITIONAL
+    assert EXCL not in seen["urls"] and ALLOW in seen["urls"]

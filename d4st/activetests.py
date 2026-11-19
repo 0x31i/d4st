@@ -33,10 +33,16 @@ def _exclude_guard(fn):
     the scan policy — wins over `aggressive`. Every run_* dispatcher in this module is wrapped.
     (The discovery crawler does NOT use these functions, so passive GET mapping is unaffected.)"""
     @functools.wraps(fn)
-    def _wrapped(session, base, urls, *args, **kwargs):
+    def _wrapped(*args, **kwargs):
         from .safety import filter_excluded
-        return fn(session, base, filter_excluded(list(urls or []), label=fn.__name__),
-                  *args, **kwargs)
+        # Filter `urls` whether it arrives positionally (3rd arg) or as a keyword, so a future kwarg
+        # call site can never silently skip the guard.
+        if "urls" in kwargs:
+            kwargs["urls"] = filter_excluded(list(kwargs["urls"] or []), label=fn.__name__)
+        elif len(args) >= 3:
+            args = (args[0], args[1], filter_excluded(list(args[2] or []), label=fn.__name__),
+                    *args[3:])
+        return fn(*args, **kwargs)
     return _wrapped
 
 

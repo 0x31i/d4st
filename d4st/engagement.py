@@ -595,6 +595,13 @@ def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[
         confirmed_at = None
         for gp in _get_eps:                           # read back via {id} or collection/debug GETs
             gurl = base + "/" + re.sub(r'\{[^}]+\}', uname, gp).lstrip("/")
+            # D4ST_EXCLUDE_PATHS: block ALL methods (incl. this read-back GET) at an excluded path,
+            # consistent with the stated standard — an excluded endpoint gets zero requests of any
+            # method. (LOW residuals left as-is, documented: httpx follow_redirects=True can
+            # auto-follow a 30x INTO an excluded path — narrow/pre-existing; and discover_api_surface
+            # probes a few fixed graphql/openapi paths for benign introspection.)
+            if is_excluded_send(gurl):
+                continue
             try:
                 rr = httpx.get(gurl, headers=_base_headers(cookie), timeout=12, follow_redirects=True)
                 data = rr.json()
@@ -617,6 +624,9 @@ def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[
     others: list[str] = []
     for path, ops in paths.items():
         if "{" in str(path) or not isinstance(ops, dict) or "get" not in {m.lower() for m in ops}:
+            continue
+        # D4ST_EXCLUDE_PATHS: never issue the BOLA victim-enumeration GET at an excluded path.
+        if is_excluded_send(_url(path)):
             continue
         try:
             r = httpx.get(_url(path), headers=_base_headers(cookie), timeout=12, follow_redirects=True)

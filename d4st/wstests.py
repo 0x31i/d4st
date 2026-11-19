@@ -85,7 +85,10 @@ def run_ws_tests(session, base: str, urls: list[str], *, js_dir: str | None = No
                  throttle=None) -> list[dict]:
     import httpx
 
-    from .safety import pace
+    from .safety import filter_excluded, pace
+    # D4ST_EXCLUDE_PATHS backstop: filter internally too, so a future caller passing raw `urls`
+    # cannot drive WebSocket/SignalR tests against an excluded endpoint.
+    urls = filter_excluded(list(urls or []), label="websocket")
 
     origin = f"{urlsplit(base).scheme}://{urlsplit(base).netloc}"
     cands = _discover(urls, js_dir, origin)[:max_cands]

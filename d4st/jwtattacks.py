@@ -190,7 +190,11 @@ def run_jwt_attacks(session: Session, base: str, urls: list[str], *,
     a list of finding dicts (each with full evidence_log + repro). Read-only; throttled."""
     import httpx
 
-    from .safety import pace
+    from .safety import filter_excluded, pace
+    # D4ST_EXCLUDE_PATHS backstop: filter the frontier internally too (not just via the engine
+    # passing _active_urls), so a future refactor that hands us raw `urls` cannot replay a forged
+    # token against an excluded endpoint.
+    urls = filter_excluded(list(urls or []), label="jwt-attacks")
 
     tok = _bearer_of(session)
     if not tok or tok.count(".") < 2:
