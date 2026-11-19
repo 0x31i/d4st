@@ -69,7 +69,7 @@ def launch(workflow: str, target: str, session_path: str | None,
            seed_url: tuple = (), seed_file: str | None = None, no_js_mine: bool = False,
            as_json: bool = False) -> None:
     """Run a scanning workflow against a target."""
-    Config.from_env()  # loaded for side effects / future DB + egress wiring
+    cfg = Config.from_env()  # also carries the session-validity MODE (rendered | basic-auth | both)
     spec = load_workflow(workflow)
 
     session = None
@@ -80,7 +80,7 @@ def launch(workflow: str, target: str, session_path: str | None,
         # instead of silently producing unauthenticated (garbage) results.
         if not dry_run:
             from .auth.session import Session
-            from .auth.validity import is_session_valid
+            from .auth.validity import validate_session
             sess = Session.from_dict(session)
             # Honor the captured validity marker if one was recorded; do NOT default to
             # 'Logout' (that false-negatives JWT-SPAs whose session is token-based, not a
@@ -88,8 +88,10 @@ def launch(workflow: str, target: str, session_path: str | None,
             marker = sess.meta.get("validity_marker") or None
             probe_url = sess.meta.get("validity_url") or sess.origin or target
             render_hint = sess.meta.get("validity_render")
-            ok, note = is_session_valid(
-                sess, probe_url, marker,
+            # Mode-aware, fail-closed gate. 'rendered' (default) is the unchanged legacy probe;
+            # 'basic-auth'/'both' additionally require the configured Basic-Auth 401->200 proof.
+            ok, note = validate_session(
+                sess, cfg, probe_url=probe_url, marker=marker,
                 render=(bool(render_hint) if render_hint is not None else None))
             # In --json mode these status lines must NOT go to stdout (they would prepend
             # non-JSON text to the findings document). Route them to stderr instead.
@@ -506,9 +508,10 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
     from urllib.parse import urlsplit
 
     from .auth.session import Session
-    from .auth.validity import is_valid, is_session_valid
+    from .auth.validity import validate_session
     from .engagement import run_engagement
 
+    cfg = Config.from_env()  # session-validity MODE (rendered | basic-auth | both)
     sess = Session.load(session_path)
     host = urlsplit(target).hostname or ""
     cookie = sess.cookie_header(host)
@@ -517,8 +520,9 @@ def engagement(target: str, session_path: str, depth: int, profile: str,
     # is_session_valid() is token-aware: a JWT/bearer SPA that carries a live token in sessionStorage
     # is valid even when no server-rendered "Logout" marker is present (the old is_valid() default
     # marker false-rejected these otherwise-good sessions). Marker None => don't require a text marker.
-    ok, note = is_session_valid(sess, sess.meta.get("validity_url") or target,
-                                sess.meta.get("validity_marker") or None,
+    ok, note = validate_session(sess, cfg,
+                                probe_url=sess.meta.get("validity_url") or target,
+                                marker=sess.meta.get("validity_marker") or None,
                                 render=bool(sess.session_storage) or None)
     if not ok:
         raise click.ClickException(f"session invalid ({note}); re-capture before an engagement.")
