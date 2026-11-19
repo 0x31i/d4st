@@ -85,7 +85,7 @@ def probe_reflection(url: str, body: str, cookie: str = "", *, timeout: float = 
 
     out: list[dict] = []
     canary = "d4stRX9z1q"          # distinctive, harmless marker
-    from .safety import browser_headers
+    from .safety import browser_headers, is_excluded_send
     hdrs = browser_headers({"Cookie": cookie} if cookie else None)
     forms = _parse_forms(body)
     with httpx.Client(verify=False, follow_redirects=True, timeout=timeout) as c:
@@ -97,6 +97,14 @@ def probe_reflection(url: str, body: str, cookie: str = "", *, timeout: float = 
                 continue
             data = {n: (canary if t in _TEXTY or t == "password" else "1") for n, t in fields}
             action = urljoin(url, f["action"] or "")
+            # D4ST_EXCLUDE_PATHS carve-out: NEVER submit a form whose action is an excluded path
+            # (this is the exact create-capture-form submission the gate exists to prevent). Gate
+            # BOTH the resolved action AND the page it lives on, before any request fires.
+            if is_excluded_send(action) or is_excluded_send(url):
+                from urllib.parse import urlsplit as _us
+                print(f"[safety] EXCLUDED {f['method'].upper()} {_us(action).path} — matched "
+                      f"D4ST_EXCLUDE_PATHS (form submission refused)", flush=True)
+                continue
             try:
                 if f["method"] == "post":
                     r = c.post(action, data=data, headers=hdrs)

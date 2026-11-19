@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import posixpath
 import re
 import time
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 # URL patterns we must NOT actively test (submitting payloads/failed logins here locks
 # accounts or logs the scanner out).
@@ -114,22 +115,42 @@ def auth_endpoint_safe_to_test(url: str, method: str = "GET", params=None) -> bo
 # of fuzz_forms. An empty / unset env is exactly today's behavior (no regression).
 #
 # PATTERN FORMAT (D4ST_EXCLUDE_PATHS): a comma-separated list; each item is matched against the
-# URL *path* (case-insensitively) in one of three ways:
-#   * ``re:<regex>``  — a Python regex, applied with re.search (matches anywhere in the path).
-#   * a glob with ``*`` / ``?`` / ``[seq]`` metacharacters — matched against the whole path with
-#     fnmatch (e.g. ``/api/capture*`` matches /api/capture, /api/captures, /api/capture/new).
-#   * a plain string (no metacharacters) — matched as a case-insensitive SUBSTRING of the path
-#     (e.g. ``/capture`` matches /api/v2/capture/new). Chosen to over-match rather than under-match,
-#     because this is a safety gate: a miss leaks an intrusive request, a false include only
-#     declines to attack a path.
-# A malformed ``re:`` pattern is skipped (the remaining patterns still apply) so one typo can never
-# silently disable the whole carve-out.
+# URL *path AND query string* (case-insensitively — so a router that dispatches on ``?do=capture``
+# is covered) in one of three ways:
+#   * ``re:<regex>``  — a Python regex, applied with re.search (matches anywhere in path+query).
+#   * a glob with ``*`` / ``?`` / ``[seq]`` metacharacters — matched against path+query with fnmatch
+#     (e.g. ``/api/*/capture*`` matches /api/v2/capture, ``*capture*`` matches anything with capture).
+#   * a plain string (no metacharacters) — matched as a case-insensitive SUBSTRING of path+query
+#     (e.g. ``/capture`` matches /api/v2/capture/new; ``do=capture`` matches ?do=capture). Chosen to
+#     over-match rather than under-match: this is a safety gate, so a miss leaks an intrusive
+#     request while a false include only declines to attack a path.
+# Matching is done against SEVERAL normalized views of the URL so encoding tricks cannot slip past:
+# the raw path+query, the PERCENT-DECODED path+query (so ``/api%2Fcapture`` is caught), and the
+# dot-segment-collapsed decoded path. Any view matching any pattern = excluded.
+#
+# FAIL-CLOSED: if D4ST_EXCLUDE_PATHS is set and ANY ``re:`` pattern fails to compile, construction
+# RAISES ExcludeConfigError — the run must ABORT with a clear error rather than silently drop the
+# bad pattern and run with the intended paths fully attackable. A typo halts; it never disables.
+
+
+class ExcludeConfigError(ValueError):
+    """Raised when D4ST_EXCLUDE_PATHS contains an uncompilable pattern — the run must fail closed."""
+
+
+class ExcludedPathError(Exception):
+    """Raised by the guarded-send chokepoint when a caller tries to send to an excluded path."""
+
+    def __init__(self, url: str, method: str = ""):
+        self.url = url
+        self.method = method
+        super().__init__(f"refused excluded request: {method} {url}".strip())
 
 
 class ExcludePathMatcher:
     """Compiled D4ST_EXCLUDE_PATHS matcher. Cheap to query (precompiled); ``bool(matcher)`` is
     False when no patterns are configured so callers can skip the check entirely (zero overhead /
-    zero behavior change when the env is unset)."""
+    zero behavior change when the env is unset). Matches on path AND query, over several normalized
+    views (raw / percent-decoded / dot-collapsed). Fails closed on an uncompilable ``re:`` pattern."""
 
     def __init__(self, raw: str | None = ""):
         self.raw = raw or ""
@@ -141,9 +162,12 @@ class ExcludePathMatcher:
             if item.lower().startswith("re:"):
                 try:
                     self._regexes.append(re.compile(item[3:], re.IGNORECASE))
-                except re.error:
-                    # one bad regex must not disable the rest of the carve-out
-                    continue
+                except re.error as exc:
+                    # FAIL-CLOSED: a bad regex must abort the run, never silently run unprotected.
+                    raise ExcludeConfigError(
+                        f"D4ST_EXCLUDE_PATHS: invalid regex pattern {item!r}: {exc}. Refusing to "
+                        f"run (fail-closed) so the intended paths are not left attackable — fix the "
+                        f"pattern or remove it.") from exc
             elif any(c in item for c in "*?["):
                 self._globs.append(item.lower())
             else:
@@ -153,26 +177,38 @@ class ExcludePathMatcher:
         return bool(self._substrings or self._globs or self._regexes)
 
     @staticmethod
-    def _path(url: str) -> str:
+    def _views(url: str) -> list[str]:
+        """Normalized path+query views of `url` to match against — raw, percent-decoded, and the
+        dot-segment-collapsed decoded path. Over-match on purpose (safety gate)."""
         try:
-            return urlsplit(url or "").path or (url or "")
+            sp = urlsplit(url or "")
+            raw_path = sp.path or (url or "")
+            raw_pq = raw_path + (("?" + sp.query) if sp.query else "")
+            dec_path = unquote(raw_path)
+            dec_pq = unquote(raw_pq)
+            # collapse ./ and ../ in the decoded path so /a/../capture can't hide the segment
+            try:
+                norm = posixpath.normpath(dec_path)
+            except Exception:  # noqa: BLE001
+                norm = dec_path
+            return list({raw_path, raw_pq, dec_path, dec_pq, norm})
         except Exception:  # noqa: BLE001 - never let a weird URL crash the safety gate
-            return url or ""
+            return [url or ""]
 
     def matches(self, url: str) -> bool:
-        """True if the URL's path matches ANY configured exclude pattern."""
+        """True if ANY normalized view of the URL (path+query) matches ANY exclude pattern."""
         if not self:
             return False
-        path = self._path(url)
-        low = path.lower()
+        views = self._views(url)
+        lows = [v.lower() for v in views]
         for s in self._substrings:
-            if s in low:
+            if any(s in v for v in lows):
                 return True
         for g in self._globs:
-            if fnmatch.fnmatch(low, g):
+            if any(fnmatch.fnmatch(v, g) for v in lows):
                 return True
         for rx in self._regexes:
-            if rx.search(path):
+            if any(rx.search(v) for v in views):
                 return True
         return False
 
@@ -218,13 +254,55 @@ def set_exclude_matcher(matcher_or_raw) -> ExcludePathMatcher:
 
 
 def reload_exclude_matcher_from_env() -> ExcludePathMatcher:
-    """Rebuild + install the active matcher from D4ST_EXCLUDE_PATHS in the current environment."""
-    return set_exclude_matcher(os.environ.get("D4ST_EXCLUDE_PATHS", ""))
+    """Rebuild + install the active matcher from D4ST_EXCLUDE_PATHS.
+
+    If the env var is PRESENT (even empty) it is authoritative and installed. If it is ABSENT, the
+    currently-active matcher is KEPT — so a matcher installed programmatically via Config/
+    set_exclude_matcher is never silently wiped by an env-less call (single source of truth, no
+    latent fail-open). Raises ExcludeConfigError if a configured pattern is uncompilable."""
+    raw = os.environ.get("D4ST_EXCLUDE_PATHS")
+    if raw is None:
+        return _ACTIVE_EXCLUDE
+    return set_exclude_matcher(raw)
 
 
 def is_path_excluded(url: str) -> bool:
-    """True if `url`'s path matches the active D4ST_EXCLUDE_PATHS carve-out."""
+    """True if `url`'s path/query matches the active D4ST_EXCLUDE_PATHS carve-out."""
     return _ACTIVE_EXCLUDE.matches(url)
+
+
+# ---- guarded-send chokepoint: the single backstop every active/intrusive dispatcher routes through.
+def is_excluded_send(url: str) -> bool:
+    """True if sending an ACTIVE/intrusive request to `url` is forbidden by the carve-out. Blocks
+    ALL methods including a parameterized GET (a GET to a side-effecting capture endpoint still
+    fires the side effect). Passive discovery crawlers must NOT use this (they may plain-GET
+    excluded paths so they appear in the sitemap); it is only for attack/mutation sends."""
+    return _ACTIVE_EXCLUDE.matches(url)
+
+
+def assert_not_excluded(url: str, method: str = "GET") -> None:
+    """Chokepoint for callers that send one request at a time: refuse (loud log + raise
+    ExcludedPathError) when `url` is excluded. Fail-closed for intrusive senders."""
+    if _ACTIVE_EXCLUDE.matches(url):
+        print(f"[safety] EXCLUDED {(method or 'GET').upper()} {urlsplit(url).path} — matched "
+              f"D4ST_EXCLUDE_PATHS (refused by guarded-send chokepoint)", flush=True)
+        raise ExcludedPathError(url, method)
+
+
+def filter_excluded(urls, *, label: str = "active testing") -> list:
+    """Drop every excluded URL from an active/intrusive frontier, logging each withheld path. The
+    standard way an intrusive dispatcher sanitizes an incoming URL list (backstop even when the
+    caller already filtered). No-op (returns a list copy) when no carve-out is configured."""
+    if not _ACTIVE_EXCLUDE:
+        return list(urls)
+    out = []
+    for u in urls:
+        if _ACTIVE_EXCLUDE.matches(u):
+            print(f"[safety] EXCLUDED {urlsplit(u).path} — matched D4ST_EXCLUDE_PATHS "
+                  f"(withheld from {label})", flush=True)
+        else:
+            out.append(u)
+    return out
 
 
 # URL patterns that perform DESTRUCTIVE or NOTIFYING actions. Actively fuzzing these on real

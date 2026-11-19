@@ -22,12 +22,14 @@ from d4st.config import Config
 
 @pytest.fixture(autouse=True)
 def _clean_exclude_env(monkeypatch):
-    """Each test starts from a known-clean exclude state and restores the module matcher after."""
+    """Each test starts from a known-clean exclude state and restores it after. The active matcher
+    is reset EXPLICITLY (reload-from-env keeps the current matcher when the env var is absent, by
+    design — so a programmatic Config install is never silently wiped; tests must reset by hand)."""
     monkeypatch.delenv("D4ST_EXCLUDE_PATHS", raising=False)
-    S.reload_exclude_matcher_from_env()
+    S.set_exclude_matcher("")
     yield
     monkeypatch.delenv("D4ST_EXCLUDE_PATHS", raising=False)
-    S.reload_exclude_matcher_from_env()
+    S.set_exclude_matcher("")
 
 
 # --------------------------------------------------------------------------- matcher format ----
@@ -53,10 +55,37 @@ def test_matcher_empty_is_falsy_and_matches_nothing():
     assert not m.matches("http://t/anything/at/all")
 
 
-def test_matcher_bad_regex_does_not_disable_rest():
-    # a malformed re: pattern is skipped; the good substring still applies
-    m = S.ExcludePathMatcher("re:[unterminated,/capture")
-    assert m.matches("http://t/capture")
+def test_matcher_bad_regex_fails_closed():
+    # FAIL-CLOSED: a malformed re: pattern must ABORT (raise), never silently run unprotected.
+    with pytest.raises(S.ExcludeConfigError):
+        S.ExcludePathMatcher("re:[unterminated,/capture")
+    # and a bad pattern in the env aborts get_policy() too (the run cannot proceed)
+    with pytest.raises(S.ExcludeConfigError):
+        S.set_exclude_matcher("re:(unbalanced")
+
+
+def test_matcher_inspects_path_and_query_and_decodes():
+    m = S.ExcludePathMatcher("/capture")
+    # percent-encoded separators must not slip past (%2F -> /)
+    assert m.matches("http://t/api%2Fcapture/new")
+    # match against the QUERY STRING, not just the path
+    assert m.matches("http://t/index.php?next=/capture")
+    # dot-segments collapsed
+    assert m.matches("http://t/a/b/../../capture")
+    # query-routed action: an app dispatching on ?do=capture
+    mq = S.ExcludePathMatcher("re:[?&]do=capture")
+    assert mq.matches("http://t/index?do=capture")
+    assert mq.matches("http://t/index?x=1&do=capture&y=2")
+    assert not mq.matches("http://t/index?do=list")
+
+
+def test_matcher_glob_whole_path_and_star_both_ends():
+    # a glob matches the WHOLE path+query, so /api/*/capture* needs a middle segment ...
+    assert not S.ExcludePathMatcher("/api/*/capture*").matches("http://t/api/capture")
+    assert S.ExcludePathMatcher("/api/*/capture*").matches("http://t/api/v2/capture/new")
+    # ... while *capture* catches both
+    g = S.ExcludePathMatcher("*capture*")
+    assert g.matches("http://t/api/capture") and g.matches("http://t/api/v2/capture/new")
 
 
 # ------------------------------------------------- (a) is_write_action rejects excluded paths ---
@@ -158,10 +187,50 @@ class _FakeResp:
         return {}
 
 
+class _FakeClient:
+    """Stand-in for httpx.Client (used by the active-depth dispatchers + formchecks as a context
+    manager): records every request to the shared attempts list and never touches the network."""
+    def __init__(self, attempts, *a, **kw):
+        self._attempts = attempts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def request(self, method, url, *a, **kw):
+        self._attempts.append((str(method).upper(), url))
+        return _FakeResp(url)
+
+    def get(self, url, *a, **kw):
+        self._attempts.append(("GET", url))
+        return _FakeResp(url)
+
+    def post(self, url, *a, **kw):
+        self._attempts.append(("POST", url))
+        return _FakeResp(url)
+
+    def put(self, url, *a, **kw):
+        self._attempts.append(("PUT", url))
+        return _FakeResp(url)
+
+
+class _FakeSession:
+    """Minimal auth Session stand-in for the active-depth dispatchers."""
+    def __init__(self):
+        self.headers = {}
+        self.session_storage = {"token": "x"}
+
+    def cookie_header(self, _base=""):
+        return ""
+
+
 @pytest.fixture
 def _record_http(monkeypatch):
-    """Monkeypatch every httpx entrypoint the engine uses to RECORD (method, url) and return a
-    benign fake response. Purely in-process — asserts there is no real/external egress."""
+    """Monkeypatch every httpx entrypoint the engine uses (module-level get/post/put/request AND
+    httpx.Client) to RECORD (method, url) and return a benign fake response. Purely in-process —
+    the tests assert there is no real/external egress."""
     import httpx
     attempts: list[tuple[str, str]] = []
 
@@ -179,6 +248,7 @@ def _record_http(monkeypatch):
     monkeypatch.setattr(httpx, "post", _mk("POST"))
     monkeypatch.setattr(httpx, "put", _mk("PUT"))
     monkeypatch.setattr(httpx, "request", _request)
+    monkeypatch.setattr(httpx, "Client", lambda *a, **kw: _FakeClient(attempts, *a, **kw))
     return attempts
 
 
@@ -231,3 +301,129 @@ def test_canary_without_exclude_both_forms_submitted(monkeypatch, _record_http):
     paths = {urlsplit(u).path for (_m, u) in _record_http}
     assert any(p.startswith("/api/captures") for p in paths)
     assert any(p.startswith("/app/comment") for p in paths)
+
+
+# =============================================================================================
+# ADVERSARIAL CANARIES — ported from the reviewer PoCs. Each previously-leaking dispatcher is run
+# under the aggressive policy against a fixture with ONE excluded parameterized URL + one allowed
+# one; the HTTP sender is recorded and we assert ZERO requests ever reach the excluded path.
+# =============================================================================================
+EXCL = "http://fixture.local/api/captures/create?target_url=http://evil.example"
+ALLOW = "http://fixture.local/api/items/search?q=1"
+
+
+def _hits(attempts, path_prefix):
+    return [(m, u) for (m, u) in attempts if urlsplit(u).path.startswith(path_prefix)]
+
+
+def _arm_aggressive(monkeypatch):
+    monkeypatch.setenv("D4ST_EXCLUDE_PATHS", "/api/captures")
+    pol = S.get_policy("aggressive")   # installs active matcher; proves precedence over aggressive
+    assert pol.name == "aggressive" and pol.exclude_paths.matches(EXCL)
+    return pol
+
+
+def test_canary_active_depth_suite_never_hits_excluded(monkeypatch, _record_http):
+    """run_host_header_injection / cspp / cache_poisoning / nosql / ldap / transformation / hpp /
+    reflection / xpath — each over a frontier containing the excluded URL → ZERO requests to it."""
+    import d4st.activetests as A
+    _arm_aggressive(monkeypatch)
+    sess = _FakeSession()
+    base = "http://fixture.local/"
+    urls = [EXCL, ALLOW]
+    dispatchers = [
+        A.run_host_header_injection, A.run_cspp_checks, A.run_cache_poisoning_checks,
+        A.run_nosql_checks, A.run_ldap_checks, A.run_transformation_checks, A.run_hpp_checks,
+        A.run_reflection_checks, A.run_xpath_checks, A.run_cors_checks, A.run_verb_tampering,
+    ]
+    for fn in dispatchers:
+        try:
+            fn(sess, base, urls, delay=0.0)
+        except Exception as exc:  # noqa: BLE001 - a dispatcher may no-op on the fake, that's fine
+            assert "excluded" not in str(exc).lower()
+    leaked = _hits(_record_http, "/api/captures")
+    assert leaked == [], f"active-depth suite LEAKED to excluded path: {leaked}"
+    # NON-VACUOUS: the allowed URL WAS probed (so the recorder is actually intercepting and the
+    # 'zero to excluded' result is a real carve-out, not a dead no-op).
+    assert _hits(_record_http, "/api/items"), "no requests recorded at all — canary is vacuous"
+    # and the fake stayed purely local (no external egress)
+    assert all(urlsplit(u).hostname == "fixture.local" for (_m, u) in _record_http)
+
+
+def test_canary_formsec_probe_reflection_does_not_submit_excluded(monkeypatch, _record_http):
+    """formchecks.probe_reflection on HTML whose form action is excluded → no POST to it."""
+    from d4st.formchecks import probe_reflection
+    _arm_aggressive(monkeypatch)
+    html = (
+        '<form method="post" action="/api/captures/create">'
+        '<input name="target_url" type="text"></form>'
+        '<form method="post" action="/api/items/add">'
+        '<input name="body" type="text"></form>'
+    )
+    probe_reflection("http://fixture.local/page", html, cookie="")
+    assert _hits(_record_http, "/api/captures") == [], "formsec LEAKED a submit to excluded action"
+    # the allowed form WAS submitted (no over-block)
+    assert _hits(_record_http, "/api/items"), "formsec over-blocked the allowed form"
+
+
+def test_canary_api_authz_tests_no_write_to_excluded(monkeypatch, _record_http):
+    """run_api_authz_tests given an OpenAPI schema with a create + {id} write on an excluded path →
+    no POST/PUT/PATCH write fired at the excluded path (registration + BOLA loops both guarded)."""
+    import httpx
+
+    def _body(props):
+        schema_props = {p: {"type": "string"} for p in props}
+        return {"requestBody": {"content": {"application/json": {"schema": {"properties": schema_props}}}}}
+
+    schema = {
+        "servers": [{"url": "http://fixture.local/"}],
+        "paths": {
+            "/api/captures/create": {"post": _body(["username", "password"])},
+            "/api/captures/{id}": {"put": _body(["name"]), "get": {}},
+            "/api/users": {"get": {}},
+        },
+    }
+    # make the schema fetch return our spec, everything else benign (recorded)
+    def _get(url, *a, **kw):
+        _record_http.append(("GET", url))
+        r = _FakeResp(url)
+        r.json = lambda: schema if url.endswith("openapi.json") else {}
+        return r
+    monkeypatch.setattr(httpx, "get", _get)
+    _arm_aggressive(monkeypatch)
+
+    E.run_api_authz_tests("http://fixture.local/openapi.json", cookie="", fuzz_forms=True)
+    writes_to_excluded = [(m, u) for (m, u) in _record_http
+                          if m in ("POST", "PUT", "PATCH") and "/api/captures" in urlsplit(u).path]
+    assert writes_to_excluded == [], f"api-authz LEAKED a write to excluded path: {writes_to_excluded}"
+
+
+def test_canary_authz_matrix_never_hits_excluded(monkeypatch, _record_http):
+    """Two-account BOLA matrix over a frontier with the excluded URL → ZERO requests to it."""
+    from d4st.auth.authz import run_authz_matrix
+    _arm_aggressive(monkeypatch)
+    sa, sb = _FakeSession(), _FakeSession()
+    try:
+        run_authz_matrix(sa, sb, "http://fixture.local/", [EXCL, ALLOW], delay=0.0)
+    except Exception:  # noqa: BLE001,S110 - fake session may short-circuit; we only assert on sends
+        pass
+    assert _hits(_record_http, "/api/captures") == [], "authz-matrix LEAKED to excluded path"
+
+
+def test_jwt_and_ws_receive_exclude_filtered_frontier():
+    """JWT/WS engines are fed the exclude-filtered frontier by the engine; prove the filter removes
+    the excluded URL from exactly the list they receive (safety.filter_excluded)."""
+    S.set_exclude_matcher("/api/captures")
+    frontier = S.filter_excluded([EXCL, ALLOW], label="jwt/ws")
+    assert EXCL not in frontier and ALLOW in frontier
+
+
+def test_config_programmatic_install_enforces(monkeypatch):
+    """Reconciled Config: building Config(exclude_paths=...) WITHOUT the env var still installs the
+    active matcher, so the engine's policy-less gates enforce it (no latent fail-open)."""
+    monkeypatch.delenv("D4ST_EXCLUDE_PATHS", raising=False)
+    S.set_exclude_matcher("")
+    assert not S.is_path_excluded(EXCL)
+    Config(exclude_paths=["/api/captures"])          # __post_init__ installs it
+    assert S.is_path_excluded(EXCL)
+    assert S.is_write_action(EXCL, "GET") is True     # free-function gate now enforces it

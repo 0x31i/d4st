@@ -476,7 +476,7 @@ def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[
     targets), never production-safe. Uses the current auth header (set_auth_header) as the acting
     identity. Best-effort + isolated: any failure yields fewer findings, never a crash."""
     import httpx
-    from .safety import is_auth_endpoint, is_state_changing
+    from .safety import is_auth_endpoint, is_excluded_send, is_state_changing
     out: list[Finding] = []
     if not fuzz_forms:
         return out
@@ -583,6 +583,11 @@ def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[
         body = {p: (uname if ("user" in p.lower() or "name" in p.lower()) else _sample_value(p, uname))
                 for p in props}
         body.update({"admin": True, "is_admin": True, "role": "admin"})
+        # D4ST_EXCLUDE_PATHS carve-out: never fire the registration WRITE at an excluded path.
+        if is_excluded_send(_url(path)):
+            print(f"[safety] EXCLUDED POST {urlsplit(_url(path)).path} — matched D4ST_EXCLUDE_PATHS "
+                  f"(api-authz registration skipped)", flush=True)
+            continue
         try:
             httpx.request("POST", _url(path), json=body, headers=_base_headers(cookie), timeout=12)
         except Exception:  # noqa: BLE001,S112
@@ -633,6 +638,12 @@ def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[
             body = {p: _sample_value(p) for p in props} if props else None
             for oid in others:
                 target_url = base + "/" + re.sub(r'\{[^}]+\}', str(oid), str(path)).lstrip("/")
+                # D4ST_EXCLUDE_PATHS carve-out: never fire the BOLA PUT/PATCH write at an excluded
+                # path (checked per concrete target URL, path+query aware).
+                if is_excluded_send(target_url):
+                    print(f"[safety] EXCLUDED {method.upper()} {urlsplit(target_url).path} — "
+                          f"matched D4ST_EXCLUDE_PATHS (api-authz BOLA skipped)", flush=True)
+                    continue
                 try:
                     r = httpx.request(method.upper(), target_url, json=body,
                                       headers=_base_headers(cookie), timeout=12,
@@ -2736,6 +2747,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     NEVER actively tested under any profile, so the scan cannot lock accounts."""
     from .dom import dom_probe
     from .passive import passive_scan
+    from .safety import filter_excluded as safety_filter_excluded
     from .safety import get_policy, is_auth_endpoint, is_state_changing
 
     # Keep the live console readable: the target's self-signed/mismatched cert otherwise floods the
@@ -3203,29 +3215,34 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                         evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
                 return out
 
+            # D4ST_EXCLUDE_PATHS carve-out: EVERY intrusive active-depth stage below (JWT replay,
+            # verb/method tampering a.k.a. BFLA, CORS, host-header, CSPP, XPath/NoSQL/LDAP/HPP,
+            # cache-poisoning, backup probe, reflection/transformation, form-sec, API-exposure,
+            # WebSocket, two-account BOLA matrix, DOM-XSS) is fed this exclude-FILTERED frontier
+            # instead of the raw sitemap `urls`. Independent of policy — wins over `aggressive`.
+            # `urls` itself stays intact so passive/report coverage still MAPS the excluded paths;
+            # only active/intrusive SENDS are withheld. The activetests dispatchers also re-filter
+            # internally (safety.filter_excluded) as a fail-closed backstop, so a raw-urls caller
+            # can never leak. "read-only GET" is NOT a safety argument for an excluded endpoint — a
+            # parameterized GET to a capture endpoint still fires its external side effect.
+            _active_urls = safety_filter_excluded(urls, label="active-depth suite")
+            if len(_active_urls) != len(urls):
+                print(f"[safety] D4ST_EXCLUDE_PATHS withheld {len(urls) - len(_active_urls)} URL(s) "
+                      f"from the intrusive active-depth suite", flush=True)
+
             # JWT attack suite — forge alg:none / sig-strip / weak-secret and replay vs a live oracle.
             # Needs a captured token, so it is authenticated-only (self-skips in unauth-deep mode).
             if session is not None:
                 _refresh_jwt("jwt-attacks")
                 try:
                     from .jwtattacks import run_jwt_attacks
-                    _jw = run_jwt_attacks(session, target, urls, delay=_base_delay, throttle=_thr)
+                    _jw = run_jwt_attacks(session, target, _active_urls, delay=_base_delay, throttle=_thr)
                     findings += _as_findings(_jw, "jwt")
                     if _jw:
                         print(f"[jwt] {len(_jw)} token-integrity finding(s) (forged-token replay)", flush=True)
                 except Exception as _je:  # noqa: BLE001
                     print(f"[jwt] skipped: {_je}", flush=True)
                 _prog.update("jwt-attacks", findings, urls=len(urls), targets=len(targets))
-
-            # D4ST_EXCLUDE_PATHS carve-out: the intrusive active-depth stages (method/verb tampering
-            # a.k.a. BFLA, which can fire write methods) must never hit an excluded path. Build an
-            # exclude-filtered URL frontier for them — independent of policy, wins over `aggressive`.
-            # `urls` itself (the sitemap) is left intact so passive/report coverage still maps them.
-            _active_urls = ([u for u in urls if not policy.exclude_paths.matches(u)]
-                            if policy.exclude_paths else urls)
-            if policy.exclude_paths and len(_active_urls) != len(urls):
-                print(f"[safety] D4ST_EXCLUDE_PATHS withheld {len(urls) - len(_active_urls)} URL(s) "
-                      f"from the intrusive active-depth suite (verb/method tampering etc.)", flush=True)
 
             # Verb / method tampering (BFLA) — SAFE read-only methods by default
             try:
@@ -3241,7 +3258,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             # CORS exploitability — reflected-Origin + credentials => verified exploitable/benign
             try:
                 from .activetests import run_cors_checks
-                _co = run_cors_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                _co = run_cors_checks(session, target, _active_urls, delay=_base_delay, throttle=_thr)
                 findings += _as_findings(_co, "cors")
                 if _co:
                     print(f"[cors] {len(_co)} CORS finding(s) (exploitability-verified)", flush=True)
@@ -3252,7 +3269,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             # Host-header injection (password-reset/cache poisoning / routing SSRF)
             try:
                 from .activetests import run_host_header_injection
-                _hh = run_host_header_injection(session, target, urls, delay=_base_delay, throttle=_thr)
+                _hh = run_host_header_injection(session, target, _active_urls, delay=_base_delay, throttle=_thr)
                 findings += _as_findings(_hh, "hostheader")
                 if _hh:
                     print(f"[hostheader] {len(_hh)} host-header-injection finding(s)", flush=True)
@@ -3264,7 +3281,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             # injected parameter into a page link/form URL (Burp-parity, near-zero FP).
             try:
                 from .activetests import run_cspp_checks
-                _cp = run_cspp_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                _cp = run_cspp_checks(session, target, _active_urls, delay=_base_delay, throttle=_thr)
                 findings += _as_findings(_cp, "cspp")
                 if _cp:
                     print(f"[cspp] {len(_cp)} client-side param-pollution finding(s)", flush=True)
@@ -3276,7 +3293,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             # extraction), auth endpoints skipped. Closes the XPath gap vs Burp with low FP.
             try:
                 from .activetests import run_xpath_checks
-                _xp = run_xpath_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                _xp = run_xpath_checks(session, target, _active_urls, delay=_base_delay, throttle=_thr)
                 findings += _as_findings(_xp, "xpath")
                 if _xp:
                     print(f"[xpath] {len(_xp)} XPath-injection finding(s)", flush=True)
@@ -3289,7 +3306,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             # ever touched (we only poison + read our own key).
             try:
                 from .activetests import run_cache_poisoning_checks
-                _wc = run_cache_poisoning_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                _wc = run_cache_poisoning_checks(session, target, _active_urls, delay=_base_delay, throttle=_thr)
                 findings += _as_findings(_wc, "cache-poison")
                 if _wc:
                     print(f"[cache-poison] {len(_wc)} web-cache-poisoning finding(s)", flush=True)
@@ -3304,7 +3321,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 try:
                     import importlib
                     _fn = getattr(importlib.import_module("d4st.activetests"), _pfn)
-                    _pr = _fn(session, target, urls, delay=_base_delay, throttle=_thr)
+                    _pr = _fn(session, target, _active_urls, delay=_base_delay, throttle=_thr)
                     findings += _as_findings(_pr, _pname)
                     if _pr:
                         print(f"[{_pname}] {len(_pr)} finding(s)", flush=True)
@@ -3316,7 +3333,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             # with a catch-all/soft-404 guard so we don't inherit phantom "backup file" FPs.
             try:
                 from .activetests import run_backup_scan
-                _bk = run_backup_scan(session, target, urls, delay=_base_delay, throttle=_thr)
+                _bk = run_backup_scan(session, target, _active_urls, delay=_base_delay, throttle=_thr)
                 findings += _as_findings(_bk, "backup")
                 if _bk:
                     print(f"[backup] {len(_bk)} backup/temp file exposure(s)", flush=True)
@@ -3328,7 +3345,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             # classifies JS/attribute/HTML context. The XSS/injection precursor.
             try:
                 from .activetests import run_reflection_checks
-                _rf = run_reflection_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                _rf = run_reflection_checks(session, target, _active_urls, delay=_base_delay, throttle=_thr)
                 findings += _as_findings(_rf, "reflection")
                 if _rf:
                     print(f"[reflect] {len(_rf)} reflected-input point(s)", flush=True)
@@ -3340,7 +3357,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             # transformation (SQL/JS string-context tell). Marker-anchored, near-zero FP.
             try:
                 from .activetests import run_transformation_checks
-                _xf = run_transformation_checks(session, target, urls, delay=_base_delay, throttle=_thr)
+                _xf = run_transformation_checks(session, target, _active_urls, delay=_base_delay, throttle=_thr)
                 findings += _as_findings(_xf, "transform")
                 if _xf:
                     print(f"[transform] {len(_xf)} suspicious-input-transformation finding(s)", flush=True)
@@ -3354,7 +3371,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             # at its true severity instead of a low-confidence PII line.
             try:
                 from .apiexposure import scan_api_exposure
-                _ax = scan_api_exposure(urls, cookie, authed=bool(cookie))
+                _ax = scan_api_exposure(_active_urls, cookie, authed=bool(cookie))
                 for _d in _ax:
                     findings.append(Finding(
                         tool="api-exposure", category=_d["category"], url=_d["url"],
@@ -3363,7 +3380,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                         evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
                 # Always report (even 0) — a permanent, watchable check: a silent "0 swept" would be
                 # visible instead of a detector that quietly stopped running.
-                _apic = sum(1 for u in urls if "/api/" in u.lower())
+                _apic = sum(1 for u in _active_urls if "/api/" in u.lower())
                 print(f"[api-exposure] swept {_apic} API endpoint(s) unauthenticated; "
                       f"{len(_ax)} bulk/credential data-exposure finding(s)", flush=True)
             except Exception as _axe:  # noqa: BLE001
@@ -3377,7 +3394,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             try:
                 import httpx as _httpx
                 from .formchecks import analyze_forms, probe_reflection
-                _html_urls = [u for u in urls if not u.split("?")[0].lower().endswith(
+                _html_urls = [u for u in _active_urls if not u.split("?")[0].lower().endswith(
                     (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff",
                      ".woff2", ".map", ".pdf", ".json"))][:40]
                 _fm_hdr = {"Cookie": cookie} if cookie else {}
@@ -3416,7 +3433,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             if session is not None:
                 try:
                     from .wstests import run_ws_tests
-                    _ws = run_ws_tests(session, target, urls, js_dir=_js_dir, delay=_base_delay, throttle=_thr)
+                    _ws = run_ws_tests(session, target, _active_urls, js_dir=_js_dir, delay=_base_delay, throttle=_thr)
                     findings += _as_findings(_ws, "websocket")
                     if _ws:
                         print(f"[ws] {len(_ws)} SignalR/WebSocket finding(s)", flush=True)
@@ -3435,7 +3452,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                     if _sb is None:
                         import json as _json
                         _sb = _Sess(**_json.load(open(_sb_path)))  # noqa: S506
-                    _mx = run_authz_matrix(session, _sb, target, urls, delay=_base_delay, throttle=_thr)
+                    _mx = run_authz_matrix(session, _sb, target, _active_urls, delay=_base_delay, throttle=_thr)
                     findings += _as_findings(_mx, "authz-matrix")
                     print(f"[authz-matrix] two-account BOLA test: {len(_mx)} cross-account "
                           f"finding(s)", flush=True)
@@ -3537,7 +3554,10 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     if dom and policy.active_scan and not health.halted:
         # Dedup HTML pages by BASE path (dom_probe strips the query and injects its own payloads),
         # so page_params — also keyed by base path — actually matches the lookup below.
-        html_pages = sorted({u.split("#")[0].split("?")[0] for u in urls
+        # D4ST_EXCLUDE_PATHS: dom_probe actively injects payloads into DOM sources, so drop excluded
+        # pages from its frontier (independent of policy; the raw `urls` sitemap stays intact).
+        _dom_src = safety_filter_excluded(urls, label="DOM-XSS probe")
+        html_pages = sorted({u.split("#")[0].split("?")[0] for u in _dom_src
                              if not u.split("?")[0].endswith((".js", ".css", ".png", ".jpg",
                                                               ".svg", ".ico", ".woff", ".map"))})
         # Map discovered params per page for DOM source testing — from injection targets AND directly

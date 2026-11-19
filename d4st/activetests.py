@@ -15,6 +15,7 @@ All read-only unless explicitly opted in; throttled; every finding carries full 
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import time
@@ -23,6 +24,20 @@ from urllib.parse import urlsplit
 from .evidence import curl, exchange, synthetic_exchange
 
 _EVIL_ORIGIN = "https://d4st-cors-probe.example.org"
+
+
+def _exclude_guard(fn):
+    """FAIL-CLOSED backstop: filter the incoming `urls` frontier through the active
+    D4ST_EXCLUDE_PATHS matcher before ANY active/intrusive dispatcher runs, so a matching path can
+    never be sent an attack/tamper request even if a caller passes the raw sitemap. Independent of
+    the scan policy — wins over `aggressive`. Every run_* dispatcher in this module is wrapped.
+    (The discovery crawler does NOT use these functions, so passive GET mapping is unaffected.)"""
+    @functools.wraps(fn)
+    def _wrapped(session, base, urls, *args, **kwargs):
+        from .safety import filter_excluded
+        return fn(session, base, filter_excluded(list(urls or []), label=fn.__name__),
+                  *args, **kwargs)
+    return _wrapped
 
 
 def _auth_header_name(session) -> str:
@@ -46,6 +61,7 @@ def _authed_headers(session, base: str) -> dict:
 
 
 # ---------------------------------------------------------------- CORS ----
+@_exclude_guard
 def run_cors_checks(session, base: str, urls: list[str], *,
                     delay: float = 0.15, timeout: float = 12.0, max_urls: int = 25,
                     throttle=None) -> list[dict]:
@@ -132,6 +148,7 @@ _CASE_VARIANTS = ["Get", "GET ", "get"]   # verb-tampering auth-bypass (filter o
 _WRITE_METHODS = ["POST", "PUT", "PATCH", "DELETE"]
 
 
+@_exclude_guard
 def run_verb_tampering(session, base: str, urls: list[str], *,
                        delay: float = 0.2, timeout: float = 12.0, max_endpoints: int = 120,
                        throttle=None) -> list[dict]:
@@ -262,6 +279,7 @@ def run_verb_tampering(session, base: str, urls: list[str], *,
 _HHI_HOST = "d4st-hhi-probe.example.org"
 
 
+@_exclude_guard
 def run_host_header_injection(session, base: str, urls: list[str], *,
                               delay: float = 0.2, timeout: float = 12.0, max_urls: int = 25,
                               throttle=None) -> list[dict]:
@@ -311,6 +329,7 @@ def run_host_header_injection(session, base: str, urls: list[str], *,
 _CSPP_MARK = "d4stZ9"
 
 
+@_exclude_guard
 def run_cspp_checks(session, base: str, urls: list[str], *,
                     delay: float = 0.2, timeout: float = 12.0, max_urls: int = 25,
                     throttle=None) -> list[dict]:
@@ -382,6 +401,7 @@ _UNKEYED_HEADERS = (
 )
 
 
+@_exclude_guard
 def run_cache_poisoning_checks(session, base: str, urls: list[str], *,
                                delay: float = 0.2, timeout: float = 12.0, max_urls: int = 20,
                                throttle=None) -> list[dict]:
@@ -471,6 +491,7 @@ _XPATH_ERR = re.compile(
 )
 
 
+@_exclude_guard
 def run_xpath_checks(session, base: str, urls: list[str], *,
                      delay: float = 0.2, timeout: float = 12.0, max_urls: int = 25,
                      max_params: int = 12, throttle=None) -> list[dict]:
@@ -612,6 +633,7 @@ def _finding(category, severity, url, param, detail, resp):
             "repro": curl(resp)}
 
 
+@_exclude_guard
 def run_nosql_checks(session, base, urls, *, delay=0.2, timeout=12.0, max_urls=25,
                      max_params=10, throttle=None) -> list[dict]:
     """NoSQL injection detection (error-based + boolean-operator differential). READ-ONLY GET,
@@ -675,6 +697,7 @@ def run_nosql_checks(session, base, urls, *, delay=0.2, timeout=12.0, max_urls=2
     return findings
 
 
+@_exclude_guard
 def run_ldap_checks(session, base, urls, *, delay=0.2, timeout=12.0, max_urls=25,
                     max_params=10, throttle=None) -> list[dict]:
     """LDAP injection detection (error-based + wildcard differential). READ-ONLY GET,
@@ -737,6 +760,7 @@ def run_ldap_checks(session, base, urls, *, delay=0.2, timeout=12.0, max_urls=25
     return findings
 
 
+@_exclude_guard
 def run_hpp_checks(session, base, urls, *, delay=0.2, timeout=12.0, max_urls=25,
                    max_params=10, throttle=None) -> list[dict]:
     """Server-side HTTP Parameter Pollution detection. READ-ONLY GET, canary-verified, low-FP:
@@ -821,6 +845,7 @@ def _backup_variants(url: str) -> list[str]:
     return out
 
 
+@_exclude_guard
 def run_backup_scan(session, base: str, urls: list[str], *,
                     delay: float = 0.2, timeout: float = 12.0, max_files: int = 30,
                     max_hits: int = 12, throttle=None) -> list[dict]:
@@ -899,6 +924,7 @@ _XFORM_MARK = "d4stX9"
 _XF_A, _XF_B = 419, 823          # distinctive operands; product 344837 is unlikely to occur naturally
 
 
+@_exclude_guard
 def run_transformation_checks(session, base: str, urls: list[str], *,
                               delay: float = 0.2, timeout: float = 12.0, max_urls: int = 25,
                               max_params: int = 4, max_hits: int = 10, throttle=None) -> list[dict]:
@@ -1023,6 +1049,7 @@ def _reflect_context(body: str, token: str) -> str:
     return "html"
 
 
+@_exclude_guard
 def run_reflection_checks(session, base: str, urls: list[str], *,
                           delay: float = 0.2, timeout: float = 12.0, max_urls: int = 30,
                           max_hits: int = 15, throttle=None) -> list[dict]:

@@ -34,11 +34,24 @@ class Config:
     # compiled matcher is exposed via .exclude_matcher.
     exclude_paths: list[str] = field(default_factory=list)
 
+    def __post_init__(self):
+        # SINGLE SOURCE OF TRUTH / no latent fail-open: building ANY Config that carries exclude
+        # patterns INSTALLS them as the engine's active matcher, so a programmatic
+        # ``Config(exclude_paths=[...])`` enforces exactly like the env var does (the engine's
+        # policy-less gates all consult the active matcher). Fails closed on a bad pattern.
+        if self.exclude_paths:
+            from .safety import set_exclude_matcher
+            set_exclude_matcher(",".join(self.exclude_paths))
+
     @property
     def exclude_matcher(self):
-        """The compiled D4ST_EXCLUDE_PATHS matcher (safety.ExcludePathMatcher) for this config."""
-        from .safety import ExcludePathMatcher
-        return ExcludePathMatcher(",".join(self.exclude_paths))
+        """The compiled D4ST_EXCLUDE_PATHS matcher for this config — the SAME object the engine
+        enforces with (installed as the active matcher by __post_init__), not a dead parallel copy.
+        When this config carries no patterns, returns the currently-active matcher."""
+        from .safety import ExcludePathMatcher, get_exclude_matcher, set_exclude_matcher
+        if self.exclude_paths:
+            return set_exclude_matcher(ExcludePathMatcher(",".join(self.exclude_paths)))
+        return get_exclude_matcher()
 
     @classmethod
     def from_env(cls) -> Config:

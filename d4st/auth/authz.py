@@ -86,8 +86,8 @@ def run_authz(session: Session, base: str, urls: list[str], *,
     """Return a list of authorization findings (dicts). Read-only; throttled by `delay`."""
     import httpx
 
-    from ..safety import pace
-
+    from ..safety import filter_excluded, pace
+    urls = filter_excluded(list(urls or []), label="authz replay")  # D4ST_EXCLUDE_PATHS backstop
     origin = f"{urlsplit(base).scheme}://{urlsplit(base).netloc}"
     api = [u for u in urls if u.startswith(origin) and "/api/" in u.lower()][:max_endpoints]
     if not api:
@@ -294,8 +294,8 @@ def run_authz_matrix(session_a: Session, session_b: Session, base: str, urls: li
     accounts. The proof is the contrast: A's token -> A's data, B's token -> the SAME data."""
     import httpx
 
-    from ..safety import pace
-
+    from ..safety import filter_excluded, pace
+    urls = filter_excluded(list(urls or []), label="authz matrix")  # D4ST_EXCLUDE_PATHS backstop
     origin = f"{urlsplit(base).scheme}://{urlsplit(base).netloc}"
     api = [u for u in urls if u.startswith(origin) and "/api/" in u.lower()][:max_endpoints]
     if not api:
