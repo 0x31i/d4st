@@ -72,6 +72,19 @@ def launch(workflow: str, target: str, session_path: str | None,
     cfg = Config.from_env()  # also carries the session-validity MODE (rendered | basic-auth | both)
     spec = load_workflow(workflow)
 
+    # FINDING A fix: the basic-auth/both validity modes are SESSION-DRIVEN — they validate the auth
+    # the scanners will actually replay (session.headers). `--session` is optional for `launch`, so
+    # a basic-auth/both launch with NO session would run a fully UNAUTHENTICATED scan while never
+    # invoking the gate built for it (fail-open). Require a session on any real (non-dry-run) launch
+    # in these modes and abort loudly. `rendered` mode keeps its optional-session behavior unchanged;
+    # `--dry-run` plans only (no network), so it is not forced to supply a session here.
+    if cfg.session_validity_mode in ("basic-auth", "both") and not dry_run and not session_path:
+        raise click.ClickException(
+            f"{cfg.session_validity_mode} validity mode requires --session (the session is the "
+            f"source of truth for the auth the scanners replay); refusing to run an "
+            f"unauthenticated scan. Capture one with `d4st auth capture`, or set "
+            f"D4ST_SESSION_VALIDITY_MODE=rendered for an unauthenticated launch.")
+
     session = None
     if session_path:
         with open(session_path, "r", encoding="utf-8") as fh:

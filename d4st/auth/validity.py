@@ -194,49 +194,99 @@ def normalize_validity_mode(raw: str | None) -> str:
     return _MODE_ALIASES[mode]
 
 
-def basic_auth_probe(url: str, username: str, password: str,
-                     *, timeout: float = 15.0) -> tuple[bool, str]:
-    """Fail-closed HTTP Basic-Auth validity probe. Returns (ok, note).
+def _basic_auth_header(username: str, password: str) -> str:
+    """The HTTP Basic ``Authorization`` value for these credentials."""
+    import base64
+    token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+    return f"Basic {token}"
 
-    Proves the endpoint actually GATES on the configured Basic credentials by requiring the
-    unauthenticated->authenticated transition:
-      * WITHOUT the Authorization header -> endpoint MUST reject with 401 (the Basic challenge)
-      * WITH the Basic header            -> endpoint MUST return 2xx (authorized)
+
+def session_auth_headers(session: Session) -> dict:
+    """The auth-bearing headers the scanners will actually fan out with ``session``: the
+    ``Authorization`` header plus any ``X-*-auth`` custom header. This is the thing that must be
+    validated, because it is the thing that gets scanned — NOT a freshly-built header from env
+    creds (which may diverge from the captured session)."""
+    out: dict = {}
+    for k, v in (getattr(session, "headers", None) or {}).items():
+        kl = k.lower()
+        if kl == "authorization" or (kl.startswith("x-") and "auth" in kl):
+            out[k] = v
+    return out
+
+
+def basic_auth_probe(url: str, session: Session, *,
+                     cross_check_user: str | None = None,
+                     cross_check_pass: str | None = None,
+                     timeout: float = 15.0) -> tuple[bool, str]:
+    """Fail-closed, SESSION-DRIVEN HTTP auth validity probe. Returns (ok, note).
+
+    Validates the auth that will ACTUALLY be scanned: the auth-bearing headers carried by
+    ``session`` (its ``Authorization`` header + any ``X-*-auth`` header the scanners replay),
+    NOT a Basic header freshly built from env creds. The thing validated is the thing scanned.
+
+    Proves the endpoint GATES on the session's auth by requiring the unauth->auth transition:
+      * WITHOUT any auth header         -> endpoint MUST reject with 401 (the auth challenge)
+      * WITH the session's auth headers -> endpoint MUST return 2xx (authorized)
 
     Every other outcome fails closed (ok=False) — we never assume a valid session:
+      * session carries NO usable auth header -> nothing authenticated to validate; ABORT
+      * cross-check creds supplied but the session's Authorization does NOT correspond to them
+        (stale / divergent session) -> ABORT (do not silently prefer env creds over the session)
       * no-auth already 2xx  -> auth is NOT actually required (suspicious / wrong endpoint); ABORT
-      * no-auth not 401      -> endpoint does not issue a Basic challenge; ABORT
-      * with-auth not 2xx    -> credentials rejected / endpoint broken; ABORT
+      * no-auth not 401      -> endpoint does not issue an auth challenge; ABORT
+      * with-auth not 2xx    -> session rejected / endpoint broken; ABORT
       * transport error      -> ABORT
-      * missing url/creds    -> ABORT (misconfigured)
+      * missing url          -> ABORT (misconfigured)
+
+    ``cross_check_user``/``cross_check_pass`` are an OPTIONAL cross-check: when supplied, the
+    session's ``Authorization`` must equal the Basic header those creds produce, else ABORT. Env
+    creds are never the authority — the session is.
 
     Redirects are NOT followed: a protected resource answers 200 directly when authorized, and a
     302 (e.g. to a login page) is ambiguous and must not be laundered into a 2xx.
     """
-    if not url or not username or not password:
-        return False, "basic-auth probe not configured (need endpoint + username + password)"
-    import base64
-
+    if not url:
+        return False, "auth validity probe not configured (need probe endpoint)"
     import httpx
 
-    token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+    auth_headers = session_auth_headers(session)
+    if not auth_headers:
+        return False, (
+            "session carries no usable auth header (no Authorization / X-*-auth) — nothing "
+            "authenticated to validate; refusing to assume a valid session")
+
+    # Optional env-cred cross-check: the session's Authorization MUST correspond to the configured
+    # Basic creds, else the captured session is stale/divergent from what the operator configured.
+    if cross_check_user or cross_check_pass:
+        if not (cross_check_user and cross_check_pass):
+            return False, "basic-auth cross-check requires BOTH a username and a password"
+        sess_authz = next((v for k, v in auth_headers.items() if k.lower() == "authorization"), None)
+        if sess_authz != _basic_auth_header(cross_check_user, cross_check_pass):
+            return False, (
+                "session Authorization does not match the configured D4ST_BASIC_AUTH_USER/PASS "
+                "(stale or divergent session) — refusing to validate env creds the scan won't use")
+
+    # No-auth leg: strip every auth-bearing header (keep any benign ones the session set) so a
+    # logged-out request is what actually reaches the endpoint.
+    non_auth = {k: v for k, v in (session.headers or {}).items() if k not in auth_headers}
     try:
-        unauth = httpx.get(url, follow_redirects=False, timeout=timeout)
+        unauth = httpx.get(url, headers=non_auth or None, follow_redirects=False, timeout=timeout)
     except Exception as exc:  # noqa: BLE001
-        return False, f"basic-auth probe error (no-auth request): {exc}"
+        return False, f"auth validity probe error (no-auth request): {exc}"
     if unauth.status_code != 401:
         return False, (
             f"no-auth request to {url} returned {unauth.status_code}, expected 401 — endpoint "
-            f"does not require Basic auth; refusing to assume a valid session")
+            f"does not require auth; refusing to assume a valid session")
+    # Auth leg: send the session's OWN headers — the exact auth the scanners will replay.
     try:
-        authed = httpx.get(url, headers={"Authorization": f"Basic {token}"},
+        authed = httpx.get(url, headers=dict(session.headers or {}),
                            follow_redirects=False, timeout=timeout)
     except Exception as exc:  # noqa: BLE001
-        return False, f"basic-auth probe error (authed request): {exc}"
+        return False, f"auth validity probe error (authed request): {exc}"
     if 200 <= authed.status_code < 300:
-        return True, f"basic-auth 401->{authed.status_code} transition confirmed at {url}"
+        return True, f"session-auth 401->{authed.status_code} transition confirmed at {url}"
     return False, (
-        f"authed request to {url} returned {authed.status_code}, expected 2xx — credentials "
+        f"authed request to {url} returned {authed.status_code}, expected 2xx — session auth "
         f"rejected or endpoint broken")
 
 
@@ -261,14 +311,17 @@ def validate_session(session: Session, cfg, *, probe_url: str | None = None,
         return is_session_valid(session, probe_url, marker, timeout=timeout, render=render)
 
     def _basic() -> tuple[bool, str]:
+        # SESSION-DRIVEN: validate the auth the scanners will actually replay (session.headers),
+        # using the configured Basic creds only as an optional cross-check. Env creds are NOT the
+        # authority (see basic_auth_probe); the session is.
         url = getattr(cfg, "session_validity_probe_url", None)
+        if not url:
+            return False, (
+                "basic-auth validity mode requires D4ST_SESSION_VALIDITY_URL (missing/empty)")
         user = getattr(cfg, "basic_auth_user", None)
         pw = getattr(cfg, "basic_auth_pass", None)
-        if not url or not user or not pw:
-            return False, (
-                "basic-auth validity mode requires D4ST_SESSION_VALIDITY_URL, "
-                "D4ST_BASIC_AUTH_USER and D4ST_BASIC_AUTH_PASS (missing/empty)")
-        return basic_auth_probe(url, user, pw, timeout=timeout)
+        return basic_auth_probe(url, session, cross_check_user=user, cross_check_pass=pw,
+                                timeout=timeout)
 
     if mode == "rendered":
         return _rendered()
