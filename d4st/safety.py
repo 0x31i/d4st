@@ -11,6 +11,8 @@ The golden rules encoded here:
 
 from __future__ import annotations
 
+import fnmatch
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -97,6 +99,134 @@ def auth_endpoint_safe_to_test(url: str, method: str = "GET", params=None) -> bo
     return not any((p or "").lower() in _CRED_PARAMS for p in params)
 
 
+# ============================================================================================
+# OPERATOR-CONFIGURABLE PATH EXCLUSION (D4ST_EXCLUDE_PATHS) — the safety-critical scope carve-out.
+#
+# Motivation: some target apps expose endpoints whose MERE INVOCATION causes real-world external
+# side effects — e.g. an archiving app where "create capture / create site / start crawl / archive"
+# makes the SERVER fetch an arbitrary external URL on our behalf. Fuzzing (or even benignly
+# auto-submitting) those endpoints is harmful no matter how aggressive the engagement is. This
+# matcher lets an operator name those paths and PROVABLY keep the scanner from sending any
+# intrusive / state-changing / form-submitting request to them — while plain GET discovery (crawl
+# + sitemap listing) of the same paths is still allowed, so they remain mapped in the report.
+#
+# The exclusion WINS over everything: it is independent of the policy name (even `aggressive`) and
+# of fuzz_forms. An empty / unset env is exactly today's behavior (no regression).
+#
+# PATTERN FORMAT (D4ST_EXCLUDE_PATHS): a comma-separated list; each item is matched against the
+# URL *path* (case-insensitively) in one of three ways:
+#   * ``re:<regex>``  — a Python regex, applied with re.search (matches anywhere in the path).
+#   * a glob with ``*`` / ``?`` / ``[seq]`` metacharacters — matched against the whole path with
+#     fnmatch (e.g. ``/api/capture*`` matches /api/capture, /api/captures, /api/capture/new).
+#   * a plain string (no metacharacters) — matched as a case-insensitive SUBSTRING of the path
+#     (e.g. ``/capture`` matches /api/v2/capture/new). Chosen to over-match rather than under-match,
+#     because this is a safety gate: a miss leaks an intrusive request, a false include only
+#     declines to attack a path.
+# A malformed ``re:`` pattern is skipped (the remaining patterns still apply) so one typo can never
+# silently disable the whole carve-out.
+
+
+class ExcludePathMatcher:
+    """Compiled D4ST_EXCLUDE_PATHS matcher. Cheap to query (precompiled); ``bool(matcher)`` is
+    False when no patterns are configured so callers can skip the check entirely (zero overhead /
+    zero behavior change when the env is unset)."""
+
+    def __init__(self, raw: str | None = ""):
+        self.raw = raw or ""
+        self.patterns: list[str] = [p.strip() for p in self.raw.split(",") if p.strip()]
+        self._substrings: list[str] = []
+        self._globs: list[str] = []
+        self._regexes: list[re.Pattern] = []
+        for item in self.patterns:
+            if item.lower().startswith("re:"):
+                try:
+                    self._regexes.append(re.compile(item[3:], re.IGNORECASE))
+                except re.error:
+                    # one bad regex must not disable the rest of the carve-out
+                    continue
+            elif any(c in item for c in "*?["):
+                self._globs.append(item.lower())
+            else:
+                self._substrings.append(item.lower())
+
+    def __bool__(self) -> bool:
+        return bool(self._substrings or self._globs or self._regexes)
+
+    @staticmethod
+    def _path(url: str) -> str:
+        try:
+            return urlsplit(url or "").path or (url or "")
+        except Exception:  # noqa: BLE001 - never let a weird URL crash the safety gate
+            return url or ""
+
+    def matches(self, url: str) -> bool:
+        """True if the URL's path matches ANY configured exclude pattern."""
+        if not self:
+            return False
+        path = self._path(url)
+        low = path.lower()
+        for s in self._substrings:
+            if s in low:
+                return True
+        for g in self._globs:
+            if fnmatch.fnmatch(low, g):
+                return True
+        for rx in self._regexes:
+            if rx.search(path):
+                return True
+        return False
+
+    def zap_exclude_regexes(self) -> list[str]:
+        """Render the patterns as ZAP Automation-Framework ``excludePaths`` entries (quoted regexes
+        that ZAP matches against the FULL URL). Globs/substrings become ``'.*<escaped>.*'``; a
+        ``re:`` pattern is passed through wrapped in ``'.*(...).* '``-style anchoring-free form so it
+        matches anywhere in the URL, mirroring our own .matches() semantics."""
+        out: list[str] = []
+        for item in self.patterns:
+            if item.lower().startswith("re:"):
+                body = item[3:]
+                try:
+                    re.compile(body)
+                except re.error:
+                    continue
+                out.append(f"'.*(?:{body}).*'")
+            else:
+                # strip glob metachars to a literal core, then escape for regex, wildcard both ends
+                core = re.escape(item.replace("*", "").replace("?", ""))
+                out.append(f"'.*{core}.*'")
+        return out
+
+
+# Module-level ACTIVE matcher consulted by is_write_action / is_state_changing (which take no
+# policy argument). get_policy() rebuilds it from the current environment and installs it here, so
+# every component that calls those free functions honors the same carve-out. Tests can install one
+# directly via set_exclude_matcher().
+_ACTIVE_EXCLUDE = ExcludePathMatcher(os.environ.get("D4ST_EXCLUDE_PATHS", ""))
+
+
+def get_exclude_matcher() -> ExcludePathMatcher:
+    """The currently-installed D4ST_EXCLUDE_PATHS matcher."""
+    return _ACTIVE_EXCLUDE
+
+
+def set_exclude_matcher(matcher_or_raw) -> ExcludePathMatcher:
+    """Install a matcher (an ExcludePathMatcher, or a raw pattern string) as the active one."""
+    global _ACTIVE_EXCLUDE
+    _ACTIVE_EXCLUDE = (matcher_or_raw if isinstance(matcher_or_raw, ExcludePathMatcher)
+                       else ExcludePathMatcher(matcher_or_raw))
+    return _ACTIVE_EXCLUDE
+
+
+def reload_exclude_matcher_from_env() -> ExcludePathMatcher:
+    """Rebuild + install the active matcher from D4ST_EXCLUDE_PATHS in the current environment."""
+    return set_exclude_matcher(os.environ.get("D4ST_EXCLUDE_PATHS", ""))
+
+
+def is_path_excluded(url: str) -> bool:
+    """True if `url`'s path matches the active D4ST_EXCLUDE_PATHS carve-out."""
+    return _ACTIVE_EXCLUDE.matches(url)
+
+
 # URL patterns that perform DESTRUCTIVE or NOTIFYING actions. Actively fuzzing these on real
 # infra can delete data, spam real inboxes/phones, move money, or fire irreversible workflows.
 # Deliberately does NOT include create/update/edit/save (too common, and injection often lives
@@ -118,6 +248,11 @@ def is_state_changing(url: str) -> bool:
     NOTE: path-only / method-agnostic. For the ACTIVE-TEST exclusion gate prefer the
     method-aware :func:`is_write_action`, which does not drop a GET read whose path merely
     mentions a verb (e.g. ``OrderDetail.asp?id=`` / ``OrderList.asp``)."""
+    # D4ST_EXCLUDE_PATHS carve-out WINS: an operator-excluded path is treated as state-changing
+    # everywhere this gate is consulted (replay / proxy / sweep write-replay all skip it), so the
+    # scanner never re-issues a mutating request to it, under any policy.
+    if _ACTIVE_EXCLUDE.matches(url):
+        return True
     return bool(_STATE_CHANGING.search(urlsplit(url).path))
 
 
@@ -139,6 +274,13 @@ def is_write_action(url: str, method: str = "GET") -> bool:
 
     ``is_state_changing(url)`` is kept for callers that have no method (and for back-compat);
     this is the preferred gate wherever a method is available."""
+    # D4ST_EXCLUDE_PATHS carve-out WINS over everything (policy name, fuzz_forms, method): an
+    # operator-excluded path is NEVER actionable for active/write testing, so it is reported as a
+    # write action here regardless of method. This drops it from the injection feed
+    # (_materialize_url) and the active-target filter even under the `aggressive` policy. Plain GET
+    # discovery / sitemap listing does not go through this gate, so excluded paths are still mapped.
+    if _ACTIVE_EXCLUDE.matches(url):
+        return True
     if (method or "GET").upper() == "GET":
         return False
     return bool(_STATE_CHANGING.search(urlsplit(url).path))
@@ -274,6 +416,10 @@ class ScanPolicy:
     sqlmap_technique: str = "BEUST"   # B/E/U/S/T; drop T,S on safe (no time-hang / no stacked)
     lfi_deep: bool = True             # allow the huge Traversal.txt corpus (heavy)
     oast_selfhosted_only: bool = False  # never use public interactsh (no data leaves the net)
+    # Operator path-exclusion carve-out (D4ST_EXCLUDE_PATHS). Populated by get_policy() from the
+    # environment. Independent of every other knob here — a matching path is skipped by ALL
+    # intrusive testing even under `aggressive` / fuzz_forms=True. Default: empty (no exclusion).
+    exclude_paths: ExcludePathMatcher = field(default_factory=lambda: ExcludePathMatcher(""))
 
     def sqlmap_args(self) -> list[str]:
         return ["--level", str(self.sqlmap_level), "--risk", str(self.sqlmap_risk),
@@ -331,7 +477,17 @@ POLICIES["normal"] = POLICIES["staging"]
 
 
 def get_policy(name: str) -> ScanPolicy:
-    return POLICIES.get(name, POLICIES["engagement"])
+    """Return the named policy with the D4ST_EXCLUDE_PATHS carve-out applied.
+
+    The matcher is built fresh from the current environment, installed as the module-active matcher
+    (so the policy-less free functions is_write_action / is_state_changing honor it too), and
+    attached to a COPY of the named policy via :func:`dataclasses.replace` — never mutating the
+    shared POLICIES entry. An empty/unset env yields an empty matcher: behavior is exactly as
+    before (no regression)."""
+    import dataclasses
+    base = POLICIES.get(name, POLICIES["engagement"])
+    matcher = reload_exclude_matcher_from_env()
+    return dataclasses.replace(base, exclude_paths=matcher)
 
 
 @dataclass

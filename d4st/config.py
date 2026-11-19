@@ -27,6 +27,18 @@ class Config:
     # Where run artifacts and captured sessions live.
     runs_dir: str = "runs"
     sessions_dir: str = "sessions"
+    # Operator path-exclusion carve-out (D4ST_EXCLUDE_PATHS): comma-separated regex/glob/substring
+    # path patterns whose matching endpoints must NEVER receive an intrusive / state-changing /
+    # form-submitting request (they are still passively GET-crawled so they appear in the sitemap).
+    # See d4st/safety.py ExcludePathMatcher for the exact pattern format. Raw list kept here; the
+    # compiled matcher is exposed via .exclude_matcher.
+    exclude_paths: list[str] = field(default_factory=list)
+
+    @property
+    def exclude_matcher(self):
+        """The compiled D4ST_EXCLUDE_PATHS matcher (safety.ExcludePathMatcher) for this config."""
+        from .safety import ExcludePathMatcher
+        return ExcludePathMatcher(",".join(self.exclude_paths))
 
     @classmethod
     def from_env(cls) -> Config:
@@ -44,4 +56,5 @@ class Config:
             asmng_api_key=os.environ.get("D4ST_ASMNG_API_KEY") or None,
             runs_dir=os.environ.get("D4ST_RUNS_DIR", "runs"),
             sessions_dir=os.environ.get("D4ST_SESSIONS_DIR", "sessions"),
+            exclude_paths=_split_csv(os.environ.get("D4ST_EXCLUDE_PATHS")),
         )

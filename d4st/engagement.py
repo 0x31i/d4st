@@ -259,7 +259,20 @@ def blind_crawl(target: str, cookie: str, depth: int = 3, duration: str = "3m",
         args = ["katana", "-u", root, "-jc", "-silent", "-d", str(depth), "-ct", duration,
                 "-cos", "logout|signout|/setup|reset", "-fs", "fqdn", "-kf", "all"]
         if use_headless:
-            args += ["-hl", "-aff", "-xhr"]      # headless browser + auto-form-fill + XHR
+            # headless browser + auto-form-fill(-aff) + XHR. -aff SUBMITS forms during the crawl;
+            # when an operator has configured D4ST_EXCLUDE_PATHS we must not auto-submit a matching
+            # create/capture form during discovery, and katana has no per-path form-submit control.
+            # So drop -aff whenever the carve-out is active (safe superset: no form is auto-submitted
+            # at crawl time) — every path is still GET-crawled and forms are still DISCOVERED as POST
+            # targets (then re-filtered by the exclude matcher at the guarded form-fuzzer), so the
+            # excluded endpoint is mapped but never invoked.
+            from .safety import get_exclude_matcher as _gem
+            if _gem():
+                args += ["-hl", "-xhr"]
+                print("[crawl] D4ST_EXCLUDE_PATHS active — disabling katana auto-form-submit (-aff) "
+                      "so no excluded create/capture form is submitted during discovery", flush=True)
+            else:
+                args += ["-hl", "-aff", "-xhr"]  # headless browser + auto-form-fill + XHR
         args += politeness.katana_flags() if politeness else ["-c", "10"]
         from .safety import BROWSER_UA
         args += ["-H", f"User-Agent: {BROWSER_UA}"]   # browser UA so WAFs don't tarpit the crawl
@@ -1912,7 +1925,13 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
     When fuzz_forms is False (production-safe), stored-XSS (which WRITES data) is skipped."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from .safety import auth_endpoint_safe_to_test, is_auth_endpoint
+    from .safety import auth_endpoint_safe_to_test, get_exclude_matcher, is_auth_endpoint
+
+    # D4ST_EXCLUDE_PATHS carve-out at THE form/POST submitter (verify_csrf / verify_stored_xss /
+    # verify_sqli|cmdi|lfi|open_redirect all submit to t.url). Independent of fuzz_forms / policy —
+    # a matching path is never submitted/fuzzed here, even under `aggressive`. Belt-and-suspenders:
+    # active_targets is already filtered upstream, but this is the component that fires the request.
+    _excl_m = get_exclude_matcher()
 
     def _probe_one(t: Target):
         """All checks for ONE target. Returns (findings, csrf_hit|None). Self-contained so it runs
@@ -1920,6 +1939,11 @@ def probe_targets(targets: list[Target], cookie: str, politeness=None,
         found: list[Finding] = []
         # never inject auth endpoints — except a GET with only non-credential nav params (safe)
         if is_auth_endpoint(t.url) and not auth_endpoint_safe_to_test(t.url, t.method, t.params):
+            return found, None
+        # operator exclude-path carve-out WINS: never submit/fuzz a matching form or endpoint.
+        if _excl_m.matches(t.url):
+            print(f"[safety] EXCLUDED {(t.method or 'GET').upper()} {urlsplit(t.url).path} "
+                  f"— matched D4ST_EXCLUDE_PATHS (form-fuzzer skipped)", flush=True)
             return found, None
 
         def _emit(cat, param, note, ev):
@@ -2949,6 +2973,26 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # production-safe also skips POST-form fuzzing entirely (no data mutation)
     if not policy.fuzz_forms:
         active_targets = [t for t in active_targets if t.method != "POST"]
+    # HARD SAFETY — operator path-exclusion carve-out (D4ST_EXCLUDE_PATHS). INDEPENDENT of the
+    # policy name and of fuzz_forms: a matching path is dropped from ALL active/intrusive testing
+    # (form fuzz, injection roster, nuclei-dast, native probes) EVEN under the `aggressive` policy.
+    # The path stays in `urls` (the sitemap) and is still GET-crawled, so passive discovery still
+    # maps it — only intrusive/creating/submitting requests are blocked. Loud per-target log so a
+    # run log PROVES the carve-out fired.
+    _excl_m = policy.exclude_paths
+    if _excl_m:
+        _kept_at = []
+        for t in active_targets:
+            if _excl_m.matches(t.url):
+                print(f"[safety] EXCLUDED {(t.method or 'GET').upper()} {urlsplit(t.url).path} "
+                      f"— matched D4ST_EXCLUDE_PATHS (dropped from active fuzzing)", flush=True)
+            else:
+                _kept_at.append(t)
+        if len(_kept_at) != len(active_targets):
+            print(f"[safety] D4ST_EXCLUDE_PATHS removed {len(active_targets) - len(_kept_at)} "
+                  f"target(s) from active fuzzing (patterns: {', '.join(_excl_m.patterns)}) — "
+                  f"these paths stay in the sitemap (GET-crawled) but are never attacked", flush=True)
+        active_targets = _kept_at
     findings: list[Finding] = []
     # Fold in the JS-content disclosure findings (connstrings/emails/keys/vuln-deps) gathered above.
     if _js_findings:
@@ -3033,6 +3077,14 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 _seed = [t for t in _seed if not is_state_changing(t.url)]
             if not policy.fuzz_forms:
                 _seed = [t for t in _seed if t.method != "POST"]
+            # D4ST_EXCLUDE_PATHS carve-out applies to OpenAPI-seeded targets too (independent of
+            # policy): a documented create/capture endpoint on an excluded path is never fuzzed.
+            if policy.exclude_paths:
+                _seed_before = len(_seed)
+                _seed = [t for t in _seed if not policy.exclude_paths.matches(t.url)]
+                if _seed_before != len(_seed):
+                    print(f"[safety] EXCLUDED {_seed_before - len(_seed)} OpenAPI-seeded target(s) "
+                          f"— matched D4ST_EXCLUDE_PATHS", flush=True)
             _known = {(t.url, t.method, tuple(t.params)) for t in active_targets}
             _new = [t for t in _seed if (t.url, t.method, tuple(t.params)) not in _known]
             active_targets.extend(_new)
@@ -3096,6 +3148,10 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         # not only sessionStorage-SPAs), and sources endpoints from the harvest OR, failing that,
         # the full crawl/seed frontier. run_authz filters to same-origin /api GETs internally.
         _authz_urls = _harvest_urls or [u for u in urls if "/api/" in u.lower()]
+        # D4ST_EXCLUDE_PATHS carve-out: the authz engine replays endpoints under TAMPERED identities
+        # (id-tamper can mutate an object), so drop excluded paths from its feed too (any policy).
+        if policy.exclude_paths:
+            _authz_urls = [u for u in _authz_urls if not policy.exclude_paths.matches(u)]
         if session is not None and _authz_urls:
             _refresh_jwt("authz")
             try:
@@ -3161,10 +3217,20 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                     print(f"[jwt] skipped: {_je}", flush=True)
                 _prog.update("jwt-attacks", findings, urls=len(urls), targets=len(targets))
 
+            # D4ST_EXCLUDE_PATHS carve-out: the intrusive active-depth stages (method/verb tampering
+            # a.k.a. BFLA, which can fire write methods) must never hit an excluded path. Build an
+            # exclude-filtered URL frontier for them — independent of policy, wins over `aggressive`.
+            # `urls` itself (the sitemap) is left intact so passive/report coverage still maps them.
+            _active_urls = ([u for u in urls if not policy.exclude_paths.matches(u)]
+                            if policy.exclude_paths else urls)
+            if policy.exclude_paths and len(_active_urls) != len(urls):
+                print(f"[safety] D4ST_EXCLUDE_PATHS withheld {len(urls) - len(_active_urls)} URL(s) "
+                      f"from the intrusive active-depth suite (verb/method tampering etc.)", flush=True)
+
             # Verb / method tampering (BFLA) — SAFE read-only methods by default
             try:
                 from .activetests import run_verb_tampering
-                _vt = run_verb_tampering(session, target, urls, delay=_base_delay, throttle=_thr)
+                _vt = run_verb_tampering(session, target, _active_urls, delay=_base_delay, throttle=_thr)
                 findings += _as_findings(_vt, "verbtamper")
                 if _vt:
                     print(f"[verb] {len(_vt)} method/verb access-control finding(s)", flush=True)
@@ -3562,8 +3628,20 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 # /send, /export would fire. Drop is_state_changing URLs from the frontier itself when
                 # the policy or D4ST_ZAP_SKIP_DESTRUCTIVE is set (mirrors the native engine's skip).
                 _skip = policy.skip_state_changing or os.environ.get("D4ST_ZAP_SKIP_DESTRUCTIVE") == "1"
+                # D4ST_EXCLUDE_PATHS carve-out (INDEPENDENT of policy — wins over `aggressive`):
+                # ZAP's `import {type: url}` GETs every frontier URL and ignores the context
+                # excludePaths, so an excluded create/capture URL would still be fetched (and fire its
+                # side effect) unless it is dropped from the frontier itself. Drop it here; it also
+                # goes into the context excludePaths inside run_zap as a second barrier.
+                _xm = policy.exclude_paths
                 _zap_frontier = [u for u in urls if urlsplit(u).path not in _cred_paths
-                                 and not (_skip and is_state_changing(u))]
+                                 and not (_skip and is_state_changing(u))
+                                 and not (_xm and _xm.matches(u))]
+                if _xm:
+                    _xdrop = sum(1 for u in urls if _xm.matches(u))
+                    if _xdrop:
+                        print(f"[safety] EXCLUDED {_xdrop} URL(s) from ZAP's frontier — matched "
+                              f"D4ST_EXCLUDE_PATHS (ZAP never imports/attacks them)", flush=True)
                 findings += run_zap(target, cookie, _tf.mkdtemp(prefix="d4st-zap-"),
                                     timeout=_zap_to, seed_url=_zap_seed, frontier=_zap_frontier)
                 zap_ran = True
@@ -3722,6 +3800,9 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
             "sqlmap": f"level {policy.sqlmap_level} risk {policy.sqlmap_risk} "
                       f"technique {policy.sqlmap_technique}",
             "inject_cap": _inject_cap or None,   # per-param heavy-tool cap (None = unbounded)
+            # operator path-exclusion carve-out (D4ST_EXCLUDE_PATHS) — surfaced so the report
+            # documents which paths were withheld from ALL intrusive testing (never silent).
+            "exclude_paths": list(policy.exclude_paths.patterns),
         },
         # adaptive health: what the target-stress monitor observed + did (never a silent cap)
         "health": {
@@ -4026,6 +4107,17 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
                 "invite|approve|reject|confirm|checkout|purchase|order|payment|pay|transfer|"
                 "withdraw|deposit|refund|discharge|deactivate|disable|revoke|suspend|terminate|"
                 "cancel|restore|rollback|migrate|import|export|backup).*'")
+        # D4ST_EXCLUDE_PATHS carve-out (INDEPENDENT of policy / D4ST_ZAP_SKIP_DESTRUCTIVE — wins over
+        # `aggressive`): add the operator exclude patterns to ZAP's context excludePaths so ZAP's
+        # active scanner never attacks them even for URLs it finds via its own spider. (Frontier URLs
+        # are also dropped upstream, because ZAP's url-import ignores excludePaths.)
+        from .safety import get_exclude_matcher as _gem
+        _xm = _gem()
+        if _xm:
+            _xzap = _xm.zap_exclude_regexes()
+            _excl += _xzap
+            print(f"[zap] EXCLUDED {len(_xzap)} D4ST_EXCLUDE_PATHS pattern(s) from ZAP active scan "
+                  f"(context excludePaths): {', '.join(_xzap)}", flush=True)
         plan = f"""env:
   contexts:
     - name: d4st
