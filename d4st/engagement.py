@@ -253,22 +253,77 @@ def blind_crawl(target: str, cookie: str, depth: int = 3, duration: str = "3m",
     else:
         use_headless = True                      # legacy default
 
+    # ASP.NET WebForms / classic-ASP postback reach: navigation via __doPostBack()/__VIEWSTATE is
+    # JS-driven, so a non-headless crawl never follows it and the frontier stalls at the landing
+    # pages (v3: ~133 pages, brute-force dead, menu/drilldowns unreached). A quick landing-page probe
+    # for the WebForms markers flips the crawl to headless + form-fill so katana executes the
+    # postbacks and REACHES the pages behind the menu — whose forms the downstream form-harvester
+    # then turns into POST injection targets. Opt-out: D4ST_CRAWL_WEBFORMS=0.
+    _is_webforms = False
+    if os.environ.get("D4ST_CRAWL_WEBFORMS", "1") != "0" and (env is None or env != "0"):
+        try:
+            import httpx as _hx
+            from .safety import BROWSER_UA as _UA
+            _hdrs = {"User-Agent": _UA}
+            if cookie:
+                _hdrs["Cookie"] = cookie
+            _pr = _hx.get(target, headers=_hdrs, timeout=15.0, follow_redirects=True, verify=False)
+            _is_webforms = bool(re.search(r"__doPostBack|__VIEWSTATE|WebForm_", _pr.text or ""))
+        except Exception:  # noqa: BLE001 - probe failure never blocks the crawl
+            _is_webforms = False
+    if _is_webforms and not use_headless:
+        use_headless = True
+        print("[crawl] ASP.NET WebForms detected (__doPostBack/__VIEWSTATE) — forcing headless + "
+              "form-fill crawl to reach postback-driven pages", flush=True)
+
     roots = list(dict.fromkeys([target, *(seeds or [])]))
+    # UNION crawl: a headless-only crawl UNDER-reaches a server-rendered app. Headless renders
+    # each page in a real browser (slow), so a fixed per-root time budget covers far fewer pages
+    # than a plain crawl of the same site (observed on a classic-ASP MPA: headless reached 6 URLs
+    # where plain reached 74). So when headless is wanted, run BOTH passes and UNION the frontiers:
+    # the plain pass gives breadth (follows every server-rendered <a href> fast), the headless pass
+    # adds depth (executes __doPostBack/XHR navigation the plain crawl can never follow). The plain
+    # pass is cheap, so we never lose the breadth we had before headless. Opt out of the extra
+    # plain pass with D4ST_CRAWL_UNION=0 (pure headless), as before.
+    if use_headless:
+        modes = ["plain", "headless"] if os.environ.get("D4ST_CRAWL_UNION", "1") != "0" \
+            else ["headless"]
+    else:
+        modes = ["plain"]
+    from .safety import BROWSER_UA
     urls: set[str] = set()
     for root in roots:
-        args = ["katana", "-u", root, "-jc", "-silent", "-d", str(depth), "-ct", duration,
-                "-cos", "logout|signout|/setup|reset", "-fs", "fqdn", "-kf", "all"]
-        if use_headless:
-            args += ["-hl", "-aff", "-xhr"]      # headless browser + auto-form-fill + XHR
-        args += politeness.katana_flags() if politeness else ["-c", "10"]
-        from .safety import BROWSER_UA
-        args += ["-H", f"User-Agent: {BROWSER_UA}"]   # browser UA so WAFs don't tarpit the crawl
-        if cookie:
-            args += ["-H", f"Cookie: {cookie}"]
-        for _k, _v in _AUTH_HEADER.items():      # bearer/header auth (token-SPA APIs) — crawl authed
-            args += ["-H", f"{_k}: {_v}"]
-        out = _run(args, timeout=1800)           # generous budget (headless is slow)
-        urls |= {ln.strip() for ln in out.splitlines() if ln.strip().startswith("http")}
+        for mode in modes:
+            args = ["katana", "-u", root, "-jc", "-silent", "-d", str(depth), "-ct", duration,
+                    "-cos", "logout|signout|/setup|reset", "-fs", "fqdn", "-kf", "all"]
+            if mode == "headless":
+                # Headless needs a real browser. The image ships one via Playwright (under
+                # ~/.cache/ms-playwright, NOT on PATH as `chromium`), so point katana straight at
+                # that binary with -scp; -nos = --no-sandbox (required running chrome as root in a
+                # container). Fall back to -sc (system chrome on PATH) if the Playwright build isn't
+                # found.
+                import glob as _glob
+                _chrome = next(iter(sorted(
+                    _glob.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome"))
+                    + _glob.glob("/home/*/.cache/ms-playwright/chromium-*/chrome-linux*/chrome")
+                    + _glob.glob("/root/.cache/ms-playwright/chromium-*/chrome-linux*/chrome"),
+                    reverse=True)), "")
+                args += ["-hl", "-nos", "-aff", "-xhr", "-fx"]   # headless + no-sandbox + form-fill + XHR + form-extract
+                args += (["-scp", _chrome] if _chrome else ["-sc"])
+                if _chrome:
+                    print(f"[crawl] headless depth pass via Playwright chromium: {_chrome}", flush=True)
+                if _is_webforms:
+                    args += ["-jsl"]                 # jsluice: pull endpoints out of the WebForms JS
+            else:
+                print(f"[crawl] plain breadth pass (root={root})", flush=True)
+            args += politeness.katana_flags() if politeness else ["-c", "10"]
+            args += ["-H", f"User-Agent: {BROWSER_UA}"]   # browser UA so WAFs don't tarpit the crawl
+            if cookie:
+                args += ["-H", f"Cookie: {cookie}"]
+            for _k, _v in _AUTH_HEADER.items():      # bearer/header auth (token-SPA APIs) — crawl authed
+                args += ["-H", f"{_k}: {_v}"]
+            out = _run(args, timeout=1800)           # generous budget (headless is slow)
+            urls |= {ln.strip() for ln in out.splitlines() if ln.strip().startswith("http")}
     return sorted(urls)
 
 
@@ -742,16 +797,22 @@ def _materialize_url(t: "Target") -> str:
     exists. Already-concrete URLs pass through unchanged; POST forms return "" (native probes and
     the form-fuzzers handle those via request bodies)."""
     from urllib.parse import urlencode, urlsplit
+    from .safety import is_write_action
     url = getattr(t, "url", "") or ""
     method = (getattr(t, "method", "GET") or "GET").upper()
     _fuzz_bodies = os.environ.get("D4ST_FUZZ_BODIES") == "1"
-    if method != "GET" and not _fuzz_bodies:
-        return ""                           # default: native probes handle non-GET bodies
-    if _fuzz_bodies:
-        from .safety import is_state_changing
-        # HARD safety: the deep-body roster feed NEVER includes DELETE or destructive/notifying URLs.
-        if method == "DELETE" or is_state_changing(url):
-            return ""
+    # HARD safety (method-aware): never materialize a genuine WRITE (non-GET + destructive verb)
+    # or any DELETE into the URL-list injection feed — that would fuzz a real order/checkout/
+    # send/delete form. A GET read with a verb in its path is NOT a write and is still fed.
+    if method == "DELETE" or is_write_action(url, method):
+        return ""
+    # ROSTER FEED (change C): a non-GET FORM target (POST search/filter/lookup — the majority of a
+    # classic-ASP shop's surface) used to return "" here, so dalfox/ghauri/commix/lfi_fuzz never
+    # received it (roster:0 targets). Give the URL-list injection tools a GET URL+query
+    # representation of the form's params so they actually test these endpoints. (Destructive/cred
+    # POSTs are already removed upstream by the method-aware active-target + credential filters;
+    # native probe_targets still fuzzes the real POST bodies.) D4ST_FUZZ_BODIES keeps the richer
+    # path-template substitution below.
     if urlsplit(url).query:                 # already a concrete ?a=b URL
         return url
     params = getattr(t, "params", None) or []
@@ -1142,8 +1203,12 @@ def _derive_meta(note: str, ev: list) -> tuple[str, str, str, str]:
         "source→sink flow" if "source" in low and "sink" in low else
         "cross-object access" if "another object" in low or "idor" in low else
         "content signature")
+    # A "not reconfirmed" / "unconfirmed" note contains the substring "confirmed" but means the
+    # OPPOSITE — never let it read as a confirmation (that over-claimed un-reproduced timing hits).
+    _neg = ("not reconfirmed" in low or "not confirmed" in low or "unconfirmed" in low
+            or "not reproducible" in low)
     conf = (
-        "tentative" if "suspect" in low or "context-dependent" in low else
+        "tentative" if _neg or "suspect" in low or "context-dependent" in low else
         "confirmed" if any(k in low for k in ("confirmed", "cracked", "read /etc/passwd", "uid=",
                                               "returned 20", "returned 2", "persisted", "win.ini",
                                               "5s=", "base64 filter")) else
@@ -1254,29 +1319,56 @@ def verify_sqli(url: str, param: str, method: str, cookie: str) -> tuple[bool, s
         _baseline = time.monotonic() - _t0
     except Exception:  # noqa: BLE001
         _baseline = 0.0
+    # HARD replay-confirmation gate: a single transient latency spike must NEVER confirm a
+    # time-based finding. For each candidate payload we take N paired SLEEP(0)/SLEEP(5) samples
+    # and require a REPRODUCIBLE separation — the MEDIAN 5s-vs-0s delta must clear the threshold
+    # AND a strict majority of the individual pairs must each separate. One spike is a single
+    # anomalous sample: the median absorbs it and the majority check rejects it, so it cannot
+    # reach a positive. A genuine injection delays EVERY SLEEP(5) request, so all pairs separate
+    # and the median delta is ~5s. (SELECT-based, non-destructive.)
+    import statistics
+    _SEP = 3.5          # seconds of separation that counts as a real injected delay
+    _PAIRS = 3          # paired (0s,5s) samples required per candidate
+    _NEED = _PAIRS // 2 + 1   # strict majority of pairs must each separate (2 of 3)
+
+    def _timed(_tmpl_sec: int) -> float:
+        _s = time.monotonic(); _req(method, url, param, _tmpl.format(n=_tmpl_sec), cookie)
+        return time.monotonic() - _s
+
     if _baseline <= 4.0:   # a naturally-slow endpoint makes timing unreliable AND expensive
         for _d in _order:
             for _label, _tmpl in _TIME_PAYLOADS.get(_d, []):
+                # cheap pre-gate: one (0s,5s) pair must separate before we spend more requests
                 try:
-                    _t0 = time.monotonic(); _req(method, url, param, _tmpl.format(n=0), cookie)
-                    fast = time.monotonic() - _t0
-                    if fast > 4.0:
+                    _f0 = _timed(0)
+                    if _f0 > 4.0:
                         continue
-                    _t0 = time.monotonic(); _req(method, url, param, _tmpl.format(n=5), cookie)
-                    slow = time.monotonic() - _t0
+                    _s0 = _timed(5)
                 except Exception:  # noqa: BLE001
                     continue
-                if slow > fast + 3.8 and slow > 3.8:
+                if not (_s0 > _f0 + _SEP and _s0 > _SEP):
+                    continue
+                # candidate looks delayed — now REPLAY to prove it reproduces, not a spike.
+                fasts, slows = [_f0], [_s0]
+                for _ in range(_PAIRS - 1):
                     try:
-                        _t0 = time.monotonic(); _req(method, url, param, _tmpl.format(n=2), cookie)
-                        mid = time.monotonic() - _t0
+                        fasts.append(_timed(0))
+                        slows.append(_timed(5))
                     except Exception:  # noqa: BLE001
-                        mid = 0.0
-                    if fast + 1.0 < mid < slow - 1.0:   # 2s sits between 0s and 5s => real
-                        _tag = f"{_d} detected" if _d == _dia else _d
-                        return True, (f"time-based blind SQLi [{_tag}/{_label}]: "
-                                      f"5s={slow:.1f}s vs 0s={fast:.1f}s")
-    return False, "no SQL error, boolean, or timing signal"
+                        break
+                if len(slows) < _PAIRS:
+                    continue
+                _sep_pairs = sum(1 for _sf, _ss in zip(fasts, slows)
+                                 if _ss > _sf + _SEP and _ss > _SEP)
+                _med_fast = statistics.median(fasts)
+                _med_slow = statistics.median(slows)
+                _delta = _med_slow - _med_fast
+                if _sep_pairs >= _NEED and _delta > _SEP and _med_slow > _SEP:
+                    _tag = f"{_d} detected" if _d == _dia else _d
+                    return True, (f"time-based blind SQLi [{_tag}/{_label}]: reproducible delay over "
+                                  f"{_PAIRS} paired samples (median 5s={_med_slow:.1f}s vs "
+                                  f"0s={_med_fast:.1f}s; {_sep_pairs}/{_PAIRS} pairs separated)")
+    return False, "no SQL error, boolean, or timing signal (time-based not reproducible)"
 
 
 def verify_lfi(url: str, param: str, method: str, cookie: str) -> tuple[bool, str]:
@@ -1530,6 +1622,14 @@ def verify_finding(f: Finding, cookie: str) -> Finding:
         if f.verified is True:
             # detector had proof; our replay couldn't reconfirm (dynamic/transient) — keep + annotate
             f.verify_note = f"detector-proven; independent replay not reconfirmed ({note})"
+            # HARD GATE for time-based findings: a timing signal that does NOT reproduce on
+            # independent replay must never stand as "confirmed" — a single transient latency
+            # spike is not proof. Cap the confidence so the report cannot over-claim.
+            _timing = ("time" in (f.detection or "").lower()
+                       or "time-based" in (f.evidence or "").lower()
+                       or "sleep" in (f.evidence or "").lower())
+            if _timing and (f.confidence or "").lower() == "confirmed":
+                f.confidence = "tentative"
         else:
             f.verified = False
             f.verify_note = note
@@ -1586,10 +1686,37 @@ def run_sqlmap(t: Target, cookie: str, politeness=None, policy=None,
     args = ["sqlmap", "--batch", "--disable-coloring", "--flush-session"]
     if policy is not None:
         lvl = level_override if level_override else policy.sqlmap_level
-        args += ["--level", str(lvl), "--risk", str(policy.sqlmap_risk),
-                 f"--technique={policy.sqlmap_technique}"]
+        # Honor an operator-set D4ST_SQLMAP_RISK (the deep re-run passes 3 to add the broadest
+        # OR-based/heavy boolean+union payloads), clamped to <=3. CRITICAL SAFETY: when the risk is
+        # raised via env, the technique is pinned to BEU (boolean/error/union) — T (time-based) and
+        # S (stacked) are stripped — so even risk 3 can NEVER introduce a time-based hang or a
+        # stacked/write query (essential on a fragile legacy target: a time-based payload is exactly
+        # what would re-trip the health HALT). When the env is unset the policy's own technique
+        # (e.g. staging/aggressive BEUST) is left untouched.
+        _env_risk = os.environ.get("D4ST_SQLMAP_RISK")
+        if _env_risk:
+            try:
+                _risk = min(int(_env_risk), 3)
+            except ValueError:
+                _risk = policy.sqlmap_risk
+            _tech = "".join(c for c in (policy.sqlmap_technique or "BEU").upper()
+                            if c in "BEU") or "BEU"
+        else:
+            _risk = policy.sqlmap_risk
+            _tech = policy.sqlmap_technique
+        args += ["--level", str(lvl), "--risk", str(_risk), f"--technique={_tech}"]
     else:
         args += ["--level", str(level_override or 2), "--risk", "2", "--technique=BEUST"]
+    # MSSQL dialect hint for a Classic-ASP/ASP.NET + IIS app. D4ST_SQLMAP_DBMS (the operator passes
+    # 'mssql' on the re-run) takes precedence; otherwise an .asp/.aspx/.asmx/.ashx target URL is a
+    # strong MSSQL fingerprint, so default to it. Narrowing --dbms focuses sqlmap's payload matrix
+    # on the right dialect (faster, fewer wasted probes). This does NOT touch the technique/risk
+    # clamp above — still BEU with risk<=2 (no time-based/stacked), per the prior safety patch.
+    _dbms = (os.environ.get("D4ST_SQLMAP_DBMS") or "").strip()
+    if not _dbms and re.search(r"\.as(?:px?|mx|hx)\b", t.url or "", re.IGNORECASE):
+        _dbms = "mssql"
+    if _dbms:
+        args += [f"--dbms={_dbms}"]
     if politeness:
         args += politeness.sqlmap_flags()
     if t.method == "POST":
@@ -1625,7 +1752,8 @@ def run_sqlmap(t: Target, cookie: str, politeness=None, policy=None,
             for n in normalize_sqlmap(out)]
 
 
-def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[Finding]:
+def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None,
+                         heavy: bool = True) -> list[Finding]:
     """Passive info-disclosure via nuclei's exposures + misconfiguration templates and our
     PII/email extractor — the CLI analog to Burp's passive scanner (source-code / private-key
     / token / config disclosure, emails/PII). Detection lives in nuclei's engine + versioned
@@ -1643,7 +1771,12 @@ def run_nuclei_exposures(urls: list[str], cookie: str, politeness=None) -> list[
     # Fast lane (D4ST_NUCLEI_FAST=1, set by `d4st unauth --fast`): the high-signal, quick dirs only
     # (exposures + misconfiguration + PII). Skips the slow, DNS-heavy CVE/takeover/panel corpus so a
     # quick sweep finishes in minutes. Default keeps the full breadth for a deep run.
-    if os.environ.get("D4ST_NUCLEI_FAST") == "1":
+    # heavy=False (set by the caller when the target is ALREADY stressed) drops the slow, DNS-heavy
+    # CVE/takeover/panel corpus and keeps only the fast high-signal exposures+misconfiguration dirs.
+    # v3 post-mortem: this stage ran a FULL HOUR against 158 urls on the heavy corpus and that load
+    # is what beat the fragile legacy app into the health HALT that then skipped ZAP. On a stressed
+    # target the hour-long heavy sweep adds little and costs the cross-check engine its turn.
+    if os.environ.get("D4ST_NUCLEI_FAST") == "1" or not heavy:
         _dnames = ("exposures", "misconfiguration")
     else:
         _dnames = ("exposures", "misconfiguration", "vulnerabilities", "cves",
@@ -2031,7 +2164,13 @@ _ROSTER_CAT = {
 # crash fragile targets — the failure we hit on WAVSEP; use `launch -w full` if you want it).
 _MEGA_ROSTER = ["dalfox", "ghauri", "lfi_fuzz", "commix", "crlfuzz", "sstimap", "rfi_oast",
                 "dotdotpwn", "openredirex", "xsrfprobe", "schemathesis", "jwt_tool",
-                "graphw00f", "gitleaks", "trufflehog", "xxe_oast"]
+                "graphw00f", "gitleaks", "trufflehog", "xxe_oast",
+                # ASP/IIS cross-check engines. nikto (active) is a per-host misconfiguration /
+                # dangerous-file scanner; viewstate (passive) decodes __VIEWSTATE for MAC state.
+                # Both are deliberately LEFT OUT of _ROSTER_CAT so each finding keeps its OWN
+                # per-finding category (nikto spans misconfig/info-disclosure; viewstate emits
+                # viewstate-no-mac / viewstate-present) instead of being forced to one bucket.
+                "nikto", "viewstate"]
 
 
 # Roster tools that loop one subprocess PER URL (expensive at scale) vs tools that batch a whole
@@ -2073,18 +2212,20 @@ def _session_from_cookie(cookie: str, target: str) -> dict | None:
     _cookie_header(ctx.session), NOT options['cookie']. run_roster historically built RunContext
     without session=, so ctx.session was None and EVERY roster tool ran UNAUTHENTICATED — hitting
     the login wall and reporting 0 on any app behind auth. This bridges the keeper's cookie string
-    onto ctx.session so the whole roster runs as the logged-in user."""
-    if not cookie:
-        return None
+    onto ctx.session so the whole roster runs as the logged-in user.
+
+    Header-bearer auth (no auth cookie) is covered too: if there is no cookie but an auth header is
+    active (_AUTH_HEADER, e.g. Authorization: Bearer <token>), a header-only session is returned so
+    the roster adapters still replay the token."""
     from urllib.parse import urlsplit
     host = urlsplit(target if "//" in target else "//" + target).hostname or ""
     cookies = []
-    for part in cookie.split(";"):
+    for part in (cookie or "").split(";"):
         name, sep, value = part.strip().partition("=")
         if sep and name.strip():
             cookies.append({"name": name.strip(), "value": value.strip(),
                             "domain": host, "path": "/"})
-    if not cookies:
+    if not cookies and not _AUTH_HEADER:
         return None
     return {"name": "keeper", "origin": target, "storage_state": {"cookies": cookies},
             "headers": dict(_AUTH_HEADER), "meta": {}, "captured_at": ""}
@@ -2172,10 +2313,15 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
         # (and re-auth on loss) before each tool so a mid-roster death doesn't leave every remaining
         # tool testing the login page. Cheap: ensure() is a single HEAD-ish probe unless auth is lost.
         if session_keeper is not None and getattr(session_keeper, "enabled", False):
+            _before = getattr(session_keeper, "reauths", 0)
             _ck = session_keeper.ensure(f"roster:{name}")
-            if _ck and _ck != cookie:
-                cookie, _sess = _ck, _session_from_cookie(_ck, target)
-                opts["cookie"] = _ck
+            # Rebuild the adapter session when EITHER the cookie changed OR a re-auth fired. A
+            # header-bearer re-mint leaves the cookie unchanged but refreshes _AUTH_HEADER, so the
+            # cookie-diff alone would miss it and the roster would replay a stale token.
+            if (_ck and _ck != cookie) or getattr(session_keeper, "reauths", 0) != _before:
+                cookie = _ck or cookie
+                _sess = _session_from_cookie(cookie, target)
+                opts["cookie"] = cookie
         if getattr(ad, "active", False) and not policy.active_scan:
             continue
         # Circuit breaker: if the target went unhealthy, stop launching more active tools
@@ -2246,7 +2392,11 @@ def run_roster(target: str, safe_urls: list[str], cookie: str, policy,
         # progress AND flushes cumulative findings to disk (base + roster-so-far).
         if progress is not None:
             try:
-                progress.update(f"roster:{name}", (base_findings or []) + out)
+                # Pass the real per-tool URL count so the live telemetry shows what each roster tool
+                # actually scanned (was a cosmetic "urls 0 targets 0" — the tool DID get the full set;
+                # the display just carried no count, which misread as a starved feed).
+                progress.update(f"roster:{name}", (base_findings or []) + out,
+                                urls=len(tool_urls))
             except Exception:  # noqa: BLE001,S110
                 pass
     return out
@@ -2297,7 +2447,7 @@ class _Progress:
         self.step += 1
         self.timeline.append({"stage": stage, "elapsed_s": elapsed,
                               "cumulative_findings": n, "note": note})
-        # LIVE line — aligned so a `tail -f` reads like a dashboard even without Claude driving.
+        # LIVE line — aligned so a `tail -f` reads like a dashboard even on an unattended run.
         if self.console:
             d = f"+{delta}" if delta else "  "
             extra = f"  {note}" if note else ""
@@ -2373,28 +2523,76 @@ class SessionKeeper:
     - ok_marker: a substring present ONLY when authenticated (e.g. 'Logout'). If empty, a
       login-redirect / login-form heuristic decides.
     - reauth:    callable() -> fresh cookie string (a form-login, or the Playwright MFA module).
+
+    HEADER-BEARER MODE (generic, config-driven): when ``auth_header`` is set the keeper maintains
+    an AUTH HEADER (e.g. ``Authorization: Bearer <token>`` or ``X-Whatever-Token: <token>``) instead
+    of — or alongside — a cookie. It probes WITH that header, treats a 401/403 on a previously-authed
+    endpoint as an expiry, optionally re-mints PROACTIVELY on a token-TTL timer (for bearer tokens
+    with no server-side refresh), and re-injects the freshly minted token into the header for every
+    downstream tool via ``set_auth_header``. Fully app-agnostic: the re-mint command (``reauth``,
+    e.g. from ``D4ST_REAUTH_CMD``) returns a fresh token; the keeper knows only the header name,
+    value template and TTL. Any auth-specific minting logic stays in that external command.
+
+    - auth_header:      header name to maintain/inject (e.g. 'Authorization'). Empty => cookie mode.
+    - header_template:  value template with a '{token}' placeholder (default 'Bearer {token}' for
+                        Authorization, else '{token}').
+    - ttl:              token lifetime in seconds; re-mint proactively once the token nears it
+                        (0 = no timer, rely on 401/403 detection only).
+    - token:            the current bearer token (bare, no template), to seed the keeper.
     """
 
-    def __init__(self, cookie: str, probe_url: str = "", ok_marker: str = "", reauth=None):
+    _TTL_MARGIN = 120   # re-mint this many seconds BEFORE the TTL ceiling (safety margin)
+
+    def __init__(self, cookie: str, probe_url: str = "", ok_marker: str = "", reauth=None,
+                 auth_header: str = "", header_template: str = "", ttl: int = 0,
+                 token: str = ""):
         self.cookie = cookie or ""
         self.probe_url = probe_url or ""
         self.ok_marker = ok_marker or ""
         self.reauth = reauth
         self.reauths = 0
-        self.enabled = bool(self.probe_url and reauth)
+        # header-bearer mode
+        self.auth_header = auth_header or ""
+        self.header_mode = bool(self.auth_header)
+        self.header_template = header_template or (
+            "Bearer {token}" if self.auth_header.lower() == "authorization" else "{token}")
+        self.token = token or ""
+        self.ttl = int(ttl or 0)
+        self._minted_at = time.monotonic() if self.token else 0.0
+        # Cookie mode needs a probe to detect loss. Header mode is useful with EITHER a probe
+        # (401/403 detection) OR a TTL timer (proactive re-mint), so arm on either.
+        self.enabled = bool(reauth) and bool(
+            self.probe_url or (self.header_mode and self.ttl))
 
     def alive(self) -> bool:
-        """True if the current cookie still authenticates. Inconclusive/error => True (never
+        """True if the current session still authenticates. Inconclusive/error => True (never
         thrash a re-auth on a transient network blip)."""
+        # TTL ceiling (header-bearer tokens with no server-side refresh, e.g. a ~20-min access
+        # token): re-mint PROACTIVELY once the current token nears its TTL, independent of any
+        # probe — the token is about to 401 and a probe may still fall inside its last valid window.
+        if self.header_mode and self.ttl and self._minted_at:
+            if (time.monotonic() - self._minted_at) >= max(self.ttl - self._TTL_MARGIN,
+                                                           self.ttl * 0.85):
+                return False
         if not self.probe_url:
             return True
         import httpx
-        hdr = {"Cookie": self.cookie} if self.cookie else {}
+        hdr = {}
+        if self.cookie:
+            hdr["Cookie"] = self.cookie
+        if self.header_mode and self.token:
+            hdr[self.auth_header] = self.header_template.format(token=self.token)
         try:
             r = httpx.get(self.probe_url, headers=hdr, follow_redirects=False, timeout=10)
+            # Header-bearer expiry is an explicit 401/403 on a previously-authed endpoint.
+            if self.header_mode and r.status_code in (401, 403):
+                return False
             if r.status_code in (301, 302, 303, 307, 308):
                 loc = (r.headers.get("location") or "").lower()
                 return not any(w in loc for w in ("login", "signin", "sign-in", "auth", "sso"))
+            if self.header_mode and r.status_code < 400:
+                # authed probe answered with the token present => still valid (marker if given)
+                return self.ok_marker.lower() in r.text.lower() if self.ok_marker else True
             body = r.text.lower()
             if self.ok_marker:
                 return self.ok_marker.lower() in body
@@ -2411,13 +2609,31 @@ class SessionKeeper:
         caller threads it into the next stage's tools."""
         if not self.enabled or self.alive():
             return self.cookie
-        print(f"[session] auth lost before '{stage}' — re-authenticating", flush=True)
+        print(f"[session] auth lost/expiring before '{stage}' — re-authenticating", flush=True)
         try:
             fresh = self.reauth()
         except Exception as e:  # noqa: BLE001
             print(f"[session] re-auth FAILED: {e}", flush=True)
             return self.cookie
-        if fresh and fresh != self.cookie:
+        if not fresh:
+            return self.cookie
+        if self.header_mode:
+            # Re-inject the fresh token into the AUTH HEADER so EVERY downstream tool (native
+            # probes via _base_headers, katana -H, and the roster via _session_from_cookie ->
+            # translators) replays the current token — not just cookies.
+            self.token = fresh
+            self._minted_at = time.monotonic()
+            self.reauths += 1
+            try:
+                set_auth_header({self.auth_header: self.header_template.format(token=fresh)})
+            except Exception as e:  # noqa: BLE001
+                print(f"[session] header re-inject FAILED: {e}", flush=True)
+                return self.cookie
+            print(f"[session] re-minted {self.auth_header} token "
+                  f"({'VALID' if self.alive() else 'still INVALID'}) (#{self.reauths})",
+                  flush=True)
+            return self.cookie
+        if fresh != self.cookie:
             self.cookie = fresh
             self.reauths += 1
             print(f"[session] re-auth {'restored' if self.alive() else 'did NOT restore'} "
@@ -2425,19 +2641,108 @@ class SessionKeeper:
         return self.cookie
 
 
-def _env_reauth():
+def _env_reauth(mode: str = "cookie"):
     """Build a reauth callable from D4ST_REAUTH_CMD: a shell command that (re)authenticates and
-    prints a fresh 'name=value; ...' cookie string as its LAST stdout line. Decouples re-auth from
-    the engagement — the operator supplies any login flow (form login, script, Playwright)."""
+    prints a fresh credential as its LAST stdout line. Decouples re-auth from the engagement — the
+    operator supplies any login/mint flow (form login, script, Playwright, token forge).
+
+    mode='cookie'  -> the last 'name=value; ...' line is used as the Cookie header.
+    mode='header'  -> the last non-empty line is used VERBATIM as a bearer/opaque token (a token
+                      may contain no '=' at all, or contain base64 '=' padding — so the cookie
+                      heuristic can't be applied). The token is injected into the configured
+                      auth header by the keeper."""
     cmd = os.environ.get("D4ST_REAUTH_CMD")
     if not cmd:
         return None
 
     def _do() -> str:
         out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
-        lines = [ln.strip() for ln in out.stdout.splitlines() if "=" in ln and ln.strip()]
-        return lines[-1] if lines else ""
+        lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        if mode == "header":
+            return lines[-1]
+        ck = [ln for ln in lines if "=" in ln]
+        return ck[-1] if ck else ""
     return _do
+
+
+def _manual_reauth():
+    """Reauth for sessions that can only be re-established BY HAND — SSO behind device-bound
+    Conditional Access, HttpOnly cookies no automation may read. On session loss it ALERTS the
+    operator (notify.alert) and WAITS for the session file to be refreshed (by `auth reauth-watch`
+    or `auth from-cookie`), then returns the fresh cookie so the scan resumes. Never fabricates a
+    login — it turns an unattended stall into a paged, auto-resuming pause.
+
+    Env: D4ST_REAUTH_WAIT_SESSION (session JSON to watch; arms this path), D4ST_REAUTH_WAIT_TIMEOUT
+    (minutes, default 60), D4ST_REAUTH_WAIT_HOST (cookie host; default the session origin),
+    D4ST_REAUTH_NOTIFY_CMD (extra alert command, e.g. a phone-push curl)."""
+    sess_path = os.environ.get("D4ST_REAUTH_WAIT_SESSION")
+    if not sess_path:
+        return None
+    timeout_min = float(os.environ.get("D4ST_REAUTH_WAIT_TIMEOUT", "60"))
+    host_hint = os.environ.get("D4ST_REAUTH_WAIT_HOST", "")
+    extra_cmd = os.environ.get("D4ST_REAUTH_NOTIFY_CMD")
+
+    def _mtime() -> float:
+        try:
+            return os.path.getmtime(sess_path)
+        except OSError:
+            return 0.0
+
+    def _do() -> str:
+        import time as _time
+
+        from . import notify
+        from .auth.session import Session
+
+        before = _mtime()
+        notify.alert("session expired — reload the app tab and Copy as cURL to reauth",
+                     title="d4st needs reauth", say="d4st needs a reauth")
+        if extra_cmd:
+            try:
+                subprocess.run(extra_cmd, shell=True, timeout=30, capture_output=True)
+            except Exception:  # noqa: BLE001
+                pass
+        deadline = _time.monotonic() + timeout_min * 60
+        renotify_at = _time.monotonic() + 300
+        while _time.monotonic() < deadline:
+            if _mtime() > before:
+                try:
+                    s = Session.load(sess_path)
+                    hdr = s.cookie_header(host_hint or s.origin)
+                except Exception:  # noqa: BLE001 - file mid-write; retry next tick
+                    hdr = ""
+                if hdr:
+                    notify.alert("session refreshed — resuming scan", title="d4st reauth")
+                    return hdr
+            if _time.monotonic() >= renotify_at:   # banner+bell only, no repeated speech
+                notify.alert("still waiting on reauth — Copy as cURL the app tab",
+                             title="d4st needs reauth")
+                renotify_at += 300
+            _time.sleep(3)
+        notify.alert("reauth timed out — scan holding", title="d4st", say="reauth timed out")
+        return ""  # keep old cookie; the next stage boundary re-probes and re-alerts
+    return _do
+
+
+def _resolve_reauth(mode: str = "cookie"):
+    """Automatable reauth (D4ST_REAUTH_CMD) wins; else the manual notify+wait path
+    (D4ST_REAUTH_WAIT_SESSION) for logins that need a human in the loop. ``mode`` selects how the
+    automatable command's output is parsed ('header' => bearer token, 'cookie' => cookie line)."""
+    return _env_reauth(mode) or _manual_reauth()
+
+
+def _token_from_header_value(template: str, value: str) -> str:
+    """Recover the bare token from a formatted auth-header value, given its template, so the keeper
+    can seed itself from an already-captured header (e.g. strip 'Bearer ' off 'Bearer <token>')."""
+    pre, _, post = template.partition("{token}")
+    v = value or ""
+    if pre and v.startswith(pre):
+        v = v[len(pre):]
+    if post and v.endswith(post):
+        v = v[:len(v) - len(post)]
+    return v.strip()
 
 
 def _redact_auth(headers: dict) -> dict:
@@ -2493,6 +2798,7 @@ def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, r
     import time as _t
 
     import httpx
+    from .evidence import _redact_phi as _redact_phi_cap  # scrub PHI on persisted bodies (regulated-data targets)
     from .safety import is_auth_endpoint, is_state_changing
     hdr = dict(_AUTH_HEADER)
     if cookie:
@@ -2555,8 +2861,8 @@ def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, r
                     "response": {"status": r.status_code, "headers": dict(r.headers),
                                  "elapsed_ms": int(r.elapsed.total_seconds() * 1000) if r.elapsed else None,
                                  "size": len(r.content),
-                                 "body": _rt[:cap_body] + ("\n…[truncated]" if _trunc else ""),
-                                 "raw": _raw_http_response(r)[:cap_body + 4000]}}
+                                 "body": _redact_phi_cap(_rt[:cap_body]) + ("\n…[truncated]" if _trunc else ""),
+                                 "raw": _redact_phi_cap(_raw_http_response(r)[:cap_body + 4000])}}
             # A real capture supersedes any synthetic placeholder exchange (e.g. a ZAP passive alert
             # rendered as status=None / body="finding basis: ..."). Keep genuine attack exchanges
             # (those with a numeric status or an injected request body); drop the empty placeholders.
@@ -2712,7 +3018,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     NEVER actively tested under any profile, so the scan cannot lock accounts."""
     from .dom import dom_probe
     from .passive import passive_scan
-    from .safety import get_policy, is_auth_endpoint, is_state_changing
+    from .safety import get_policy, is_auth_endpoint, is_state_changing, is_write_action
 
     # Keep the live console readable: the target's self-signed/mismatched cert otherwise floods the
     # log with one urllib3 InsecureRequestWarning PER REQUEST (thousands), burying every real
@@ -2740,13 +3046,37 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # stray logout) or it silently degrades to scanning the login page. Probe validity at each
     # stage boundary and re-auth on loss, refreshing the cookie for every downstream tool. Inert
     # unless a probe URL + reauth are supplied (params or env), so back-compat is preserved.
+    # Header-bearer keeper mode (generic): when D4ST_AUTH_HEADER is set, the keeper maintains an
+    # auth HEADER (bearer/opaque token) rather than a cookie — detecting a 401/403 expiry and/or
+    # re-minting on a token-TTL timer (D4ST_AUTH_TTL), then re-injecting the fresh token into the
+    # header for every tool. The re-mint command (D4ST_REAUTH_CMD) returns a bare token. This is
+    # what lets a header-authed API with a short, non-refreshable token (an access token that just
+    # dies at its TTL) be scanned to full depth instead of degrading to unauth mid-scan.
+    _auth_hdr_name = os.environ.get("D4ST_AUTH_HEADER", "")
+    _auth_hdr_tmpl = os.environ.get("D4ST_AUTH_HEADER_TEMPLATE", "")
+    _auth_ttl = int(os.environ.get("D4ST_AUTH_TTL", "0") or "0")
+    _init_token = ""
+    if _auth_hdr_name:
+        _tmpl = _auth_hdr_tmpl or (
+            "Bearer {token}" if _auth_hdr_name.lower() == "authorization" else "{token}")
+        _cur_val = (_AUTH_HEADER or {}).get(_auth_hdr_name) \
+            or (auth_headers or {}).get(_auth_hdr_name) or ""
+        _init_token = _token_from_header_value(_tmpl, _cur_val) if _cur_val \
+            else os.environ.get("D4ST_AUTH_TOKEN", "")
     _session = SessionKeeper(
         cookie,
         probe_url=session_probe or os.environ.get("D4ST_SESSION_PROBE_URL", ""),
         ok_marker=session_marker or os.environ.get("D4ST_SESSION_MARKER", ""),
-        reauth=reauth or _env_reauth())
+        reauth=reauth or _resolve_reauth("header" if _auth_hdr_name else "cookie"),
+        auth_header=_auth_hdr_name,
+        header_template=_auth_hdr_tmpl,
+        ttl=_auth_ttl,
+        token=_init_token)
     if _session.enabled:
-        print(f"[session] keeper armed (probe={_session.probe_url})", flush=True)
+        _armed = (f"header={_session.auth_header}, ttl={_session.ttl}s, probe="
+                  f"{_session.probe_url or 'none'}") if _session.header_mode \
+            else f"probe={_session.probe_url}"
+        print(f"[session] keeper armed ({_armed})", flush=True)
         cookie = _session.ensure("preflight")
     # Rate override for robust targets (owned labs / benchmark apps with thousands of cases):
     # safe-deep's 2-rps throttle is right for fragile client prod, but it makes the active
@@ -2783,6 +3113,15 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
 
     _headless = appprof.headless if appprof else None
     _seeds = appprof.entry_seeds if appprof else []
+    # Operator-supplied seed URLs (D4ST_SEED_URLS, newline/comma-separated): force known
+    # high-value endpoints into the crawl roots AND the frontier directly. A crawler can miss
+    # a page reachable only via menu/postback nav or a deep parameterized URL; seeding it here
+    # guarantees the injection/active stages still reach it. Same treatment as the auto-discovered
+    # entry seeds below (unioned into `urls` so a normalized/dropped query string survives).
+    _op_seeds = [s.strip() for s in re.split(r"[\n,]+", os.environ.get("D4ST_SEED_URLS", "")) if s.strip()]
+    if _op_seeds:
+        print(f"[seed] {len(_op_seeds)} operator seed URL(s) forced into crawl roots + frontier", flush=True)
+        _seeds = list(dict.fromkeys([*_seeds, *_op_seeds]))
     urls = blind_crawl(target, cookie, depth=depth, politeness=pol,
                        headless=_headless, seeds=_seeds)
     # Ensure discovered entry seeds (incl. a captured redirect-landing URL with its query params)
@@ -2823,18 +3162,54 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # self-lower the rate and abort if the target struggles, so this is a ceiling, not a floor.
     _ferox_threads = max(4, pol.concurrency * 2) if pol else 8
     _ferox_rate = max(10, int(pol.rps * pol.concurrency * 2)) if pol else 15
-    _dopts = {"cookie": cookie, "harvest_rounds": int(os.environ.get("D4ST_HARVEST_ROUNDS") or 3), "ferox_depth": 2, "timeout": 1500,
-              "ferox_threads": _ferox_threads, "ferox_rate": _ferox_rate}
+    _dopts = {"cookie": cookie, "harvest_rounds": int(os.environ.get("D4ST_HARVEST_ROUNDS") or 3),
+              "ferox_depth": int(os.environ.get("D4ST_FEROX_DEPTH") or 3), "timeout": 1500,
+              "ferox_threads": _ferox_threads, "ferox_rate": _ferox_rate,
+              # arjun param-mining: more threads than its default 2 (param GETs are cheap) and a
+              # dedicated, longer budget so it FINISHES over the full page set (it previously timed
+              # out at the shared 1500s cap with the oversized large.txt and never emitted params).
+              "workers": max(4, (pol.concurrency if pol else 4)),
+              "arjun_timeout": int(os.environ.get("D4ST_ARJUN_TIMEOUT") or 2400)}
     if os.environ.get("D4ST_FEROX_WORDLIST"):   # operator override (e.g. a fast list)
         _dopts["ferox_wordlist"] = os.environ["D4ST_FEROX_WORDLIST"]
     #  (c) arjun: hidden-parameter discovery on the crawled URLs, so downstream scanners test
     #      REAL accepted params instead of a blind wordlist (non-active recon; --stable + rate cap).
-    for _tool, _seeds in (("linkharvest", urls), ("feroxbuster", None), ("arjun", urls)):
+    #  (d) shortscan: IIS 8.3 tilde short-name enumeration. RECYCLES disclosed stems back into the
+    #      frontier as candidate paths (feroxbuster/crawl then expand them) and emits a confirmed
+    #      info-disclosure finding, folded into `findings` once that list is initialised below.
+    _shortscan_findings: list[Finding] = []
+    for _tool, _seeds in (("linkharvest", urls), ("feroxbuster", None), ("arjun", urls),
+                          ("shortscan", None)):
+        # VISIBILITY: the convergence loop used to run every discovery tool silently and swallow
+        # all exceptions, so a tool that was missing, errored, or found nothing was invisible (this
+        # hid a feroxbuster crash-on-no-wordlist = zero content discovery). Log each tool's
+        # availability, discovered count, frontier gain, and any error so the crawl surface is
+        # auditable from the run log.
+        _before = len(urls)
         try:
-            _r = REGISTRY[_tool].run(_RC(target=target, seed_urls=_seeds or [], options=_dopts))
+            _ad = REGISTRY[_tool]
+            if not _ad.available():
+                print(f"[discovery:{_tool}] SKIP — tool/binary not available", flush=True)
+                continue
+            _r = _ad.run(_RC(target=target, seed_urls=_seeds or [], options=_dopts))
             if _r.discovered_urls:
                 urls = sorted(set(urls) | set(_r.discovered_urls))
-        except Exception:  # noqa: BLE001,S112 - a discovery tool failing must not sink the scan
+            # Defense-in-depth: even though adapters now sanitize their own notes, redact any
+            # Cookie/token substring before logging so a tool note can never leak the session.
+            _note = re.sub(r"(?i)cookie:\s*\S[^|]*", "Cookie: [REDACTED] ", _r.note or "")
+            print(f"[discovery:{_tool}] ok={_r.ok} discovered={len(_r.discovered_urls or [])} "
+                  f"frontier +{len(urls) - _before} -> {len(urls)} | {_note}", flush=True)
+            if _tool == "shortscan":
+                for _f in (_r.findings or []):
+                    _shortscan_findings.append(Finding(
+                        tool="shortscan", category=_f.get("category", "info-disclosure"),
+                        url=_f.get("url") or target, param=None,
+                        evidence=str(_f.get("evidence", ""))[:1000],
+                        payload=str(_f.get("payload", ""))[:400],
+                        detection="iis-shortname-enumeration",
+                        confidence="firm", verified=True))
+        except Exception as _dexc:  # noqa: BLE001 - a discovery tool failing must not sink the scan
+            print(f"[discovery:{_tool}] ERROR — {type(_dexc).__name__}: {_dexc}", flush=True)
             continue
 
     # Authenticated API-surface harvest (token-SPA crawl-reach lever): katana's browser can't carry
@@ -2939,7 +3314,12 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     active_targets = targets
     skipped_state_changing = 0
     if policy.skip_state_changing:
-        active_targets = [t for t in targets if not is_state_changing(t.url)]
+        # METHOD-AWARE skip: exclude a target from active fuzzing only when it is a genuine WRITE
+        # (non-GET method AND a destructive/notifying verb in its path). A GET read whose path
+        # merely contains a verb (OrderDetail.asp?id=, OrderList.asp?...) is TESTED — the old
+        # path-only is_state_changing dropped the whole shop surface and starved the injection
+        # roster. POST ConfirmOrder / SendMail / DeleteItem forms are still dropped.
+        active_targets = [t for t in targets if not is_write_action(t.url, t.method)]
         skipped_state_changing = len(targets) - len(active_targets)
     # HARD SAFETY (all profiles): the native engine NEVER auto-fuzzes the DELETE verb. DELETE
     # targets only ever arise from the OpenAPI seeder; drop them here so a RESTful DELETE on a
@@ -2953,6 +3333,9 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # Fold in the JS-content disclosure findings (connstrings/emails/keys/vuln-deps) gathered above.
     if _js_findings:
         findings.extend(_js_findings)
+    # Fold in the IIS short-name disclosure findings from the discovery convergence (shortscan).
+    if _shortscan_findings:
+        findings.extend(_shortscan_findings)
 
     # Incremental progress checkpoint (crash-survivable observability): after each stage, rewrite
     # D4ST_PROGRESS_FILE with everything found so far + a stage timeline. So even a killed/hung
@@ -3095,7 +3478,20 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         # Permanent coverage: runs for ANY authenticated session (a bearer/custom header is enough —
         # not only sessionStorage-SPAs), and sources endpoints from the harvest OR, failing that,
         # the full crawl/seed frontier. run_authz filters to same-origin /api GETs internally.
-        _authz_urls = _harvest_urls or [u for u in urls if "/api/" in u.lower()]
+        # Feed the differential authz/IDOR engine the PARAMETERIZED frontier — NOT just /api/.
+        # The old "/api/"-only gate meant a classic server-rendered app (Classic-ASP shop, which
+        # has no /api/ routes) never ran this engine at all. Every in-scope URL carrying a query
+        # string is an object-access candidate; prioritize object-ID-looking params (id, *id,
+        # recid, recID, CatRecId, *RecId, itemType, orderid, custid, userid) so the per-run cap
+        # keeps the highest-value IDOR endpoints. run_authz still same-origin-filters internally.
+        import re as _re_authz
+        _objid = _re_authz.compile(r"(?i)(?:^|[?&])([a-z0-9_]*id[a-z0-9_]*|itemtype)=")
+        if _harvest_urls:
+            _authz_urls = _harvest_urls
+        else:
+            _param_urls = [u for u in urls if urlsplit(u).query]
+            _authz_urls = sorted(_param_urls,
+                                 key=lambda u: (0 if _objid.search(urlsplit(u).query) else 1, u))
         if session is not None and _authz_urls:
             _refresh_jwt("authz")
             try:
@@ -3112,8 +3508,8 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                     detection=f"authenticated authorization replay ({_d['type']})",
                     confidence="firm" if _d["type"] != "idor-suspect" else "tentative",
                     evidence_log=_d.get("evidence_log", []), repro=_d.get("repro", "")))
-            _src = "harvested" if _harvest_urls else "frontier"
-            print(f"[authz] replayed {len(_authz_urls)} {_src} /api endpoint(s) under "
+            _src = "harvested" if _harvest_urls else "parameterized-frontier"
+            print(f"[authz] replayed {len(_authz_urls)} {_src} endpoint(s) under "
                   f"tampered identities; {len(_hz)} authorization finding(s)", flush=True)
             _prog.update("authz", findings, urls=len(urls), targets=len(targets))
 
@@ -3417,8 +3813,12 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     # extractor) — the OSS analog to Burp's passive scanner (source/key/token/config
     # disclosure, emails/PII). Read-only GETs, so run regardless of active-scan policy.
     if tools:
-        findings += run_nuclei_exposures(urls, cookie, politeness=pol)
-        _prog.update("nuclei-exposures", findings, urls=len(urls), targets=len(targets))
+        # Skip the slow DNS-heavy CVE/takeover corpus if the target already backed off (stage>=1) so
+        # this stage can't grind an hour and stress the app out of ZAP's reach (v3 root cause).
+        _nx_heavy = (health is None) or (getattr(health, "stage", 0) < 1)
+        findings += run_nuclei_exposures(urls, cookie, politeness=pol, heavy=_nx_heavy)
+        _prog.update("nuclei-exposures", findings, urls=len(urls), targets=len(targets),
+                     note=("full corpus" if _nx_heavy else "fast corpus (target stressed)"))
 
     # 2c) PII / PHI disclosure (Presidio, Burp-style) — high-precision structured profile
     # (email, SSN, card w/ Luhn, IBAN, medical/passport/ITIN; NO NER-names, which false-
@@ -3527,8 +3927,15 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     zap_ran = False
     zap_note = "disabled"
     if zap and tools and policy.active_scan:
-        if health.check() >= 2:
-            zap_note = "skipped: target unhealthy"
+        # ZAP is the heaviest engine and runs LAST, so a transient stress dip earlier in the run used
+        # to permanently skip it (v3: 2 liveness blips during the hour-long nuclei-exposures stage
+        # HALTed the gate and ZAP never ran). Give a HALTed target a cooldown + recovery probe FIRST;
+        # only skip if it is genuinely still down. A recovered target runs ZAP at reduced intensity.
+        _zh = health.check()
+        if _zh >= 2:
+            _zh = health.recover_check(attempts=3, delay=20.0)
+        if _zh >= 2:
+            zap_note = "skipped: target unhealthy (recovery probe also failed)"
         elif not zap_available():
             zap_note = "skipped: ZAP unavailable (no baked-in zap.sh, no dockerized zaproxy image)"
         else:
@@ -3562,8 +3969,14 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                 # /send, /export would fire. Drop is_state_changing URLs from the frontier itself when
                 # the policy or D4ST_ZAP_SKIP_DESTRUCTIVE is set (mirrors the native engine's skip).
                 _skip = policy.skip_state_changing or os.environ.get("D4ST_ZAP_SKIP_DESTRUCTIVE") == "1"
+                # Method-aware: the frontier is GET crawl URLs, so a GET read with a verb in its
+                # path (OrderDetail.asp/OrderList.asp/export) survives into ZAP's active scan. Only
+                # a non-GET write would be dropped — but ZAP imports these as GETs, so in practice
+                # this keeps the read surface while still honoring the cred-path exclusion. (A GET
+                # that performs a write, e.g. /delete?id=, is accepted under this policy on the
+                # isolated target copy; see is_write_action.)
                 _zap_frontier = [u for u in urls if urlsplit(u).path not in _cred_paths
-                                 and not (_skip and is_state_changing(u))]
+                                 and not (_skip and is_write_action(u))]
                 findings += run_zap(target, cookie, _tf.mkdtemp(prefix="d4st-zap-"),
                                     timeout=_zap_to, seed_url=_zap_seed, frontier=_zap_frontier)
                 zap_ran = True
@@ -3893,14 +4306,26 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         # is a mis-severity bug, not data, so we fix it while keeping every instance.
         _ZAP_CAT_OVERRIDE = [
             (re.compile(r"cross-domain javascript source file inclusion", re.I), "misconfiguration"),
-            (re.compile(r"session management response|modern web application|user agent fuzzer|"
-                        r"re-examine cache|sub resource integrity|timestamp disclosure|"
-                        r"information disclosure - suspicious comments|elmah", re.I), "info-disclosure"),
+            (re.compile(r"session management response|elmah", re.I), "info-disclosure"),
         ]
+        # DE-NOISE (D4ST_ZAP_DENOISE=0 to disable): ZAP's passive scanner emits a tail of pure
+        # housekeeping alerts with no pentest value that inflated the v2deep result (the "other" and
+        # info-disclosure spam the diff flagged). DROP these outright; real categories (CSRF absence,
+        # open-redirect, injection, disclosure) are kept untouched. Reversible + logged.
+        _ZAP_DENOISE = os.environ.get("D4ST_ZAP_DENOISE", "1") != "0"
+        _ZAP_NOISE_RX = re.compile(
+            r"user agent fuzzer|timestamp disclosure|information disclosure - suspicious comments|"
+            r"re-examine cache-control|modern web application|sub resource integrity attribute missing|"
+            r"charset mismatch|storable and cacheable content|non-storable content|storable content|"
+            r"retrieved from cache|content-type-options header missing \(informational\)", re.I)
+        _zap_dropped_noise = 0
         out: list[Finding] = []
         for n in normalize_zap(report):
             alert = n.raw or {}
             _zname = str(alert.get("name", ""))
+            if _ZAP_DENOISE and _ZAP_NOISE_RX.search(_zname):
+                _zap_dropped_noise += 1
+                continue
             for _rx, _newcat in _ZAP_CAT_OVERRIDE:
                 if _rx.search(_zname):
                     n.category = _newcat
@@ -3941,6 +4366,9 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
                 detection="zap active scan",
                 confidence=("firm" if conf in ("2", "3", "Medium", "High") else "tentative"),
                 verify_note=(f"Remediation (ZAP): {solution}" if solution else "")))
+        if _zap_dropped_noise:
+            print(f"[zap] de-noise dropped {_zap_dropped_noise} housekeeping passive alert(s)",
+                  flush=True)
         print(f"[zap] {len(out)} finding instance(s) (every endpoint kept as its own item)", flush=True)
         # Soft-404 guard: on catch-all/SPA-routing apps, ZAP's file-existence checks
         # (.env/.htaccess/Trace.axd/backup-file leaks) false-positive on the index page. Re-verify

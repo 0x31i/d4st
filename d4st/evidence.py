@@ -12,8 +12,43 @@ when opsec allows.
 from __future__ import annotations
 
 import os
+import re
 
 _MAX_BODY = 8000
+
+# PHI / regulated-data redaction. When a target handles personal or health data, response bodies
+# captured as proof can contain SSNs, DOBs, names, contact and insurance identifiers. Scrub those
+# before any body string is persisted to an artifact. Set D4ST_NO_PHI_REDACT=1 to disable (do not
+# disable against regulated-data targets).
+_PHI_KEYS = re.compile(
+    r'(?i)("(?:first_?name|last_?name|middle_?name|full_?name|patient_?name|patientname|dob|'
+    r'date_?of_?birth|birth_?date|ssn|social|mrn|medical_?record|member_?id|subscriber|guarantor|'
+    r'address\d?|street|city|state|zip|postal|phone|mobile|home_?phone|cell|fax|email|insurance|'
+    r'policy_?number|account_?number|chart_?number|dependent)"\s*:\s*)"[^"]*"')
+_PHI_SSN = re.compile(r'\b\d{3}-\d{2}-\d{4}\b')
+_PHI_PHONE = re.compile(r'\b(?:\(\d{3}\)\s*|\d{3}[-.\s])\d{3}[-.\s]\d{4}\b')
+_PHI_EMAIL = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
+_PHI_DOB = re.compile(r'\b\d{1,2}[-/]\d{1,2}[-/](?:19|20)\d{2}\b|\b(?:19|20)\d{2}[-/]\d{1,2}[-/]\d{1,2}\b')
+_PHI_LONGNUM = re.compile(r'\b\d{7,}\b')
+
+
+def _redact_phi(s):
+    """Scrub PHI / regulated-data from a body string BEFORE it is persisted to any artifact."""
+    if not s:
+        return s
+    if os.environ.get("D4ST_NO_PHI_REDACT") == "1":
+        return s
+    try:
+        t = s if isinstance(s, str) else str(s)
+    except Exception:  # noqa: BLE001
+        return s
+    t = _PHI_KEYS.sub(lambda m: m.group(1) + '"<PHI-REDACTED>"', t)
+    t = _PHI_SSN.sub("<SSN-REDACTED>", t)
+    t = _PHI_PHONE.sub("<PHONE-REDACTED>", t)
+    t = _PHI_EMAIL.sub("<EMAIL-REDACTED>", t)
+    t = _PHI_DOB.sub("<DOB-REDACTED>", t)
+    t = _PHI_LONGNUM.sub("<NUM-REDACTED>", t)
+    return t
 
 
 def _full_auth() -> bool:
@@ -46,7 +81,7 @@ def exchange(label: str, r, *, req_body: str = "") -> dict:
     body = req_body
     if not body and req is not None:
         try:
-            body = (getattr(req, "content", b"") or b"").decode("utf-8", "replace")[:_MAX_BODY]
+            body = _redact_phi((getattr(req, "content", b"") or b"").decode("utf-8", "replace")[:_MAX_BODY])
         except Exception:  # noqa: BLE001
             body = ""
     return {
@@ -55,14 +90,14 @@ def exchange(label: str, r, *, req_body: str = "") -> dict:
             "method": getattr(req, "method", "GET"),
             "url": str(getattr(req, "url", "")),
             "headers": redact_headers(dict(getattr(req, "headers", {}) or {})),
-            "body": body,
+            "body": _redact_phi(body),
         },
         "response": {
             "status": getattr(r, "status_code", None),
             "headers": dict(getattr(r, "headers", {}) or {}),
             "elapsed_ms": elapsed,
             "size": len(getattr(r, "content", b"") or b""),
-            "body": (getattr(r, "text", "") or "")[:_MAX_BODY],
+            "body": _redact_phi((getattr(r, "text", "") or "")[:_MAX_BODY]),
         },
     }
 
@@ -108,7 +143,7 @@ def raw_response(r) -> str:
            f"{getattr(r, 'reason_phrase', '') or ''}".rstrip()]
     for k, v in (getattr(r, "headers", {}) or {}).items():
         out.append(f"{k}: {v}")
-    return "\r\n".join(out) + "\r\n\r\n" + (getattr(r, "text", "") or "")
+    return "\r\n".join(out) + "\r\n\r\n" + _redact_phi(getattr(r, "text", "") or "")
 
 
 def synthetic_exchange(label: str, *, method: str, url: str, req_headers: dict | None = None,
@@ -119,7 +154,8 @@ def synthetic_exchange(label: str, *, method: str, url: str, req_headers: dict |
     return {
         "label": label,
         "request": {"method": method, "url": url,
-                    "headers": redact_headers(req_headers or {}), "body": (req_body or "")[:_MAX_BODY]},
+                    "headers": redact_headers(req_headers or {}),
+                    "body": _redact_phi((req_body or "")[:_MAX_BODY])},
         "response": {"status": status, "headers": resp_headers or {},
-                     "body": (resp_body or "")[:_MAX_BODY]},
+                     "body": _redact_phi((resp_body or "")[:_MAX_BODY])},
     }

@@ -587,6 +587,60 @@ _LDAP_ERR = re.compile(
     r"LDAP:\s*error code|Bad search filter|supplied argument is not a valid ldap|"
     r"AcceptSecurityContext|OpenLDAP|ldap_search|protocol error.*ldap)", re.IGNORECASE)
 
+# WAF / gateway block-page signature. A blocked request returns a small canned page whose large
+# size delta vs the baseline response would otherwise be miscounted as an operator differential.
+_WAF_BLOCK_SIG = re.compile(
+    r"(application\s+gateway|request\s+blocked|the\s+requested\s+url\s+was\s+rejected|"
+    r"web\s+application\s+firewall|mod[_\s]?security|incident\s+id|support\s+id|"
+    r"request\s+unsuccessful|attention\s+required|access\s+(?:to\s+this\s+page\s+)?"
+    r"(?:has\s+been\s+)?denied|blocked\s+by|your\s+request\s+(?:has\s+been\s+)?blocked|"
+    r"malicious|cloudflare|akamai|sucuri|imperva|f5\s+big-?ip)", re.IGNORECASE)
+# Header names that, when present, betray a WAF/CDN/gateway sitting in front of the app.
+_WAF_HDRS = ("x-azure-ref", "cf-ray", "x-waf-event-info", "x-sucuri-id", "x-cdn",
+             "x-iinfo", "x-akamai-transformed")
+
+
+def _is_waf_block(resp) -> bool:
+    """True when a response looks like a WAF/gateway BLOCK, not an application answer.
+
+    Catches the Azure Application Gateway class: a `param[$ne]=` probe trips the WAF and comes
+    back as a ~179-581B HTTP 403 block page. That large delta vs baseline is NOT an injection
+    operator-differential, so the caller must treat it as inconclusive/blocked, never positive."""
+    try:
+        status = int(getattr(resp, "status_code", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return False
+    body = getattr(resp, "text", "") or ""
+    try:
+        hdrs = {str(k).lower(): str(v or "") for k, v in dict(getattr(resp, "headers", {}) or {}).items()}
+    except Exception:  # noqa: BLE001
+        hdrs = {}
+    if any(h in hdrs for h in _WAF_HDRS):
+        # a fronting WAF header on a blocking status is a block
+        if status in (400, 403, 406, 429, 501, 503):
+            return True
+    blob = body + " " + " ".join(f"{k}:{v}" for k, v in hdrs.items())
+    if status in (400, 403, 406, 429, 501, 503) and _WAF_BLOCK_SIG.search(blob):
+        return True
+    # a tiny canned page on a hard block status is almost always a gateway block, not a result set
+    if status in (403, 406) and len(body) < 1500:
+        return True
+    return False
+
+
+def _placeholder_param(name: str, value: str) -> bool:
+    """True for params that are not a real injectable input: unresolved templating placeholders
+    (`${...}`) and HTML-entity split artifacts (a `&amp;foo=` naive-split leaves a param named
+    `amp;foo`). Scoring these as an injection differential is a false positive."""
+    n = (name or "").strip()
+    v = (value or "").strip()
+    low = n.lower()
+    if "${" in n or "${" in v:
+        return True
+    if low == "amp" or low.startswith("amp;"):
+        return True
+    return False
+
 
 def _param_candidates(base, urls, max_urls):
     """In-scope, non-auth URLs that carry query params (shared by the injection probes)."""
@@ -643,6 +697,10 @@ def run_nosql_checks(session, base, urls, *, delay=0.2, timeout=12.0, max_urls=2
             base_len = len(base_body)
             base_err = bool(_NOSQL_ERR.search(base_body))
             for i, (pn, pv) in enumerate(params[:max_params]):
+                # placeholder / entity-artifact param guard: `${...}` templating and `amp;`
+                # entity-split artifacts are not real injectable inputs — never score them.
+                if _placeholder_param(pn, pv):
+                    continue
                 # error-based
                 q_err = "&".join(f"{k}={quote(pv + chr(39), safe='')}" if j == i
                                  else f"{k}={quote(vv, safe='')}" for j, (k, vv) in enumerate(params))
@@ -665,8 +723,13 @@ def run_nosql_checks(session, base, urls, *, delay=0.2, timeout=12.0, max_urls=2
                     nurl, rn = _get(c, sp, q_ne)
                 except Exception:  # noqa: BLE001
                     continue
+                # WAF/gateway BLOCK guard: a 403 block page (e.g. Azure Application Gateway,
+                # ~179-581B) is a large size delta vs baseline but is NOT an operator
+                # differential. Treat as inconclusive/blocked, never a positive.
+                if _is_waf_block(rn):
+                    continue
                 nb = rn.text or ""
-                if abs(len(nb) - base_len) / base_len > 0.30:
+                if base_len and abs(len(nb) - base_len) / base_len > 0.30:
                     findings.append(_finding("nosql-injection", "high", nurl, pn,
                         f"parameter '{pn}' shows a NoSQL operator differential: injecting a "
                         f"'[$ne]' operator materially changed the result set "
