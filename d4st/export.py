@@ -15,7 +15,7 @@ import re as _re
 from urllib.parse import urlsplit as _urlsplit
 from xml.sax.saxutils import escape as _xesc
 
-from .report import SEV_RANK, _meta_for
+from .report import SEV_RANK, _meta_for, severity_for
 
 # Curated at-a-glance titles: param (check name) -> the EXACT issue. Without this, a d4st family
 # category ("misconfiguration"/"tls-configuration"/"pii-disclosure") collapses many distinct checks
@@ -162,7 +162,7 @@ def _exchange_text(evlog) -> tuple[str, str]:
 
 
 def _ordered(findings: list[dict]) -> list[dict]:
-    return sorted(findings, key=lambda f: (SEV_RANK.get(_meta_for(f.get("category", "other"))["severity"], 9),
+    return sorted(findings, key=lambda f: (SEV_RANK.get(severity_for(f), 9),
                                            f.get("category", ""), f.get("url", "")))
 
 
@@ -176,7 +176,7 @@ def _row(i: int, f: dict) -> list:
     m = _meta_for(f.get("category", "other"))
     req, resp = _exchange_text(f.get("evidence_log"))
     desc = _dd((m["desc"] + ((" - " + f["evidence"]) if f.get("evidence") else "")).strip())
-    return [i, _dd(_specific_name(f, m)), f.get("category", ""), m["severity"], f.get("confidence") or "",
+    return [i, _dd(_specific_name(f, m)), f.get("category", ""), severity_for(f), f.get("confidence") or "",
             _verified_str(f.get("verified")), f.get("tool", ""), f.get("url", ""),
             f.get("method", "GET"), f.get("param") or "", f.get("payload") or "", desc,
             _dd(m["fix"]), _dd(m["cwe"]), _dd(m["owasp"]), f.get("detection") or "", req, resp,
@@ -267,7 +267,7 @@ def to_burp_xml(result: dict, path: str) -> int:
         lines.append(f'    <host ip="">{_xesc(host)}</host>')
         lines.append(f"    <path>{_xesc(path_q)}</path>")
         lines.append(f"    <location>{_xesc(f.get('param') or path_q)}</location>")
-        lines.append(f"    <severity>{_BURP_SEV.get(m['severity'], 'Information')}</severity>")
+        lines.append(f"    <severity>{_BURP_SEV.get(severity_for(f), 'Information')}</severity>")
         lines.append(f"    <confidence>{_burp_confidence(f)}</confidence>")
         # Fold the specific evidence into issueBackground too. ASM-NG shows issueBackground
         # as the vuln DESCRIPTION but does not surface issueDetail, so without this a
@@ -309,7 +309,7 @@ def to_xlsx(result: dict, path: str, meta: dict | None = None, burp_diff: dict |
     # ---- Summary sheet -------------------------------------------------------------------------
     ws = wb.active
     ws.title = "Summary"
-    sev_counts = Counter(_meta_for(f.get("category", "other"))["severity"] for f in findings)
+    sev_counts = Counter(severity_for(f) for f in findings)
     cat_counts = Counter(f.get("category", "?") for f in findings)
     ws["A1"] = "d4st Engagement — Findings Summary"
     ws["A1"].font = Font(bold=True, size=14)

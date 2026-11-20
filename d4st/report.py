@@ -135,7 +135,10 @@ VULN_META: dict[str, dict] = {
         fix="Require a per-session anti-CSRF token on state-changing requests, set SameSite=Lax/"
             "Strict on session cookies, and validate Origin/Referer."),
     "bola": dict(
-        title="Broken Object-Level Authorization (BOLA/IDOR)", severity="critical", cwe="CWE-639",
+        # Access-control / authorization bypass on protected data → High (not Critical): an
+        # authorization flaw exposes data but is not, by itself, remote code execution or a
+        # pre-auth credential mint. Severity_for() keeps this High when verified.
+        title="Broken Object-Level Authorization (BOLA/IDOR)", severity="high", cwe="CWE-639",
         owasp="API1:2023 BOLA",
         desc="One user's identity can read or modify another user's object by changing an ID — the "
              "#1 API risk. In healthcare this is direct cross-patient record access.",
@@ -191,7 +194,8 @@ VULN_META: dict[str, dict] = {
         fix="Suppress verbose errors/banners, remove debug endpoints, and keep source/secrets out "
             "of responses."),
     "broken-auth": dict(
-        title="Broken Authentication (Missing Authorization Check)", severity="critical",
+        # Missing-authorization / access-control bypass on protected data → High (see bola note).
+        title="Broken Authentication (Missing Authorization Check)", severity="high",
         cwe="CWE-306", owasp="A01:2021 Broken Access Control / API2:2023",
         desc="An authenticated API endpoint returns real data when the bearer token is removed "
              "entirely — the server does not enforce authentication on that route. Anyone on the "
@@ -258,6 +262,36 @@ VULN_META: dict[str, dict] = {
              "connection string or cloud key is often directly abusable.",
         fix="Remove secrets from client code; keep them server-side. Rotate any exposed credential "
             "immediately, scope keys to least privilege, and add secret-scanning to CI."),
+    # Canonical secret category emitted by the secret scanners (trufflehog / gitleaks roster). Base
+    # severity is High (a disclosed credential); severity_for() ELEVATES it to Critical when the
+    # scanner independently VERIFIED the secret is live (e.g. trufflehog Verified=true), and caps an
+    # unverified / low-entropy match lower. Without this entry the class fell through to "other"
+    # (Info) — the real bug that buried a trufflehog-verified live Azure AI key as Information.
+    "secret": dict(
+        title="Verified Secret / Credential Disclosure", severity="high", cwe="CWE-798 / CWE-522",
+        owasp="A07:2021 Identification and Authentication Failures",
+        desc="A secret scanner recovered a credential — an API key, access token, connection string, "
+             "or private key — from client-delivered content. When the scanner VERIFIED the secret "
+             "against its live service (e.g. trufflehog Verified=true), it is a proven, directly "
+             "abusable credential (e.g. a working cloud/AI API key) — a complete pre-compromise of "
+             "whatever that credential grants.",
+        fix="Remove the secret from client-delivered code and rotate it immediately; keep secrets "
+            "server-side, scope them to least privilege, and add verified secret-scanning to CI."),
+    # Unauthenticated token / SAS minting: an anonymous caller hits an endpoint that hands back a
+    # live credential (Azure Storage SAS, bearer/JWT) with NO session. When proven (the engine's
+    # probe got a usable token back, verified=true) this is a Critical pre-auth credential-issuance
+    # primitive. Was absent from the VKB → fell through to "other" (Info); that buried the FHC
+    # unauthenticated SAS-minting endpoint as Information.
+    "unauthenticated-token-minting": dict(
+        title="Unauthenticated Token / SAS Minting", severity="critical", cwe="CWE-306 / CWE-522",
+        owasp="A01:2021 Broken Access Control / API2:2023 Broken Authentication",
+        desc="An endpoint issues a live credential (an Azure Storage SAS token, or a bearer/JWT) to "
+             "a caller with NO authentication. Any anonymous attacker can mint a usable token and "
+             "then act with whatever access that token grants (e.g. read/write a storage account) — "
+             "a direct, pre-auth credential-issuance primitive.",
+        fix="Require authentication and authorization before issuing any token/SAS; scope issued "
+            "tokens to the least privilege and shortest lifetime; never expose a mint endpoint "
+            "anonymously, and rotate the backing storage/account keys."),
     "vulnerable-js-dependency": dict(
         title="Vulnerable JavaScript Dependency", severity="medium", cwe="CWE-1104 / CWE-937",
         owasp="A06:2021 Vulnerable and Outdated Components",
@@ -346,7 +380,8 @@ VULN_META: dict[str, dict] = {
         fix="Apply authorization uniformly to ALL methods (deny-by-default); do not gate on an exact "
             "verb string. Return 405 for unsupported methods and 401/403 consistently."),
     "broken-object-level-authorization": dict(
-        title="Broken Object-Level Authorization (Cross-Account BOLA/IDOR)", severity="critical",
+        # Confirmed cross-account authorization bypass on protected data → High (see bola note).
+        title="Broken Object-Level Authorization (Cross-Account BOLA/IDOR)", severity="high",
         cwe="CWE-639", owasp="API1:2023 BOLA / A01:2021",
         desc="A second authenticated account retrieved the first account's object at the same endpoint "
              "— one user can read another user's data. Confirmed with two accounts (not a suspicion). "
@@ -475,6 +510,64 @@ SEV_RANK = {s: i for i, s in enumerate(SEV_ORDER)}
 def _meta_for(cat: str) -> dict:
     base = VULN_META.get(cat, VULN_META["other"])
     return {**base, "classes": _CLASSES.get(cat, []), "refs": _REFS.get(cat, [])}
+
+
+# ── deterministic severity resolution (verified/confidence-aware) ───────────────────────────────
+# The VKB above gives each CATEGORY a base severity. For a few high-impact classes that is not
+# enough on its own: whether a disclosed secret or a minted token is a Critical depends on whether
+# the engine actually CONFIRMED it (a verified live credential) versus merely flagged a lead. This
+# resolver lets the finding's own `verified` flag and `confidence` modulate the category base, so
+# d4st's DEFAULT report (no AI/review layer) rates confirmed criticals at their true tier AT
+# DETECTION while NOT inflating unverified candidates. It is a pure rules table — no AI, no network,
+# fully deterministic — and callers use it in place of the raw category severity.
+
+# Disclosed credential/secret classes: a VERIFIED live key is Critical; a firm static match is
+# High; a tentative / low-entropy lead is capped at Medium.
+_SECRET_CATS = {"secret", "secret-disclosure"}
+# Unauthenticated token / SAS minting: a proven anonymous mint is Critical; an unproven hint is High.
+_TOKEN_MINT_CATS = {"unauthenticated-token-minting"}
+# Confidence strings the engine emits for a firm/strong detection (certain > firm > tentative).
+_STRONG_CONF = {"certain", "firm", "high"}
+
+
+def severity_for(f: dict) -> str:
+    """Resolve a single finding's severity deterministically.
+
+    Starts from the finding's category base severity (the VKB), then factors `verified` and
+    `confidence` for the classes where confirmation changes the tier. Returns a severity string
+    from SEV_ORDER. Never raises; unknown categories fall back to the VKB "other" base.
+    """
+    cat = f.get("category", "other")
+    base = _meta_for(cat)["severity"]
+    verified = f.get("verified")
+    conf = str(f.get("confidence") or "").strip().lower()
+
+    # 1) Disclosed secret / credential. trufflehog Verified=true (verified is True) means the key
+    #    was validated against its live service → Critical. A firm/certain static match (e.g. an
+    #    Azure/AWS/Google key regex hit in client JS) is a real exposure but unproven-live → High.
+    #    Anything weaker is a tentative / low-entropy lead → Medium (never inflated).
+    if cat in _SECRET_CATS:
+        if verified is True:
+            return "critical"
+        if conf in _STRONG_CONF:
+            return "high"
+        return "medium"
+
+    # 2) Unauthenticated token / SAS minting. A proven mint (the probe got a live token back,
+    #    verified is True) is Critical; an endpoint we only suspect mints (verified is False/None)
+    #    is still a High lead. (verified is False findings are dropped from the report upstream.)
+    if cat in _TOKEN_MINT_CATS:
+        return "high" if verified is False else "critical"
+
+    return base
+
+
+def _group_severity(items: list[dict]) -> str:
+    """Worst (most severe) resolved severity across a category group — used for the group's row in
+    the index and for ordering, so a group inherits the tier of its highest finding."""
+    if not items:
+        return "info"
+    return min((severity_for(f) for f in items), key=lambda s: SEV_RANK.get(s, 9))
 
 
 # ── Manual-verification playbooks ───────────────────────────────────────────────
@@ -1014,7 +1107,7 @@ def _render_finding(f: dict, anchor: str, nobreak: bool = False, concise: bool =
     critical/high always keep full evidence."""
     cat = f.get("category", "other")
     meta = _meta_for(cat)
-    sev = meta["severity"]
+    sev = severity_for(f)   # verified/confidence-aware (not just the category base)
     # concise mode bounds giant blobs: a GENEROUS cap on crit/high (full request + headers +
     # substantial response body) and a tight cap on medium/low/info noise. The full report
     # (no --concise) keeps everything uncapped.
@@ -1121,9 +1214,9 @@ def build_report(result: dict, target: str = "", meta: dict | None = None,
     # (verified is False) — those are false positives d4st's own verification caught. They remain in
     # the raw result JSON for audit, but a refuted candidate is not a finding and must not ship.
     findings = [f for f in (result.get("findings", []) or []) if f.get("verified") is not False]
-    findings = sorted(findings, key=lambda f: (SEV_RANK.get(_meta_for(f.get("category", "other"))["severity"], 9),
+    findings = sorted(findings, key=lambda f: (SEV_RANK.get(severity_for(f), 9),
                                                f.get("category", "")))
-    sev_counts = Counter(_meta_for(f.get("category", "other"))["severity"] for f in findings)
+    sev_counts = Counter(severity_for(f) for f in findings)
     total = len(findings)
     from urllib.parse import urlsplit
     target = target or meta.get("target") or (findings[0]["url"] if findings else "target")
@@ -1231,7 +1324,7 @@ def build_report(result: dict, target: str = "", meta: dict | None = None,
     idx_rows = ""
     for cat, items in groups.items():
         m = _meta_for(cat)
-        s = m["severity"]
+        s = _group_severity(items)   # worst resolved severity across the group's findings
         first = items[0]
         conf = first.get("confidence") or ("verified" if first.get("verified") else "")
         loc = urlsplit(items[0].get("url", "")).path or items[0].get("url", "")

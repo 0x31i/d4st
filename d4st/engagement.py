@@ -399,8 +399,18 @@ def seed_targets_from_openapi(schema_url: str, cookie: str) -> tuple[list[Target
             allp = sorted(set(qparams + pparams + bparams))
             if not allp:
                 continue
+            # Default: collapse every non-GET verb to POST (write-safe, back-compat). Under
+            # D4ST_FUZZ_BODIES=1 (authorized deep API injection) preserve the REAL update verb so
+            # PUT/PATCH-only routes are injected with their true method — but DELETE is NEVER made
+            # an injection target (it remains a crawl/passive URL only).
+            if os.environ.get("D4ST_FUZZ_BODIES") == "1":
+                if M == "DELETE":
+                    continue
+                seed_method = M if M in ("GET", "POST", "PUT", "PATCH") else "POST"
+            else:
+                seed_method = "GET" if M == "GET" else "POST"
             targets.append(Target(
-                url=full, method="GET" if M == "GET" else "POST", params=allp,
+                url=full, method=seed_method, params=allp,
                 path_params=sorted(set(pparams)),
                 body_type="json" if is_json else "form",
                 template=template))
@@ -453,6 +463,7 @@ def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[
     targets), never production-safe. Uses the current auth header (set_auth_header) as the acting
     identity. Best-effort + isolated: any failure yields fewer findings, never a crash."""
     import httpx
+    from .safety import is_auth_endpoint, is_state_changing
     out: list[Finding] = []
     if not fuzz_forms:
         return out
@@ -489,6 +500,10 @@ def run_api_authz_tests(schema_url: str, cookie: str, fuzz_forms: bool) -> list[
             if not props:
                 continue
             url = _url(path)
+            # HARD RULE: never auto-fire destructive/notifying or auth verbs. Normal
+            # (non-state-changing, non-auth) create/update endpoints are still tested.
+            if is_state_changing(url) or is_auth_endpoint(url):
+                continue
             body = {p: _sample_value(p) for p in props}
             body.update(_MASS_ASSIGN_FIELDS)          # the privileged extras
             try:
@@ -728,16 +743,36 @@ def _materialize_url(t: "Target") -> str:
     the form-fuzzers handle those via request bodies)."""
     from urllib.parse import urlencode, urlsplit
     url = getattr(t, "url", "") or ""
-    if (getattr(t, "method", "GET") or "GET").upper() != "GET":
-        return ""
+    method = (getattr(t, "method", "GET") or "GET").upper()
+    _fuzz_bodies = os.environ.get("D4ST_FUZZ_BODIES") == "1"
+    if method != "GET" and not _fuzz_bodies:
+        return ""                           # default: native probes handle non-GET bodies
+    if _fuzz_bodies:
+        from .safety import is_state_changing
+        # HARD safety: the deep-body roster feed NEVER includes DELETE or destructive/notifying URLs.
+        if method == "DELETE" or is_state_changing(url):
+            return ""
     if urlsplit(url).query:                 # already a concrete ?a=b URL
         return url
     params = getattr(t, "params", None) or []
     values = getattr(t, "values", None) or {}
     if not params:
         return ""
-    q = {p: (values.get(p) or "1") for p in params}
-    return f"{url.split('?')[0]}?{urlencode(q)}"
+    if not _fuzz_bodies:
+        q = {p: (values.get(p) or "1") for p in params}
+        return f"{url.split('?')[0]}?{urlencode(q)}"
+    # D4ST_FUZZ_BODIES: substitute path params into the real template path (benign "1") instead of
+    # the bogus ?pathparam=1, then fuzz the remaining query/body params by name.
+    path_params = set(getattr(t, "path_params", None) or [])
+    template = getattr(t, "template", "") or ""
+    base = url.split('?')[0]
+    if path_params and template:
+        _t = template
+        for pp in path_params:
+            _t = _t.replace("{" + pp + "}", str(values.get(pp) or "1"))
+        base = _t.split('?')[0]
+    q = {p: (values.get(p) or "1") for p in params if p not in path_params}
+    return f"{base}?{urlencode(q)}" if q else base
 
 
 # ----- response pipeline (Burp-style passive inspection of EVERY response) ----
@@ -1578,7 +1613,11 @@ def run_sqlmap(t: Target, cookie: str, politeness=None, policy=None,
     # minutes; grinding 10 min/param mostly means it is NOT injectable (pure waste + sustained
     # load that kills fragile targets). Keep it tight so the depth pass over N params can never
     # monopolize the scan or pin the target: full=180s, reduced (stressed target)=120s.
-    _to = 180 if (level_override or (policy.sqlmap_level if policy else 2)) >= 5 else 120
+    _base_to = 180 if (level_override or (policy.sqlmap_level if policy else 2)) >= 5 else 120
+    # D4ST_SQLMAP_TIMEOUT (seconds) lets an authorized owned/bench run grant more wall-time per
+    # target so the full L5 enumeration completes across every injectable target instead of being
+    # cut mid-confirmation. Unset => unchanged (180 at L5 / 120 reduced). Env-guarded, reversible.
+    _to = int(os.environ.get("D4ST_SQLMAP_TIMEOUT") or _base_to)
     out = _run(args, timeout=_to)
     from .scoring.normalize import normalize_sqlmap
     return [Finding(tool="sqlmap", category="sql-injection", url=t.url, param=n.param,
@@ -2403,36 +2442,22 @@ def _env_reauth():
 
 def _redact_auth(headers: dict) -> dict:
     """Show that a valid bearer/cookie WAS sent (proof) without printing the raw session secret.
-    D4ST_FULL_AUTH=1 prints the complete token for true Burp-parity when opsec allows."""
-    full = os.environ.get("D4ST_FULL_AUTH") == "1"
-    out = {}
-    for k, v in (headers or {}).items():
-        lk = k.lower()
-        if not full and lk == "authorization":
-            out[k] = (str(v)[:30] + "…<redacted - set D4ST_FULL_AUTH=1 to reveal>")
-        elif not full and lk == "cookie":
-            out[k] = "<redacted - set D4ST_FULL_AUTH=1 to reveal>"
-        else:
-            out[k] = v
-    return out
+    Delegates to the one canonical redactor (evidence.redact_headers); both honor D4ST_FULL_AUTH=1
+    for true Burp-parity when opsec allows."""
+    from .evidence import redact_headers
+    return redact_headers(headers)
 
 
+# Raw-HTTP string builders live in evidence.py now (the public, shared versions used by the
+# replay/sweep primitives too). Kept as module-local shims so in-file callers are unchanged.
 def _raw_http_request(method: str, url: str, headers: dict, body: str = "") -> str:
-    p = urlsplit(url)
-    path = (p.path or "/") + (("?" + p.query) if p.query else "")
-    out = [f"{method} {path} HTTP/1.1", f"Host: {p.netloc}"]
-    for k, v in headers.items():
-        if k.lower() == "host":
-            continue
-        out.append(f"{k}: {v}")
-    return "\r\n".join(out) + "\r\n\r\n" + (body or "")
+    from .evidence import raw_request
+    return raw_request(method, url, headers, body)
 
 
 def _raw_http_response(r) -> str:
-    out = [f"HTTP/1.1 {r.status_code} {getattr(r, 'reason_phrase', '') or ''}".rstrip()]
-    for k, v in r.headers.items():
-        out.append(f"{k}: {v}")
-    return "\r\n".join(out) + "\r\n\r\n" + (r.text or "")
+    from .evidence import raw_response
+    return raw_response(r)
 
 
 def _is_synthetic_exchange(e: dict) -> bool:
@@ -2452,16 +2477,23 @@ def _is_synthetic_exchange(e: dict) -> bool:
     return (body == "" or body.startswith(("finding basis:", "matched evidence", "ZAP alert:")))
 
 
-def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, rps: float = 4.0) -> int:
+def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, rps: float = 4.0,
+                          allow_state_changing: bool = False) -> int:
     """GUARANTEE Burp-grade proof: replay each finding's request (authenticated) and record the
     COMPLETE raw request + full response (status line + ALL headers + full body) as the finding's
-    primary evidence exchange — the standard Burp always provides. Deduped by (method,url); GET only
-    (never re-issues a state-changing request); rate-limited + capped. Auth-proof findings (authz)
-    are skipped so their no-bearer proof is preserved. Any native attack exchange (payload/reflection)
-    is kept AFTER the full capture. D4ST_FULL_CAPTURE=0 disables; D4ST_FULL_CAPTURE_CAP overrides cap."""
+    primary evidence exchange — the standard Burp always provides. Deduped by (method,url);
+    rate-limited + capped. Auth-proof findings (authz) are skipped so their no-bearer proof is
+    preserved. Any native attack exchange (payload/reflection) is kept AFTER the full capture.
+
+    Read-only by default: only GET findings are replayed (the scan pipeline stays read-only). When
+    allow_state_changing=True a finding carrying a non-GET method (and, if present, its request body)
+    is replayed faithfully with that verb — but DELETE and destructive/notifying or auth endpoints
+    (safety.is_state_changing / is_auth_endpoint) are NEVER re-issued even then.
+    D4ST_FULL_CAPTURE=0 disables; D4ST_FULL_CAPTURE_CAP overrides cap."""
     import time as _t
 
     import httpx
+    from .safety import is_auth_endpoint, is_state_changing
     hdr = dict(_AUTH_HEADER)
     if cookie:
         hdr["Cookie"] = cookie
@@ -2469,6 +2501,15 @@ def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, r
     cap_body = int(os.environ.get("D4ST_FULL_CAPTURE_CAP", str(cap_body)) or cap_body)
     cache: dict = {}
     captured = 0
+
+    def _finding_body(f) -> str:
+        for e in (getattr(f, "evidence_log", None) or []):
+            if isinstance(e, dict):
+                b = (e.get("request") or {}).get("body")
+                if b:
+                    return str(b)
+        return str(getattr(f, "payload", "") or "")
+
     # follow_redirects=True so a URL that 30x-redirects (e.g. the SPA root '/') yields the REAL
     # final response (200 + HTML + body) rather than an empty 0-byte redirect. The redirect chain is
     # recorded in the request note so the proof shows '302 -> 200', not a bare empty response.
@@ -2476,12 +2517,22 @@ def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, r
         for f in findings:
             url = getattr(f, "url", "") or ""
             method = (getattr(f, "method", "") or "GET").upper()
-            if not url.startswith("http") or method != "GET" or getattr(f, "tool", "") == "authz":
+            if not url.startswith("http") or getattr(f, "tool", "") == "authz":
                 continue
+            body = ""
+            if method != "GET":
+                # Read-only default: skip non-GET unless the caller opted in; even then, never
+                # re-issue a destructive verb/path (no regression to the scan pipeline's safety).
+                if not allow_state_changing:
+                    continue
+                if method == "DELETE" or is_state_changing(url) or is_auth_endpoint(url):
+                    continue
+                body = _finding_body(f)
             key = (method, url)
             if key not in cache:
                 try:
-                    cache[key] = c.get(url, headers=hdr)
+                    cache[key] = c.request(method, url, headers=hdr,
+                                           content=(body or None))
                 except Exception:  # noqa: BLE001
                     cache[key] = None
                 _t.sleep(delay)
@@ -2490,14 +2541,17 @@ def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, r
                 continue
             _rt = (r.text or "")
             _trunc = len(_rt) > cap_body
+            _rmethod = r.request.method
+            _rbody = (r.request.content or b"").decode("utf-8", "replace") if r.request.content else ""
             # redirect chain (if any) so the capture is honest about how we reached the final response
             _hops = [f"{h.status_code} {h.request.method} {h.request.url}" for h in (r.history or [])]
             _chain = ("redirect chain: " + " -> ".join(_hops) + f" -> {r.status_code}\n") if _hops else ""
             full = {"label": "FULL request / response (Burp-grade capture)",
-                    "request": {"method": "GET", "url": str(r.request.url),
-                                "headers": _redact_auth(dict(r.request.headers)), "body": "",
-                                "raw": _chain + _raw_http_request("GET", str(r.request.url),
-                                                                  _redact_auth(dict(r.request.headers)))},
+                    "request": {"method": _rmethod, "url": str(r.request.url),
+                                "headers": _redact_auth(dict(r.request.headers)), "body": _rbody,
+                                "raw": _chain + _raw_http_request(_rmethod, str(r.request.url),
+                                                                  _redact_auth(dict(r.request.headers)),
+                                                                  _rbody)},
                     "response": {"status": r.status_code, "headers": dict(r.headers),
                                  "elapsed_ms": int(r.elapsed.total_seconds() * 1000) if r.elapsed else None,
                                  "size": len(r.content),
@@ -2510,7 +2564,10 @@ def capture_full_evidence(findings: list, cookie: str, cap_body: int = 200000, r
                            if isinstance(e, dict) and not _is_synthetic_exchange(e)]
             f.evidence_log = [full] + _kept_prior
             if not getattr(f, "repro", ""):
-                f.repro = f"curl -i '{url}'"
+                f.repro = (f"curl -i '{url}'" if _rmethod == "GET"
+                           else f"curl -i -X {_rmethod} "
+                                + (f"--data '{_rbody[:2000]}' " if _rbody else "")
+                                + f"'{url}'")
             captured += 1
     return captured
 
@@ -2884,6 +2941,11 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
     if policy.skip_state_changing:
         active_targets = [t for t in targets if not is_state_changing(t.url)]
         skipped_state_changing = len(targets) - len(active_targets)
+    # HARD SAFETY (all profiles): the native engine NEVER auto-fuzzes the DELETE verb. DELETE
+    # targets only ever arise from the OpenAPI seeder; drop them here so a RESTful DELETE on a
+    # benign path (no delete/remove in the URL, which is_state_changing would miss) can never be
+    # fired. No-op by default (the seeder collapses DELETE->POST unless D4ST_FUZZ_BODIES is set).
+    active_targets = [t for t in active_targets if (t.method or "GET").upper() != "DELETE"]
     # production-safe also skips POST-form fuzzing entirely (no data mutation)
     if not policy.fuzz_forms:
         active_targets = [t for t in active_targets if t.method != "POST"]
@@ -2966,6 +3028,7 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
         if _api.get("openapi_schema"):
             _oa_t, _oa_u = seed_targets_from_openapi(_api["openapi_schema"], cookie)
             _seed = [t for t in _oa_t if not is_auth_endpoint(t.url)]
+            _seed = [t for t in _seed if (t.method or "GET").upper() != "DELETE"]  # HARD: never DELETE
             if policy.skip_state_changing:
                 _seed = [t for t in _seed if not is_state_changing(t.url)]
             if not policy.fuzz_forms:
@@ -3494,7 +3557,13 @@ def run_engagement(target: str, cookie: str, host: str, depth: int = 3, *,
                         print(f"[zap] bearer refresh skipped: {_zje}", flush=True)
                 # Keep credential-change forms out of ZAP's frontier too — ZAP fills forms during
                 # its active scan and would otherwise reset the password ZAP itself logged in with.
-                _zap_frontier = [u for u in urls if urlsplit(u).path not in _cred_paths]
+                # HARD no-destructive at the import feed: ZAP's `import {type: url}` GETs every URL
+                # in the frontier and ignores the context excludePaths, so a crawled /delete?id=1,
+                # /send, /export would fire. Drop is_state_changing URLs from the frontier itself when
+                # the policy or D4ST_ZAP_SKIP_DESTRUCTIVE is set (mirrors the native engine's skip).
+                _skip = policy.skip_state_changing or os.environ.get("D4ST_ZAP_SKIP_DESTRUCTIVE") == "1"
+                _zap_frontier = [u for u in urls if urlsplit(u).path not in _cred_paths
+                                 and not (_skip and is_state_changing(u))]
                 findings += run_zap(target, cookie, _tf.mkdtemp(prefix="d4st-zap-"),
                                     timeout=_zap_to, seed_url=_zap_seed, frontier=_zap_frontier)
                 zap_ran = True
@@ -3946,12 +4015,23 @@ def run_zap(target: str, cookie: str, out_dir: str, timeout: int = 2400,
         if strength not in ("low", "medium", "high", "insane"):
             strength = "medium"
         scope_re = f"{_p.scheme}://{re.escape(_p.netloc)}.*"
+        # HARD no-destructive at the ZAP layer: when D4ST_ZAP_SKIP_DESTRUCTIVE=1, keep ZAP's active
+        # scanner off delete/send/pay/notify/... paths too — mirroring the native engine's
+        # is_state_changing skip (ZAP is the one engine that otherwise would not honor it). Opt-in
+        # so the aggressive/staging profiles that intentionally attack those endpoints are unchanged.
+        _excl = ["'.*logout.*'", "'.*signout.*'", "'.*/reset.*'"]
+        if os.environ.get("D4ST_ZAP_SKIP_DESTRUCTIVE") == "1":
+            _excl.append(
+                "'.*(?:delete|remove|destroy|drop|purge|erase|wipe|send|email|mail|sms|notify|"
+                "invite|approve|reject|confirm|checkout|purchase|order|payment|pay|transfer|"
+                "withdraw|deposit|refund|discharge|deactivate|disable|revoke|suspend|terminate|"
+                "cancel|restore|rollback|migrate|import|export|backup).*'")
         plan = f"""env:
   contexts:
     - name: d4st
       urls: ['{zt}']
       includePaths: ['{scope_re}']
-      excludePaths: ['.*logout.*', '.*signout.*', '.*/reset.*']
+      excludePaths: [{', '.join(_excl)}]
   parameters:
     failOnError: false
     failOnWarning: false

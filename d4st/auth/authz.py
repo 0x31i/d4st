@@ -164,6 +164,124 @@ def run_authz(session: Session, base: str, urls: list[str], *,
     return findings
 
 
+def replay_once(session, method: str, url: str, *, body: str = "", base: str = "",
+                timeout: float = 12.0, verify: bool = False, policy=None, client=None):
+    """Send ONE request under `session`'s identity and return the httpx.Response — the atomic unit
+    the authz matrix / N-way diff are built from. Method and body are generic (any verb). Identity is
+    the session's own headers + cookie_header(base or url). An optional `client` reuses a caller's
+    httpx.Client (connection reuse in a loop); otherwise a one-shot client is used. `policy`, if
+    given, is called policy(method, url) before the request so an outside driver can add a check."""
+    import httpx
+
+    m = (method or "GET").upper()
+    if policy is not None:
+        policy(m, url)
+    hdr = dict(getattr(session, "headers", {}) or {})
+    try:
+        ck = session.cookie_header(base or url)
+        if ck:
+            hdr["Cookie"] = ck
+    except Exception:  # noqa: BLE001
+        pass
+    content = body.encode("utf-8") if isinstance(body, str) and body else (body or None)
+    if client is not None:
+        return client.request(m, url, headers=hdr, content=content)
+    with httpx.Client(verify=verify, follow_redirects=False, timeout=timeout) as c:
+        return c.request(m, url, headers=hdr, content=content)
+
+
+def diff_identities(method: str, url: str, sessions: dict, *, body: str = "",
+                    owner: str | None = None, base: str = "", delay: float = 0.2,
+                    timeout: float = 12.0, verify: bool = False, throttle=None,
+                    allow_state_changing: bool = False, policy=None) -> dict:
+    """Replay ONE request across many named identities and diff the outcomes — the clean, N-way,
+    method-generic access-control check `run_authz_matrix` cannot express (it is 2-account + GET-only
+    + `/api/`-filtered). For each identity: replay_once -> status + body. The verdict uses the same
+    primitives as the matrix — `_similar` (body shape) + `_sensitivity` (data ranking): a non-owner
+    identity returning <400 with a body matching the owner's = access NOT enforced (BOLA/BFLA-shaped);
+    a non-owner 401/403 (or a non-matching body) = enforced.
+
+    Read-only by default: a write verb or a destructive/auth path raises ValueError unless
+    allow_state_changing=True. `policy(method, url)` runs before each identity's request; a policy
+    raise ABORTS that one identity distinctly — it is recorded blocked (blocked=True, status=None),
+    NOT as a network error (blocked=False, error=<str>) — so a deliberate block is never confused
+    with a request failure.
+
+    Returns: {url, method, owner, verdict: 'enforced'|'bypassed'|'mixed'|'n/a',
+              per_identity:[{name, status, size, allowed, matches_owner, sensitivity,
+                             blocked, error}],
+              evidence_log:[exchange per identity]}."""
+    import httpx
+
+    from ..safety import is_auth_endpoint, is_state_changing, pace
+
+    m = (method or "GET").upper()
+    if not allow_state_changing and (m not in ("GET", "HEAD", "OPTIONS")
+                                     or is_state_changing(url) or is_auth_endpoint(url)):
+        raise ValueError(f"{m} {url} is not read-only (write verb or destructive/auth path); "
+                         "pass allow_state_changing=True to authorize it")
+
+    names = list(sessions)
+    if not names:
+        return {"url": url, "method": m, "owner": None, "verdict": "n/a",
+                "per_identity": [], "evidence_log": []}
+    owner = owner if owner in sessions else names[0]
+    order = [owner] + [n for n in names if n != owner]
+
+    per_identity: list[dict] = []
+    evidence_log: list[dict] = []
+    owner_body: str | None = None
+    with httpx.Client(verify=verify, follow_redirects=False, timeout=timeout) as c:
+        for name in order:
+            # A policy raise is a DELIBERATE block of this identity's probe — it must abort this
+            # identity distinctly (recorded blocked/skipped), not be swallowed by the broad except
+            # below that only means "the request failed on the network". Evaluate policy here and
+            # pass policy=None into replay_once so it is not run (and caught) twice.
+            if policy is not None:
+                try:
+                    policy(m, url)
+                except Exception as exc:  # noqa: BLE001
+                    per_identity.append({"name": name, "status": None, "size": 0,
+                                         "allowed": False, "matches_owner": False,
+                                         "sensitivity": 0, "blocked": True, "error": None,
+                                         "note": f"policy blocked: {exc}"})
+                    continue
+            try:
+                r = replay_once(sessions[name], m, url, body=body, base=base,
+                                policy=None, client=c)
+            except Exception as exc:  # noqa: BLE001
+                per_identity.append({"name": name, "status": None, "size": 0, "allowed": False,
+                                     "matches_owner": False, "sensitivity": 0,
+                                     "blocked": False, "error": str(exc)})
+                continue
+            pace(throttle, delay, r.status_code)
+            txt = r.text or ""
+            if name == owner:
+                owner_body = txt
+            rank, label = _sensitivity(txt)
+            allowed = r.status_code < 400
+            matches = True if name == owner else _similar(txt, owner_body or "")
+            per_identity.append({"name": name, "status": r.status_code,
+                                 "size": len(r.content or b""), "allowed": allowed,
+                                 "matches_owner": matches, "sensitivity": rank,
+                                 "sensitivity_label": label, "blocked": False, "error": None})
+            evidence_log.append(_exchange(
+                f"identity {name!r}" + (" — owner (baseline)" if name == owner else " — PROOF"), r))
+
+    non_owner = [p for p in per_identity if p["name"] != owner]
+    bypassed = [p for p in non_owner if p["allowed"] and p["matches_owner"]]
+    if not non_owner:
+        verdict = "n/a"
+    elif len(bypassed) == len(non_owner):
+        verdict = "bypassed"
+    elif not bypassed:
+        verdict = "enforced"
+    else:
+        verdict = "mixed"
+    return {"url": url, "method": m, "owner": owner, "verdict": verdict,
+            "per_identity": per_identity, "evidence_log": evidence_log}
+
+
 def run_authz_matrix(session_a: Session, session_b: Session, base: str, urls: list[str], *,
                      delay: float = 0.2, timeout: float = 12.0, max_endpoints: int = 300,
                      throttle=None) -> list[dict]:
@@ -183,20 +301,11 @@ def run_authz_matrix(session_a: Session, session_b: Session, base: str, urls: li
     if not api:
         return []
 
-    hb = _auth_header_name(session_b)
-    a_hdr = dict(session_a.headers)
-    if session_a.cookie_header(base):
-        a_hdr["Cookie"] = session_a.cookie_header(base)
-    # B's identity: B's bearer + B's cookie, but everything else (accept etc.) from A
-    b_hdr = {k: v for k, v in a_hdr.items() if k.lower() not in ("authorization", "cookie")}
-    for k, v in (session_b.headers or {}).items():
-        if k.lower() == "authorization":
-            b_hdr[hb] = v
-    if session_b.cookie_header(base):
-        b_hdr["Cookie"] = session_b.cookie_header(base)
-
     findings: list[dict] = []
     seen: set[str] = set()
+    # Built on the shared atomic unit replay_once: A's request then the SAME request as B. Each
+    # session supplies its own identity (headers + cookie_header(base)); GET-only + id-filtered
+    # here, exactly as before.
     with httpx.Client(verify=False, follow_redirects=False, timeout=timeout) as c:
         for url in api:
             # only endpoints that look object-scoped (carry an id) are BOLA-interesting; endpoints
@@ -206,14 +315,14 @@ def run_authz_matrix(session_a: Session, session_b: Session, base: str, urls: li
                 continue
             seen.add(url)
             try:
-                ra = c.get(url, headers=a_hdr)
+                ra = replay_once(session_a, "GET", url, base=base, client=c)
                 pace(throttle, delay, ra.status_code)
             except Exception:  # noqa: BLE001
                 continue
             if ra.status_code >= 400 or not (ra.text or "").strip():
                 continue
             try:
-                rb = c.get(url, headers=b_hdr)
+                rb = replay_once(session_b, "GET", url, base=base, client=c)
                 pace(throttle, delay, rb.status_code)
             except Exception:  # noqa: BLE001
                 continue

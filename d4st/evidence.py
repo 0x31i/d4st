@@ -87,6 +87,30 @@ def curl(r, *, body: str = "") -> str:
     return " ".join(parts)
 
 
+def raw_request(method: str, url: str, headers: dict, body: str = "") -> str:
+    """Render a request as the raw HTTP/1.1 text an analyst pastes into Repeater. The one public
+    builder (promoted out of the engagement runner) so replay/sweep and the scan pipeline emit
+    identical raw proof. Headers are shown as given — redact with redact_headers() first if needed."""
+    from urllib.parse import urlsplit
+    p = urlsplit(url)
+    path = (p.path or "/") + (("?" + p.query) if p.query else "")
+    out = [f"{method} {path} HTTP/1.1", f"Host: {p.netloc}"]
+    for k, v in (headers or {}).items():
+        if k.lower() == "host":
+            continue
+        out.append(f"{k}: {v}")
+    return "\r\n".join(out) + "\r\n\r\n" + (body or "")
+
+
+def raw_response(r) -> str:
+    """Render an httpx Response as raw HTTP/1.1 text (status line + headers + body)."""
+    out = [f"HTTP/1.1 {getattr(r, 'status_code', '')} "
+           f"{getattr(r, 'reason_phrase', '') or ''}".rstrip()]
+    for k, v in (getattr(r, "headers", {}) or {}).items():
+        out.append(f"{k}: {v}")
+    return "\r\n".join(out) + "\r\n\r\n" + (getattr(r, "text", "") or "")
+
+
 def synthetic_exchange(label: str, *, method: str, url: str, req_headers: dict | None = None,
                        req_body: str = "", status=None, resp_headers: dict | None = None,
                        resp_body: str = "") -> dict:
